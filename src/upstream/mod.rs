@@ -15,6 +15,7 @@ pub struct Manager {
     entries: Vec<Entry>,
     system_fallback: Vec<SocketAddr>,
     fallback_active: AtomicBool,
+    fallback_failed: AtomicBool,
 }
 
 struct Entry {
@@ -86,6 +87,7 @@ impl Manager {
             entries,
             system_fallback,
             fallback_active: AtomicBool::new(false),
+            fallback_failed: AtomicBool::new(false),
         })
     }
 
@@ -116,8 +118,12 @@ impl Manager {
             };
             match result {
                 Ok(mut response) => {
-                    if self.fallback_active.swap(false, Ordering::Relaxed) {
+                    let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
+                    let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
+                    if fallback_was_active {
                         log::info!("configured DNS upstreams recovered; system fallback inactive");
+                    } else if fallback_had_failed {
+                        log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
                     }
                     if response.len() >= 2 {
                         // Transports may rewrite the DNS ID (DoQ pins it to 0);
@@ -134,6 +140,11 @@ impl Manager {
 
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
         if self.system_fallback.is_empty() {
+            if !self.fallback_failed.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "all configured upstreams failed and no system DNS fallback is available; returning SERVFAIL"
+                );
+            }
             return None;
         }
         if !self.fallback_active.swap(true, Ordering::Relaxed) {
@@ -142,10 +153,18 @@ impl Manager {
         for server in &self.system_fallback {
             let attempt = legacy::query(*server, query, client_tcp);
             match tokio::time::timeout(Duration::from_secs(2), attempt).await {
-                Ok(Ok(response)) => return Some(response),
+                Ok(Ok(response)) => {
+                    if self.fallback_failed.swap(false, Ordering::Relaxed) {
+                        log::info!("system DNS fallback recovered");
+                    }
+                    return Some(response);
+                }
                 Ok(Err(err)) => log::debug!("system DNS fallback {server}: {err}"),
                 Err(_) => log::debug!("system DNS fallback {server}: timeout after 2000ms"),
             }
+        }
+        if !self.fallback_failed.swap(true, Ordering::Relaxed) {
+            log::warn!("system DNS fallback also failed; returning SERVFAIL");
         }
         None
     }
@@ -279,7 +298,42 @@ mod tests {
         let response = manager.forward(&query, false).await.unwrap();
         assert_eq!(&response[..2], &query[..2]);
         assert_ne!(response[2] & 0x80, 0);
+        assert!(manager.fallback_active.load(Ordering::Relaxed));
+        assert!(!manager.fallback_failed.load(Ordering::Relaxed));
         responder.await.unwrap();
+        drop(dead);
+    }
+
+    #[tokio::test]
+    async fn exhausted_upstreams_record_missing_system_fallback_once() {
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let upstream = Upstream {
+            name: "dead primary".into(),
+            proto: Proto::Legacy,
+            host: dead_addr.ip().to_string(),
+            port: dead_addr.port(),
+            path: String::new(),
+            bootstrap_ip: Some(dead_addr.ip()),
+            timeout_ms: 20,
+            ip_stack: IpStack::Both,
+        };
+        let manager = Manager::new(
+            vec![upstream],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+        let query = [
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x01,
+        ];
+
+        assert!(manager.forward(&query, false).await.is_none());
+        assert!(manager.fallback_failed.load(Ordering::Relaxed));
+        assert!(!manager.fallback_active.load(Ordering::Relaxed));
+        assert!(manager.forward(&query, false).await.is_none());
+        assert!(manager.fallback_failed.load(Ordering::Relaxed));
         drop(dead);
     }
 }
