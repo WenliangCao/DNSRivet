@@ -1,0 +1,32 @@
+# DNSRivet example configuration
+# Replace the documentation-only upstream endpoints before starting DNSRivet.
+
+[service]
+log_level = "info"   # debug | info | warn | error
+log_path = ""        # empty = stderr (launchd redirects it to a file)
+cache_enable = true
+cache_size = 4096
+
+[listener.0]
+ip = "127.0.0.1"
+port = 53
+
+# type: doh | doh3 | dot | doq | legacy   (may be omitted when the endpoint
+#       carries a scheme: https:// -> doh, h3:// -> doh3, quic:// -> doq,
+#       tls:// -> dot, bare IP -> legacy)
+# endpoint: URL for doh/doh3; host[:port] or IP[:port] for dot/doq/legacy
+#           (default ports: doh/doh3 443, dot/doq 853, legacy 53)
+# timeout: milliseconds before failing over to the next upstream; 0 = none
+[upstream.0]
+name = "Primary DoH"
+type = "doh"
+endpoint = "https://resolver.example/dns-query"
+bootstrap_ip = ""
+timeout = 5000
+
+[upstream.1]
+name = "DoT fallback"
+type = "dot"
+endpoint = "resolver-backup.example"
+bootstrap_ip = "192.0.2.53"
+timeout = 5000

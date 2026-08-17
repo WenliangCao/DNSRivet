@@ -1,0 +1,47 @@
+[package]
+name = "dnsrivet"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Lightweight encrypted DNS forwarding daemon for macOS with DoH, DoH3, DoT, and DoQ"
+repository = "https://github.com/WenliangCao/DNSRivet"
+readme = "README.md"
+keywords = ["dns", "doh", "doh3", "dot", "doq"]
+categories = ["network-programming", "command-line-utilities"]
+
+[dependencies]
+# DNS wire format + DoH/DoH3/DoT/DoQ client streams.
+# 0.25.2 is the last line with public transport streams (0.26 moved them into
+# hickory-resolver behind a private module); brings rustls 0.23, quinn 0.11,
+# h2 0.4, h3 0.0.7, tokio-rustls 0.26 — all on the ring provider via *-ring.
+hickory-proto = { version = "=0.25.2", default-features = false, features = [
+    "tokio",
+    "https-ring",
+    "h3-ring",
+    "quic-ring",
+    "tls-ring",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+webpki-roots = "0.26"
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "net",
+    "time",
+    "io-util",
+    "sync",
+    "macros",
+    "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"] }
+log = { version = "0.4", features = ["std"] }
+lru = "0.18"
+lexopt = "0.3"
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

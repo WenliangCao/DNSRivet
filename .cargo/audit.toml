@@ -1,0 +1,7 @@
+[advisories]
+# hickory-proto 0.25 is retained because 0.26 removed the public raw transport
+# clients this forwarder needs. Both exceptions are reviewed in SECURITY.md.
+ignore = [
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+]
