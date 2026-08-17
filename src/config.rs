@@ -1,11 +1,11 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 // ---------- raw TOML layer ----------
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct RawConfig {
     service: RawService,
@@ -13,7 +13,7 @@ struct RawConfig {
     upstream: BTreeMap<String, RawUpstream>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct RawService {
     log_level: String,
@@ -33,7 +33,7 @@ impl Default for RawService {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct RawListener {
     ip: String,
@@ -49,7 +49,7 @@ impl Default for RawListener {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct RawUpstream {
     name: String,
@@ -139,6 +139,10 @@ pub struct Upstream {
 
 pub fn load(path: &Path) -> Result<Loaded, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    load_text(&text)
+}
+
+pub fn load_text(text: &str) -> Result<Loaded, String> {
     let table: toml::Table = text.parse().map_err(|e| format!("TOML parse error: {e}"))?;
 
     let mut warnings = Vec::new();
@@ -178,6 +182,72 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         },
         warnings,
     })
+}
+
+/// Render the quick CLI surface to canonical TOML, then validate that TOML
+/// through the same parser used for hand-written configuration files.
+pub fn quick_toml(
+    listeners: &[String],
+    upstreams: &[String],
+    timeout_ms: Option<u64>,
+    cache_size: Option<usize>,
+    no_cache: bool,
+) -> Result<String, String> {
+    if upstreams.is_empty() {
+        return Err("quick configuration requires at least one upstream".into());
+    }
+
+    let mut raw = RawConfig::default();
+    raw.service.cache_enable = !no_cache;
+    raw.service.cache_size = cache_size.unwrap_or(4096);
+
+    let listeners: Vec<String> = if listeners.is_empty() {
+        vec!["127.0.0.1:53".into()]
+    } else {
+        listeners.to_vec()
+    };
+    for (index, value) in listeners.iter().enumerate() {
+        let addr: SocketAddr = value
+            .parse()
+            .map_err(|_| format!("invalid --listen address {value:?}; expected IP:PORT"))?;
+        raw.listener.insert(
+            index.to_string(),
+            RawListener {
+                ip: addr.ip().to_string(),
+                port: addr.port(),
+            },
+        );
+    }
+
+    for (index, spec) in upstreams.iter().enumerate() {
+        let (kind, endpoint) = match spec.split_once('=') {
+            Some((kind, endpoint)) if !kind.is_empty() && !endpoint.is_empty() => {
+                (kind.to_string(), endpoint.to_string())
+            }
+            None if !spec.is_empty() => (String::new(), spec.to_string()),
+            _ => {
+                return Err(format!(
+                    "invalid --upstream {spec:?}; expected TYPE=ENDPOINT"
+                ));
+            }
+        };
+        raw.upstream.insert(
+            index.to_string(),
+            RawUpstream {
+                name: format!("upstream.{index}"),
+                kind,
+                endpoint,
+                bootstrap_ip: String::new(),
+                timeout: timeout_ms.unwrap_or(5000),
+                ip_stack: "both".into(),
+            },
+        );
+    }
+
+    let text =
+        toml::to_string_pretty(&raw).map_err(|e| format!("serialize quick configuration: {e}"))?;
+    load_text(&text)?;
+    Ok(text)
 }
 
 /// Unknown or intentionally unsupported config sections/fields: warn instead
@@ -490,5 +560,32 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("cache_size"))
         );
+    }
+
+    #[test]
+    fn quick_config_round_trips_through_toml_parser() {
+        let text = quick_toml(
+            &["127.0.0.1:5354".into()],
+            &[
+                "doh3=https://resolver.example/profile".into(),
+                "dot=resolver-backup.example".into(),
+            ],
+            Some(750),
+            Some(128),
+            false,
+        )
+        .unwrap();
+        let loaded = load_text(&text).unwrap();
+        assert_eq!(loaded.config.listeners[0].port(), 5354);
+        assert_eq!(loaded.config.upstreams.len(), 2);
+        assert_eq!(loaded.config.upstreams[0].proto, Proto::Doh3);
+        assert_eq!(loaded.config.upstreams[0].timeout_ms, 750);
+        assert_eq!(loaded.config.service.cache_size, 128);
+    }
+
+    #[test]
+    fn quick_config_rejects_ambiguous_hostname_without_type() {
+        let err = quick_toml(&[], &["resolver.example".into()], None, None, false).unwrap_err();
+        assert!(err.contains("type is required"));
     }
 }

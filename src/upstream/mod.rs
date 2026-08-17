@@ -7,11 +7,14 @@ use bootstrap::Bootstrap;
 use hickory_proto::op::{Message, MessageType, OpCode};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
     entries: Vec<Entry>,
+    system_fallback: Vec<SocketAddr>,
+    fallback_active: AtomicBool,
 }
 
 struct Entry {
@@ -32,7 +35,11 @@ enum Backend {
 }
 
 impl Manager {
-    pub fn new(all: Vec<Upstream>, listeners: &[SocketAddr]) -> Result<Self, String> {
+    pub fn new(
+        all: Vec<Upstream>,
+        listeners: &[SocketAddr],
+        system_fallback: Vec<SocketAddr>,
+    ) -> Result<Self, String> {
         let boot = Arc::new(Bootstrap::new());
         let deny = Arc::new(listeners.to_vec());
         let needs_tls = all.iter().any(|up| up.proto != Proto::Legacy);
@@ -75,7 +82,11 @@ impl Manager {
                 backend,
             });
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            system_fallback,
+            fallback_active: AtomicBool::new(false),
+        })
     }
 
     /// Try each upstream in config order; None when all of them failed.
@@ -105,6 +116,9 @@ impl Manager {
             };
             match result {
                 Ok(mut response) => {
+                    if self.fallback_active.swap(false, Ordering::Relaxed) {
+                        log::info!("configured DNS upstreams recovered; system fallback inactive");
+                    }
                     if response.len() >= 2 {
                         // Transports may rewrite the DNS ID (DoQ pins it to 0);
                         // hand the client back its own.
@@ -113,6 +127,24 @@ impl Manager {
                     return Some(response);
                 }
                 Err(err) => log::debug!("upstream {}: {err}", entry.name),
+            }
+        }
+        self.forward_to_system(query, client_tcp).await
+    }
+
+    async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
+        if self.system_fallback.is_empty() {
+            return None;
+        }
+        if !self.fallback_active.swap(true, Ordering::Relaxed) {
+            log::warn!("all configured upstreams failed; using pre-takeover system DNS directly");
+        }
+        for server in &self.system_fallback {
+            let attempt = legacy::query(*server, query, client_tcp);
+            match tokio::time::timeout(Duration::from_secs(2), attempt).await {
+                Ok(Ok(response)) => return Some(response),
+                Ok(Err(err)) => log::debug!("system DNS fallback {server}: {err}"),
+                Err(_) => log::debug!("system DNS fallback {server}: timeout after 2000ms"),
             }
         }
         None
@@ -190,6 +222,7 @@ mod tests {
     use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn encrypted_encoder_accepts_only_single_question_queries() {
@@ -207,5 +240,46 @@ mod tests {
             RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
         ));
         assert!(!safe_encrypted_query(&query));
+    }
+
+    #[tokio::test]
+    async fn exhausted_upstreams_use_direct_system_fallback() {
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (n, peer) = fallback.recv_from(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            query[3] |= 0x80;
+            fallback.send_to(&query[..n], peer).await.unwrap();
+        });
+
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let upstream = Upstream {
+            name: "dead primary".into(),
+            proto: Proto::Legacy,
+            host: dead_addr.ip().to_string(),
+            port: dead_addr.port(),
+            path: String::new(),
+            bootstrap_ip: Some(dead_addr.ip()),
+            timeout_ms: 20,
+            ip_stack: IpStack::Both,
+        };
+        let manager = Manager::new(
+            vec![upstream],
+            &["127.0.0.1:5354".parse().unwrap()],
+            vec![fallback_addr],
+        )
+        .unwrap();
+        let query = [
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x01,
+        ];
+        let response = manager.forward(&query, false).await.unwrap();
+        assert_eq!(&response[..2], &query[..2]);
+        assert_ne!(response[2] & 0x80, 0);
+        responder.await.unwrap();
+        drop(dead);
     }
 }

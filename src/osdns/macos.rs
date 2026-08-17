@@ -1,20 +1,24 @@
 //! Transactional macOS DNS configuration through `networksetup`.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
+const SCUTIL: &str = "/usr/sbin/scutil";
 pub const BACKUP_PATH: &str = "/Library/Application Support/DNSRivet/dns-backup.toml";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Backup {
     version: u8,
     services: Vec<ServiceDns>,
+    #[serde(default)]
+    fallback_servers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -37,9 +41,21 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
         ));
     }
 
+    let mut fallback_servers = match effective_dns_servers() {
+        Ok(servers) => servers,
+        Err(err) => {
+            eprintln!("warning: could not snapshot effective system DNS: {err}");
+            Vec::new()
+        }
+    };
     let mut services = Vec::new();
     for name in list_services()? {
         let servers = get_dns_servers(&name)?;
+        fallback_servers.extend(
+            servers
+                .iter()
+                .filter_map(|value| value.parse::<IpAddr>().ok()),
+        );
         if servers
             .iter()
             .any(|existing| existing == &server.to_string())
@@ -55,9 +71,18 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
     }
 
     let backup = Backup {
-        version: 1,
+        version: 2,
         services,
+        fallback_servers: filter_fallback_servers(fallback_servers, &[server])
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect(),
     };
+    if backup.fallback_servers.is_empty() {
+        eprintln!(
+            "warning: no usable pre-takeover system DNS server was found; upstream exhaustion will return SERVFAIL"
+        );
+    }
     write_backup(&backup)?;
 
     let mut changed = Vec::new();
@@ -89,11 +114,8 @@ pub fn restore() -> Result<bool, String> {
     if !backup_exists() {
         return Ok(false);
     }
-    let text = std::fs::read_to_string(BACKUP_PATH)
-        .map_err(|e| format!("read DNS backup {BACKUP_PATH}: {e}"))?;
-    let backup: Backup =
-        toml::from_str(&text).map_err(|e| format!("parse DNS backup {BACKUP_PATH}: {e}"))?;
-    if backup.version != 1 {
+    let backup = read_backup()?;
+    if !matches!(backup.version, 1 | 2) {
         return Err(format!("unsupported DNS backup version {}", backup.version));
     }
 
@@ -121,6 +143,73 @@ pub fn restore() -> Result<bool, String> {
         .map_err(|e| format!("remove restored DNS backup {BACKUP_PATH}: {e}"))?;
     flush_caches();
     Ok(true)
+}
+
+/// Direct DNS servers that were effective before system takeover. The proxy
+/// queries these addresses itself, never through the now-looping OS resolver.
+pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, String> {
+    let denied: Vec<IpAddr> = listeners.iter().map(SocketAddr::ip).collect();
+    let candidates = if backup_exists() {
+        let backup = read_backup()?;
+        if !matches!(backup.version, 1 | 2) {
+            return Err(format!("unsupported DNS backup version {}", backup.version));
+        }
+        let mut candidates: Vec<IpAddr> = backup
+            .fallback_servers
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        if candidates.is_empty() {
+            candidates.extend(
+                backup
+                    .services
+                    .iter()
+                    .flat_map(|service| &service.servers)
+                    .filter_map(|value| value.parse::<IpAddr>().ok()),
+            );
+        }
+        candidates
+    } else {
+        effective_dns_servers()?
+    };
+    Ok(filter_fallback_servers(candidates, &denied)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect())
+}
+
+fn read_backup() -> Result<Backup, String> {
+    let text = std::fs::read_to_string(BACKUP_PATH)
+        .map_err(|e| format!("read DNS backup {BACKUP_PATH}: {e}"))?;
+    toml::from_str(&text).map_err(|e| format!("parse DNS backup {BACKUP_PATH}: {e}"))
+}
+
+fn effective_dns_servers() -> Result<Vec<IpAddr>, String> {
+    let output = run(SCUTIL, &["--dns"])?;
+    let text = stdout(&output, "read effective system DNS")?;
+    Ok(parse_scutil_dns(&text))
+}
+
+fn parse_scutil_dns(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("nameserver["))
+        .filter_map(|line| line.split_once(':').map(|(_, value)| value.trim()))
+        .filter(|value| !value.contains('%'))
+        .filter_map(|value| value.parse().ok())
+        .collect()
+}
+
+fn filter_fallback_servers(mut servers: Vec<IpAddr>, denied: &[IpAddr]) -> Vec<IpAddr> {
+    let mut seen = HashSet::new();
+    servers.retain(|ip| {
+        !ip.is_loopback()
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && !denied.contains(ip)
+            && seen.insert(*ip)
+    });
+    servers
 }
 
 fn list_services() -> Result<Vec<String>, String> {
@@ -295,16 +384,38 @@ mod tests {
     #[test]
     fn dns_backup_round_trips_through_toml() {
         let backup = Backup {
-            version: 1,
+            version: 2,
             services: vec![ServiceDns {
                 name: "USB & Wi-Fi".into(),
                 servers: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
             }],
+            fallback_servers: vec!["192.0.2.53".into()],
         };
         let text = toml::to_string(&backup).unwrap();
         let decoded: Backup = toml::from_str(&text).unwrap();
-        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.version, 2);
         assert_eq!(decoded.services[0].name, "USB & Wi-Fi");
         assert_eq!(decoded.services[0].servers.len(), 2);
+        assert_eq!(decoded.fallback_servers, ["192.0.2.53"]);
+    }
+
+    #[test]
+    fn parses_and_filters_effective_dns_servers() {
+        let text = r#"
+resolver #1
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : 127.0.0.1
+resolver #2
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : fe80::1%en0
+  nameserver[2] : 2001:db8::53
+"#;
+        assert_eq!(
+            filter_fallback_servers(parse_scutil_dns(text), &["127.0.0.1".parse().unwrap()]),
+            [
+                "192.168.1.1".parse::<IpAddr>().unwrap(),
+                "2001:db8::53".parse::<IpAddr>().unwrap()
+            ]
+        );
     }
 }

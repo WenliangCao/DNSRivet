@@ -19,7 +19,25 @@ const MAX_TCP_QUERY_SIZE: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve(config: Config) -> Result<(), String> {
-    let manager = Arc::new(Manager::new(config.upstreams, &config.listeners)?);
+    let system_fallback = match crate::osdns::fallback_servers(&config.listeners) {
+        Ok(servers) => {
+            if servers.is_empty() {
+                log::warn!("no usable system DNS fallback server was found");
+            } else {
+                log::info!("system DNS fallback ready: {servers:?}");
+            }
+            servers
+        }
+        Err(err) => {
+            log::warn!("system DNS fallback unavailable: {err}");
+            Vec::new()
+        }
+    };
+    let manager = Arc::new(Manager::new(
+        config.upstreams,
+        &config.listeners,
+        system_fallback,
+    )?);
     let cache = Arc::new(Cache::new(
         config.service.cache_enable,
         config.service.cache_size,
