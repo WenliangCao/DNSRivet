@@ -251,13 +251,13 @@ fn write_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .create(true)
         .truncate(true)
         .write(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(&temporary)
         .map_err(|e| format!("write config {}: {e}", temporary.display()))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|e| format!("write config {}: {e}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("set config permissions {}: {e}", temporary.display()))?;
     std::fs::rename(&temporary, path).map_err(|e| format!("install config {}: {e}", path.display()))
 }
