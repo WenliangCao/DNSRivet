@@ -122,13 +122,27 @@ pub fn status() -> Result<String, String> {
             "service: not installed".into()
         });
     }
-    let addr = installed_probe_address()?;
-    match wait_for_dns(addr, Duration::from_secs(2)) {
-        Ok(()) => Ok(format!("service: loaded; DNS probe at {addr}: healthy")),
-        Err(err) => Ok(format!(
-            "service: loaded; DNS probe at {addr}: failed ({err})"
-        )),
+    let addresses = match installed_probe_address() {
+        Ok(addr) => vec![addr],
+        Err(config_err) => {
+            let addresses = osdns::current_loopback_dns()?;
+            if addresses.is_empty() {
+                return Err(config_err);
+            }
+            addresses
+        }
+    };
+    let mut failures = Vec::new();
+    for addr in addresses {
+        match wait_for_dns(addr, Duration::from_secs(2)) {
+            Ok(()) => return Ok(format!("service: loaded; DNS probe at {addr}: healthy")),
+            Err(err) => failures.push(format!("{addr}: {err}")),
+        }
     }
+    Ok(format!(
+        "service: loaded; DNS probe failed ({})",
+        failures.join("; ")
+    ))
 }
 
 pub fn uninstall() -> Result<String, String> {

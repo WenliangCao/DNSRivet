@@ -178,6 +178,17 @@ pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, Str
         .collect())
 }
 
+/// Loopback DNS endpoints currently advertised by macOS. This lets unprivileged
+/// health checks probe the active service without reading its private config.
+pub fn current_loopback_dns() -> Result<Vec<SocketAddr>, String> {
+    let mut seen = HashSet::new();
+    Ok(effective_dns_servers()?
+        .into_iter()
+        .filter(|ip| ip.is_loopback() && seen.insert(*ip))
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect())
+}
+
 fn read_backup() -> Result<Backup, String> {
     let text = std::fs::read_to_string(BACKUP_PATH)
         .map_err(|e| format!("read DNS backup {BACKUP_PATH}: {e}"))?;
