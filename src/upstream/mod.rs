@@ -8,7 +8,7 @@ use hickory_proto::op::{Message, MessageType, OpCode};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
@@ -112,17 +112,18 @@ impl Manager {
                 entry.name,
                 entry.timeout_ms
             );
-            let attempt = entry.attempt(query, client_tcp, &mut parsed);
-            let result = if entry.timeout_ms > 0 {
-                match tokio::time::timeout(Duration::from_millis(entry.timeout_ms), attempt).await {
+            // Encrypted channels enforce this deadline themselves so their
+            // invalidation stays generation-precise; the outer timeout below
+            // is a pure scheduling backstop with no channel side effects.
+            let deadline = (entry.timeout_ms > 0)
+                .then(|| Instant::now() + Duration::from_millis(entry.timeout_ms));
+            let attempt = entry.attempt(query, client_tcp, &mut parsed, deadline);
+            let result = match entry.outer_timeout() {
+                Some(limit) => match tokio::time::timeout(limit, attempt).await {
                     Ok(result) => result,
-                    Err(_) => {
-                        entry.reset_after_timeout().await;
-                        Err(format!("timeout after {}ms", entry.timeout_ms))
-                    }
-                }
-            } else {
-                attempt.await
+                    Err(_) => Err(format!("timeout after {}ms", entry.timeout_ms)),
+                },
+                None => attempt.await,
             };
             match result {
                 Ok(mut response) => {
@@ -195,10 +196,18 @@ impl Manager {
 }
 
 impl Entry {
-    async fn reset_after_timeout(&self) {
-        if let Backend::Encrypted(channel) = &self.backend {
-            channel.reset().await;
+    /// Legacy transports have no internal deadline, so the outer timeout is
+    /// exact for them; encrypted channels time out internally, and the outer
+    /// bound only catches a stuck channel, with a small scheduling margin.
+    fn outer_timeout(&self) -> Option<Duration> {
+        if self.timeout_ms == 0 {
+            return None;
         }
+        let base = Duration::from_millis(self.timeout_ms);
+        Some(match self.backend {
+            Backend::Legacy { .. } => base,
+            Backend::Encrypted(_) => base + Duration::from_millis(250),
+        })
     }
 
     async fn attempt(
@@ -206,6 +215,7 @@ impl Entry {
         query: &[u8],
         client_tcp: bool,
         parsed: &mut Option<Message>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<u8>, String> {
         match &self.backend {
             Backend::Legacy {
@@ -237,7 +247,7 @@ impl Entry {
                     }
                     *parsed = Some(message);
                 }
-                channel.query(parsed.clone().unwrap()).await
+                channel.query(parsed.clone().unwrap(), deadline).await
             }
         }
     }
