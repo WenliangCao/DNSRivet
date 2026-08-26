@@ -13,7 +13,9 @@ use std::time::Duration;
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
     entries: Vec<Entry>,
-    system_fallback: Vec<SocketAddr>,
+    /// Runtime-refreshable: the watchdog swaps in the current network's DNS
+    /// when it recovers a lost takeover. Never persisted to the backup.
+    system_fallback: std::sync::RwLock<Vec<SocketAddr>>,
     fallback_active: AtomicBool,
     fallback_failed: AtomicBool,
 }
@@ -85,10 +87,16 @@ impl Manager {
         }
         Ok(Self {
             entries,
-            system_fallback,
+            system_fallback: std::sync::RwLock::new(system_fallback),
             fallback_active: AtomicBool::new(false),
             fallback_failed: AtomicBool::new(false),
         })
+    }
+
+    /// Replace the runtime fallback list. Callers must pass a non-empty,
+    /// freshly captured list; an empty capture keeps the previous one.
+    pub fn set_system_fallback(&self, servers: Vec<SocketAddr>) {
+        *self.system_fallback.write().unwrap() = servers;
     }
 
     /// Try each upstream in config order; None when all of them failed.
@@ -146,7 +154,10 @@ impl Manager {
     }
 
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
-        if self.system_fallback.is_empty() {
+        // Snapshot and drop the guard before any await: the read guard is not
+        // Send, and holding it would also block the watchdog's refresh.
+        let system_fallback: Vec<SocketAddr> = self.system_fallback.read().unwrap().clone();
+        if system_fallback.is_empty() {
             if !self.fallback_failed.swap(true, Ordering::Relaxed) {
                 log::warn!(
                     "all configured upstreams failed and no system DNS fallback is available; returning SERVFAIL"
@@ -157,7 +168,7 @@ impl Manager {
         if !self.fallback_active.swap(true, Ordering::Relaxed) {
             log::warn!("all configured upstreams failed; using pre-takeover system DNS directly");
         }
-        for server in &self.system_fallback {
+        for server in &system_fallback {
             let attempt = legacy::query(*server, query, client_tcp);
             match tokio::time::timeout(Duration::from_secs(2), attempt).await {
                 Ok(Ok(response)) => {

@@ -6,12 +6,90 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Output};
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 const SCUTIL: &str = "/usr/sbin/scutil";
 pub const BACKUP_PATH: &str = "/Library/Application Support/DNSRivet/dns-backup.toml";
+/// Created only after a takeover applied to every service; its absence next
+/// to a backup means the takeover state is not trustworthy.
+pub const MARKER_PATH: &str = "/Library/Application Support/DNSRivet/takeover-active";
+const LOCK_PATH: &str = "/Library/Application Support/DNSRivet/.lock";
+
+/// Cross-process critical section (flock) shared by the CLI lifecycle
+/// commands and the daemon watchdog. Dropping it releases the lock.
+struct FsLock {
+    _file: std::fs::File,
+}
+
+fn lock() -> Result<FsLock, String> {
+    let parent = Path::new(LOCK_PATH).parent().expect("lock path has a parent");
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(LOCK_PATH)
+        .map_err(|e| format!("open lock file {LOCK_PATH}: {e}"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(format!(
+            "lock {LOCK_PATH}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(FsLock { _file: file })
+}
+
+pub fn marker_exists() -> bool {
+    Path::new(MARKER_PATH).is_file()
+}
+
+fn create_marker() -> Result<(), String> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(MARKER_PATH)
+        .map(|_| ())
+        .map_err(|e| format!("create takeover marker {MARKER_PATH}: {e}"))
+}
+
+fn remove_marker() -> Result<(), String> {
+    match std::fs::remove_file(MARKER_PATH) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove takeover marker {MARKER_PATH}: {err}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TakeoverState {
+    NotTakenOver,
+    Active,
+    /// Backup without marker: a takeover attempt did not complete.
+    Indeterminate,
+    /// Marker without backup: restore data is gone.
+    Corrupted,
+}
+
+fn classify(backup: bool, marker: bool) -> TakeoverState {
+    match (backup, marker) {
+        (false, false) => TakeoverState::NotTakenOver,
+        (true, true) => TakeoverState::Active,
+        (true, false) => TakeoverState::Indeterminate,
+        (false, true) => TakeoverState::Corrupted,
+    }
+}
+
+pub fn takeover_state() -> TakeoverState {
+    classify(backup_exists(), marker_exists())
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Backup {
@@ -33,8 +111,10 @@ pub fn backup_exists() -> bool {
 
 /// Save every enabled network service's explicit DNS settings, then point all
 /// of them at the local proxy. On partial failure, already-modified services
-/// are rolled back before returning.
+/// are rolled back before returning. The takeover-active marker is created
+/// last, only once every service was switched.
 pub fn take_over(server: IpAddr) -> Result<(), String> {
+    let _lock = lock()?;
     if backup_exists() {
         return Err(format!(
             "DNS backup already exists at {BACKUP_PATH}; run `dnsrivet stop` before starting again"
@@ -56,13 +136,20 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
                 .iter()
                 .filter_map(|value| value.parse::<IpAddr>().ok()),
         );
+        // Snapshotting a service that already lists the takeover address
+        // would write our own loopback into the restore backup: after a later
+        // `stop`, the system would point at a proxy that no longer runs.
+        // Whether the entry is a stale leftover or another local DNS tool,
+        // proceeding is wrong.
         if servers
             .iter()
             .any(|existing| existing == &server.to_string())
         {
-            eprintln!(
-                "warning: network service {name:?} already uses {server}; another local DNS tool may own it"
-            );
+            return Err(format!(
+                "network service {name:?} already lists {server} as a DNS server; \
+                 refusing to take over. Clear it first (sudo networksetup \
+                 -setdnsservers {name:?} Empty) or remove the other local DNS tool"
+            ));
         }
         services.push(ServiceDns { name, servers });
     }
@@ -103,14 +190,56 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
         }
         changed.push(service.name.clone());
     }
+    create_marker()?;
     flush_caches();
     Ok(())
+}
+
+/// stop/uninstall entry point: handles all four takeover states under the
+/// cross-process lock and refuses to proceed when stopping would strand the
+/// machine on a dead loopback resolver.
+pub fn release() -> Result<bool, String> {
+    let _lock = lock()?;
+    if !backup_exists() {
+        if marker_exists() {
+            if system_points_at_loopback()? {
+                return Err(
+                    "a takeover marker exists without a DNS backup, and the system still \
+                     resolves through a loopback address; stopping now would cut off DNS. \
+                     Restore DNS manually first (for each service: sudo networksetup \
+                     -setdnsservers <service> Empty), then retry"
+                        .into(),
+                );
+            }
+            remove_marker()?;
+        }
+        return Ok(false);
+    }
+    // Marker first: a crash between these steps leaves backup-without-marker,
+    // which `stop` can still restore from.
+    remove_marker()?;
+    restore()
+}
+
+fn system_points_at_loopback() -> Result<bool, String> {
+    if !current_loopback_dns()?.is_empty() {
+        return Ok(true);
+    }
+    for name in list_services()? {
+        let loopback = get_dns_servers(&name)?
+            .iter()
+            .any(|value| value.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+        if loopback {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Restore the exact per-service DNS snapshot. A missing backup means this
 /// process has no evidence that it owns the current DNS settings, so it safely
 /// leaves them untouched.
-pub fn restore() -> Result<bool, String> {
+fn restore() -> Result<bool, String> {
     if !backup_exists() {
         return Ok(false);
     }
@@ -178,6 +307,101 @@ pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, Str
         .collect())
 }
 
+pub enum TickOutcome {
+    /// Gate not satisfied (no backup, no marker): nothing to guard.
+    NotActive,
+    /// Every backed-up service still points exactly at the takeover address.
+    Clean,
+    /// Drift was detected and corrected.
+    Reasserted {
+        corrected: Vec<String>,
+        /// Global DNS captured while takeover was lost — the only moment the
+        /// current network's real resolvers are visible. Runtime-only; the
+        /// restore backup is never rewritten.
+        captured: Vec<SocketAddr>,
+    },
+}
+
+/// One watchdog cycle, run by the daemon under the cross-process lock:
+/// verify that every backed-up service still lists exactly the takeover
+/// address (a second resolver would leak queries around the proxy), and on
+/// drift capture the currently effective DNS before reasserting.
+pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
+    let _lock = lock()?;
+    if !(backup_exists() && marker_exists()) {
+        return Ok(TickOutcome::NotActive);
+    }
+    let expected = server.to_string();
+    let current = service_dns_snapshot()?;
+    let drifted: Vec<String> = services_needing_reassert(&current, &expected)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if drifted.is_empty() {
+        return Ok(TickOutcome::Clean);
+    }
+
+    // Capture before reassert: right now scutil still shows the network's
+    // own resolvers; afterwards it will only show the loopback again.
+    let captured: Vec<SocketAddr> = effective_dns_servers()
+        .map(|ips| {
+            filter_fallback_servers(ips, &[server])
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, 53))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut errors = Vec::new();
+    for name in &drifted {
+        if let Err(err) = set_dns_servers(name, std::slice::from_ref(&expected)) {
+            errors.push(err);
+        }
+    }
+    flush_caches();
+    if !errors.is_empty() {
+        return Err(format!("reassert incomplete: {}", errors.join("; ")));
+    }
+    Ok(TickOutcome::Reasserted {
+        corrected: drifted,
+        captured,
+    })
+}
+
+/// Read-only variant for `restart`'s verification wait.
+pub fn takeover_intact(server: IpAddr) -> Result<bool, String> {
+    let expected = server.to_string();
+    let current = service_dns_snapshot()?;
+    Ok(services_needing_reassert(&current, &expected).is_empty())
+}
+
+/// Current DNS list of every backed-up service that still exists.
+fn service_dns_snapshot() -> Result<Vec<(String, Vec<String>)>, String> {
+    let backup = read_backup()?;
+    let all_services = list_all_services()?;
+    let mut snapshot = Vec::new();
+    for service in &backup.services {
+        if !all_services.contains(&service.name) {
+            continue; // vanished service: nothing to reassert
+        }
+        snapshot.push((service.name.clone(), get_dns_servers(&service.name)?));
+    }
+    Ok(snapshot)
+}
+
+/// Exact-list check: anything other than exactly `[server]` is drift, even a
+/// list that still contains the server alongside a second resolver.
+fn services_needing_reassert<'a>(
+    current: &'a [(String, Vec<String>)],
+    server: &str,
+) -> Vec<&'a str> {
+    current
+        .iter()
+        .filter(|(_, servers)| !(servers.len() == 1 && servers[0] == server))
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
 /// Loopback DNS endpoints currently advertised by macOS. This lets unprivileged
 /// health checks probe the active service without reading its private config.
 pub fn current_loopback_dns() -> Result<Vec<SocketAddr>, String> {
@@ -198,17 +422,55 @@ fn read_backup() -> Result<Backup, String> {
 fn effective_dns_servers() -> Result<Vec<IpAddr>, String> {
     let output = run(SCUTIL, &["--dns"])?;
     let text = stdout(&output, "read effective system DNS")?;
-    Ok(parse_scutil_dns(&text))
+    Ok(parse_scutil_global_dns(&text))
 }
 
-fn parse_scutil_dns(text: &str) -> Vec<IpAddr> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("nameserver["))
-        .filter_map(|line| line.split_once(':').map(|(_, value)| value.trim()))
-        .filter(|value| !value.contains('%'))
-        .filter_map(|value| value.parse().ok())
-        .collect()
+/// Global default resolvers only. Accepted resolver blocks must sit in the
+/// section titled exactly `DNS configuration` — every `DNS configuration
+/// (...)` variant (scoped or service-specific) is excluded — and must carry
+/// no `domain` restriction: a split-DNS VPN resolver in the main section
+/// serves only its own domain and must never become a global fallback.
+fn parse_scutil_global_dns(text: &str) -> Vec<IpAddr> {
+    fn commit(pending: &mut Vec<IpAddr>, domain_scoped: &mut bool, out: &mut Vec<IpAddr>) {
+        if !*domain_scoped {
+            out.append(pending);
+        }
+        pending.clear();
+        *domain_scoped = false;
+    }
+
+    let mut servers = Vec::new();
+    let mut pending = Vec::new();
+    let mut domain_scoped = false;
+    let mut in_global = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line == "DNS configuration" {
+            commit(&mut pending, &mut domain_scoped, &mut servers);
+            in_global = true;
+        } else if line.starts_with("DNS configuration (") {
+            commit(&mut pending, &mut domain_scoped, &mut servers);
+            in_global = false;
+        } else if !in_global {
+            continue;
+        } else if line.starts_with("resolver #") {
+            commit(&mut pending, &mut domain_scoped, &mut servers);
+        } else if line.starts_with("domain") {
+            // `domain : x` restricts the block; `search domain[N]` does not.
+            domain_scoped = true;
+        } else if line.starts_with("nameserver[")
+            && let Some((_, value)) = line.split_once(':')
+        {
+            let value = value.trim();
+            if !value.contains('%')
+                && let Ok(ip) = value.parse()
+            {
+                pending.push(ip);
+            }
+        }
+    }
+    commit(&mut pending, &mut domain_scoped, &mut servers);
+    servers
 }
 
 fn filter_fallback_servers(mut servers: Vec<IpAddr>, denied: &[IpAddr]) -> Vec<IpAddr> {
@@ -413,6 +675,8 @@ mod tests {
     #[test]
     fn parses_and_filters_effective_dns_servers() {
         let text = r#"
+DNS configuration
+
 resolver #1
   nameserver[0] : 192.168.1.1
   nameserver[1] : 127.0.0.1
@@ -422,11 +686,71 @@ resolver #2
   nameserver[2] : 2001:db8::53
 "#;
         assert_eq!(
-            filter_fallback_servers(parse_scutil_dns(text), &["127.0.0.1".parse().unwrap()]),
+            filter_fallback_servers(
+                parse_scutil_global_dns(text),
+                &["127.0.0.1".parse().unwrap()]
+            ),
             [
                 "192.168.1.1".parse::<IpAddr>().unwrap(),
                 "2001:db8::53".parse::<IpAddr>().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn global_parser_excludes_domain_and_scoped_resolvers() {
+        let text = r#"
+DNS configuration
+
+resolver #1
+  search domain[0] : lan
+  nameserver[0] : 192.168.1.1
+  nameserver[1] : fdfd:3b1d:1c26::1
+
+resolver #2
+  domain   : corp.example
+  nameserver[0] : 10.0.0.53
+
+resolver #3
+  domain   : local
+  options  : mdns
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 10.9.9.9
+  if_index : 12 (en0)
+"#;
+        assert_eq!(
+            parse_scutil_global_dns(text),
+            [
+                "192.168.1.1".parse::<IpAddr>().unwrap(),
+                "fdfd:3b1d:1c26::1".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn drift_requires_exactly_the_takeover_address() {
+        let current = vec![
+            ("Wi-Fi".to_string(), vec!["127.0.0.1".to_string()]),
+            (
+                "USB LAN".to_string(),
+                vec!["127.0.0.1".to_string(), "8.8.8.8".to_string()],
+            ),
+            ("Bridge".to_string(), Vec::new()),
+        ];
+        assert_eq!(
+            services_needing_reassert(&current, "127.0.0.1"),
+            ["USB LAN", "Bridge"]
+        );
+    }
+
+    #[test]
+    fn takeover_state_matrix() {
+        assert_eq!(classify(false, false), TakeoverState::NotTakenOver);
+        assert_eq!(classify(true, true), TakeoverState::Active);
+        assert_eq!(classify(true, false), TakeoverState::Indeterminate);
+        assert_eq!(classify(false, true), TakeoverState::Corrupted);
     }
 }

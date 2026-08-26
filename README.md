@@ -147,6 +147,15 @@ with a two-second bound per server. Loopback and self-listener addresses are
 discarded, so the fallback cannot recurse through DNSRivet. If no usable
 pre-takeover server exists, exhaustion still returns `SERVFAIL`.
 
+While the service runs, a takeover watchdog re-checks every two minutes
+(immediately on daemon start) that each backed-up network service still
+points exactly at the takeover address. macOS updates are known to rewrite
+network preferences and silently drop the takeover; the watchdog detects
+that, captures the network's current DNS as a fresh runtime fallback, and
+re-applies the takeover. The restore backup itself is never rewritten. If an
+external tool keeps rewriting DNS, the watchdog backs off to a 30-minute
+cadence and says so in the log instead of fighting it.
+
 ## Configuration
 
 ```toml
@@ -198,6 +207,14 @@ cached (RFC 5452).
   local DNSSEC validation.
 - System fallback may use conventional unencrypted DNS, depending on the
   pre-takeover macOS configuration.
+- Takeover is guarded by a periodic watchdog; between checks there is a
+  window (up to the check interval) in which an externally cleared takeover
+  leaves queries on the system's own DNS.
+- VPN and Network Extension scoped resolvers are outside the takeover and are
+  never used as fallback servers.
+- When the takeover is intact but the network changed underneath it, the
+  fallback list stays as captured and only refreshes on the next takeover
+  loss. This is a known limitation of this release.
 - Debug logs can contain queried domain names and complete upstream URLs.
 - Service commands modify system-wide `launchd` and network DNS state and
   therefore require `sudo`.
@@ -331,6 +348,12 @@ sudo dnsrivet restart --config dnsrivet.toml
 loopback 和自身监听地址会被过滤，避免形成递归自环。如果没有可用的接管前服务器，
 最终仍返回 `SERVFAIL`。
 
+服务运行期间，接管看门狗每两分钟（守护进程启动时立即执行一次）核对备份内每个
+网络服务是否仍严格指向接管地址。macOS 更新可能重写网络偏好、静默清除接管；
+看门狗检测到后，会先把当前网络的 DNS 捕获为新的运行时回退列表，再重新接管。
+恢复用的备份本身永不改写。若有外部工具持续改写 DNS，看门狗会退避到 30 分钟
+周期并在日志中说明，而不是无限对抗。
+
 ## 配置与缓存
 
 完整配置见 [`example.config.toml`](example.config.toml)。DoH/DoH3 默认端口为
@@ -354,6 +377,12 @@ question 一致，才会被返回或写入缓存（RFC 5452）。
 
 - DNSRivet 加密到兼容上游的传输，但不在本机执行 DNSSEC 验证。
 - 系统 DNS 回退是否加密取决于接管前的 macOS 配置，可能使用传统明文 DNS。
+- 接管由周期性看门狗守护；两次检查之间存在窗口（最长一个检查周期），期间被
+  外部清除的接管会让查询走系统自身 DNS。
+- VPN 与 Network Extension 的 scoped resolver 不在接管范围内，也不会被用作
+  回退服务器。
+- 接管完好但底层网络已切换时，回退列表保持接管时捕获的值，仅在下一次接管
+  丢失时刷新。此为本版本的已知限制。
 - debug 日志可能包含查询域名和完整上游 URL。
 - 服务命令修改系统级 `launchd` 和网络 DNS，因此需要 `sudo`。
 - 源码会主动拒绝在非 macOS 目标上编译。

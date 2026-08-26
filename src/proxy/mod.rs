@@ -18,6 +18,13 @@ const MAX_TCP_CONNECTIONS: usize = 256;
 const MAX_TCP_QUERY_SIZE: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(120);
+const WATCHDOG_SLOW_INTERVAL: Duration = Duration::from_secs(1800);
+/// A reassert followed by renewed drift within this many ticks counts as one
+/// flap strike; this many strikes switch to the slow cadence.
+const FLAP_WINDOW_TICKS: u32 = 3;
+const FLAP_STRIKES: u32 = 3;
+
 pub async fn serve(config: Config) -> Result<(), String> {
     let system_fallback = match crate::osdns::fallback_servers(&config.listeners) {
         Ok(servers) => {
@@ -68,9 +75,106 @@ pub async fn serve(config: Config) -> Result<(), String> {
         ));
     }
 
+    // The takeover watchdog only makes sense with a loopback:53 listener
+    // (service mode). Its gate — backup, marker, root — is re-evaluated on
+    // every tick, never once at startup: `start` boots this daemon before it
+    // writes the backup, so a one-shot check would disable the watchdog
+    // forever.
+    match crate::service::takeover_address(&config.listeners) {
+        Ok(takeover_ip) => {
+            tokio::spawn(watchdog_loop(takeover_ip, manager.clone()));
+        }
+        Err(_) => log::debug!("takeover watchdog not started: no loopback port-53 listener"),
+    }
+
     wait_for_shutdown().await;
     log::info!("shutting down");
     Ok(())
+}
+
+/// Periodically verify the DNS takeover and repair it when an external event
+/// (a macOS update rewriting network preferences, another tool) removed it.
+/// The first tick fires immediately, so a daemon restarted while DNS is
+/// already drifted recovers in seconds rather than a full interval.
+async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
+    if unsafe { libc::geteuid() } != 0 {
+        log::info!("takeover watchdog inactive: not running as root");
+        return;
+    }
+    let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks_since_reassert: Option<u32> = None;
+    let mut flap_strikes = 0u32;
+    let mut slow_mode = false;
+    loop {
+        interval.tick().await;
+        // networksetup/scutil are blocking subprocess calls; keep them off
+        // the single-threaded reactor.
+        let outcome = match tokio::task::spawn_blocking(move || crate::osdns::watchdog_tick(server))
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                log::warn!("takeover watchdog task failed: {err}");
+                continue;
+            }
+        };
+        match outcome {
+            Ok(crate::osdns::TickOutcome::NotActive) => {
+                log::debug!("takeover watchdog idle: takeover not active");
+            }
+            Ok(crate::osdns::TickOutcome::Clean) => {
+                if slow_mode {
+                    slow_mode = false;
+                    flap_strikes = 0;
+                    ticks_since_reassert = None;
+                    interval = tokio::time::interval(WATCHDOG_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    interval.reset();
+                    log::info!("DNS settings stable again; watchdog back to normal cadence");
+                } else if let Some(ticks) = &mut ticks_since_reassert {
+                    *ticks += 1;
+                    if *ticks >= FLAP_WINDOW_TICKS {
+                        ticks_since_reassert = None;
+                        flap_strikes = 0;
+                    }
+                }
+            }
+            Ok(crate::osdns::TickOutcome::Reasserted {
+                corrected,
+                captured,
+            }) => {
+                log::warn!(
+                    "system DNS no longer pointed at {server} on {corrected:?}; takeover reasserted"
+                );
+                if captured.is_empty() {
+                    log::warn!(
+                        "could not capture the current network DNS; keeping the previous fallback list"
+                    );
+                } else {
+                    log::info!("runtime system DNS fallback refreshed: {captured:?}");
+                    manager.set_system_fallback(captured);
+                }
+                flap_strikes = if ticks_since_reassert.is_some() {
+                    flap_strikes + 1
+                } else {
+                    1
+                };
+                ticks_since_reassert = Some(0);
+                if flap_strikes >= FLAP_STRIKES && !slow_mode {
+                    slow_mode = true;
+                    interval = tokio::time::interval(WATCHDOG_SLOW_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    interval.reset();
+                    log::warn!(
+                        "DNS settings keep being rewritten externally; another DNS manager may be active — checking every {}s from now on",
+                        WATCHDOG_SLOW_INTERVAL.as_secs()
+                    );
+                }
+            }
+            Err(err) => log::warn!("takeover watchdog: {err}"),
+        }
+    }
 }
 
 async fn udp_loop(

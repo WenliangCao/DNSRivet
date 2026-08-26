@@ -22,10 +22,21 @@ pub fn start(
     if launchd::is_loaded() {
         return Err("service is already loaded; use `dnsrivet restart`".into());
     }
-    if osdns::backup_exists() {
-        return Err(
-            "a previous DNS backup is still present; run `dnsrivet stop` before starting".into(),
-        );
+    match osdns::takeover_state() {
+        osdns::TakeoverState::NotTakenOver => {}
+        osdns::TakeoverState::Corrupted => {
+            return Err(
+                "a takeover-active marker exists without a DNS backup (state corrupted); \
+                 run `dnsrivet stop` to clean up before starting"
+                    .into(),
+            );
+        }
+        osdns::TakeoverState::Active | osdns::TakeoverState::Indeterminate => {
+            return Err(
+                "a previous DNS backup is still present; run `dnsrivet stop` before starting"
+                    .into(),
+            );
+        }
     }
 
     let installed_config = install_config(config_path, generated_config)?;
@@ -79,7 +90,7 @@ pub fn start(
 
 pub fn stop() -> Result<String, String> {
     require_root()?;
-    let restored = osdns::restore()?;
+    let restored = osdns::release()?;
     let managed = launchd::is_installed() || launchd::is_loaded();
     if managed {
         launchd::set_enabled(false)?;
@@ -111,16 +122,63 @@ pub fn restart(
     launchd::restart()?;
     let addr = installed_probe_address()?;
     wait_for_dns(addr, Duration::from_secs(15))?;
-    Ok("service restarted and DNS probe passed".into())
+    // The restarted daemon reconciles the takeover itself on its immediate
+    // first watchdog tick; this CLI only observes the result and never
+    // touches DNS settings.
+    Ok(match osdns::takeover_state() {
+        osdns::TakeoverState::Active => {
+            if wait_for_reassertion(addr.ip(), Duration::from_secs(15)) {
+                "service restarted; DNS probe passed and takeover verified".into()
+            } else {
+                "service restarted and DNS probe passed, but takeover verification did not \
+                 complete in time; check `dnsrivet status`"
+                    .into()
+            }
+        }
+        osdns::TakeoverState::NotTakenOver => "service restarted and DNS probe passed".into(),
+        osdns::TakeoverState::Indeterminate | osdns::TakeoverState::Corrupted => {
+            "service restarted and DNS probe passed, but the takeover state is inconsistent; \
+             run `dnsrivet stop` then `dnsrivet start` to re-establish it"
+                .into()
+        }
+    })
+}
+
+/// Poll until every backed-up service points exactly at the takeover address
+/// again (the daemon's first watchdog tick performs the actual reassert).
+fn wait_for_reassertion(server: IpAddr, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(true) = osdns::takeover_intact(server) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 pub fn status() -> Result<String, String> {
+    let takeover = match osdns::takeover_state() {
+        osdns::TakeoverState::Active => "takeover: active",
+        osdns::TakeoverState::NotTakenOver => "takeover: not active",
+        osdns::TakeoverState::Indeterminate => {
+            "takeover: indeterminate (backup without marker); run `sudo dnsrivet stop`"
+        }
+        osdns::TakeoverState::Corrupted => {
+            "takeover: state corrupted (marker without backup); run `sudo dnsrivet stop`"
+        }
+    };
     if !launchd::is_loaded() {
-        return Ok(if launchd::is_installed() {
-            "service: installed but stopped".into()
-        } else {
-            "service: not installed".into()
-        });
+        return Ok(format!(
+            "{}\n{takeover}",
+            if launchd::is_installed() {
+                "service: installed but stopped"
+            } else {
+                "service: not installed"
+            }
+        ));
     }
     let addresses = match installed_probe_address() {
         Ok(addr) => vec![addr],
@@ -135,19 +193,23 @@ pub fn status() -> Result<String, String> {
     let mut failures = Vec::new();
     for addr in addresses {
         match wait_for_dns(addr, Duration::from_secs(2)) {
-            Ok(()) => return Ok(format!("service: loaded; DNS probe at {addr}: healthy")),
+            Ok(()) => {
+                return Ok(format!(
+                    "service: loaded; DNS probe at {addr}: healthy\n{takeover}"
+                ));
+            }
             Err(err) => failures.push(format!("{addr}: {err}")),
         }
     }
     Ok(format!(
-        "service: loaded; DNS probe failed ({})",
+        "service: loaded; DNS probe failed ({})\n{takeover}",
         failures.join("; ")
     ))
 }
 
 pub fn uninstall() -> Result<String, String> {
     require_root()?;
-    let restored = osdns::restore()?;
+    let restored = osdns::release()?;
     let managed = launchd::is_installed() || launchd::is_loaded();
     if managed {
         launchd::set_enabled(false)?;
@@ -385,7 +447,8 @@ fn remove_installed_binary() -> Result<(), String> {
     }
 }
 
-fn takeover_address(listeners: &[SocketAddr]) -> Result<IpAddr, String> {
+/// Also used by the daemon's takeover watchdog to derive the guarded address.
+pub(crate) fn takeover_address(listeners: &[SocketAddr]) -> Result<IpAddr, String> {
     listeners
         .iter()
         .find(|addr| addr.port() == 53 && addr.ip().is_loopback() && addr.is_ipv4())
