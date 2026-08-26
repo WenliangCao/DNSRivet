@@ -165,9 +165,16 @@ name = "Primary DoH3"
 type = "doh3" # doh | doh3 | dot | doq | legacy
 endpoint = "https://resolver.example/dns-query"
 bootstrap_ip = ""
-timeout = 5000 # milliseconds; 0 disables the timeout
+timeout = 5000 # milliseconds; omitted = 5000
 ip_stack = "both" # both | v4 | v6
 ```
+
+An explicit `timeout = 0` disables the timeout and is a dangerous advanced
+option: when the first upstream black-holes traffic (drops packets without
+refusing), that query never reaches later upstreams or the system fallback,
+and sustained load hangs queries one by one until the in-flight budget of 512
+is exhausted and further UDP queries are dropped. Use it only when the first
+upstream's reachability is fully trusted.
 
 See [`example.config.toml`](example.config.toml) for the complete annotated
 example. DoH and DoH3 default to port 443; DoT and DoQ default to 853;
@@ -321,6 +328,11 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 
 完整配置见 [`example.config.toml`](example.config.toml)。DoH/DoH3 默认端口为
 443，DoT/DoQ 为 853，传统 DNS 为 53。
+
+`timeout` 省略时默认 5000 毫秒。显式写 `timeout = 0` 表示完全禁用超时，属于
+危险的高级选项：第一上游黑洞（丢包不拒绝）时，该查询不会进入后续上游或系统
+回退，持续请求会逐个挂起并最终耗尽 512 项并发额度，导致后续 UDP 查询被丢弃。
+仅在完全信任首上游可达性时使用。
 
 缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本、多问题或
 `RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别和

@@ -57,9 +57,16 @@ struct RawUpstream {
     kind: String,
     endpoint: String,
     bootstrap_ip: String,
-    timeout: u64,
+    /// None (omitted) = DEFAULT_TIMEOUT_MS; explicit 0 = no timeout at all.
+    timeout: Option<u64>,
     ip_stack: String,
 }
+
+/// Applied when an upstream omits `timeout`. An omitted field must never mean
+/// "wait forever": a black-holed first upstream would then hang every query
+/// and exhaust the in-flight budget. Only an explicit `timeout = 0` opts into
+/// that behavior.
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
 
 // ---------- validated layer ----------
 
@@ -132,7 +139,8 @@ pub struct Upstream {
     pub path: String,
     /// Pre-resolved address; filled from `bootstrap_ip` or an IP-literal host.
     pub bootstrap_ip: Option<IpAddr>,
-    /// 0 = no timeout.
+    /// Milliseconds before this upstream is abandoned for the next one.
+    /// 0 = no timeout (explicit opt-in only; omitted fields become 5000).
     pub timeout_ms: u64,
     pub ip_stack: IpStack,
 }
@@ -238,7 +246,7 @@ pub fn quick_toml(
                 kind,
                 endpoint,
                 bootstrap_ip: String::new(),
-                timeout: timeout_ms.unwrap_or(5000),
+                timeout: Some(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
                 ip_stack: "both".into(),
             },
         );
@@ -476,7 +484,7 @@ fn parse_upstream(
         port,
         path,
         bootstrap_ip,
-        timeout_ms: raw.timeout,
+        timeout_ms: raw.timeout.unwrap_or(DEFAULT_TIMEOUT_MS),
         ip_stack,
     })
 }
@@ -587,5 +595,32 @@ mod tests {
     fn quick_config_rejects_ambiguous_hostname_without_type() {
         let err = quick_toml(&[], &["resolver.example".into()], None, None, false).unwrap_err();
         assert!(err.contains("type is required"));
+    }
+
+    #[test]
+    fn omitted_timeout_defaults_to_5000() {
+        let loaded = load_text(
+            "[upstream.0]\ntype = \"doh\"\nendpoint = \"https://resolver.example/dns-query\"\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.upstreams[0].timeout_ms, 5000);
+    }
+
+    #[test]
+    fn explicit_zero_timeout_stays_disabled() {
+        let loaded = load_text(
+            "[upstream.0]\ntype = \"doh\"\nendpoint = \"https://resolver.example/dns-query\"\ntimeout = 0\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.upstreams[0].timeout_ms, 0);
+    }
+
+    #[test]
+    fn explicit_timeout_is_preserved() {
+        let loaded = load_text(
+            "[upstream.0]\ntype = \"doh\"\nendpoint = \"https://resolver.example/dns-query\"\ntimeout = 800\n",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.upstreams[0].timeout_ms, 800);
     }
 }

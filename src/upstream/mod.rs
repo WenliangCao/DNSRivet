@@ -304,6 +304,86 @@ mod tests {
         drop(dead);
     }
 
+    fn test_upstream(name: &str, addr: SocketAddr, timeout_ms: u64) -> Upstream {
+        Upstream {
+            name: name.into(),
+            proto: Proto::Legacy,
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            path: String::new(),
+            bootstrap_ip: Some(addr.ip()),
+            timeout_ms,
+            ip_stack: IpStack::Both,
+        }
+    }
+
+    const TEST_QUERY: [u8; 17] = [
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x01,
+    ];
+
+    /// Documented hazard, locked in as a regression test: with an explicit
+    /// `timeout = 0`, a black-holed first upstream hangs the query forever and
+    /// the healthy second upstream is never consulted.
+    #[tokio::test]
+    async fn zero_timeout_never_fails_over_past_a_blackhole() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(
+            vec![
+                test_upstream("blackhole", blackhole.local_addr().unwrap(), 0),
+                test_upstream("healthy", healthy.local_addr().unwrap(), 0),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let pending =
+            tokio::time::timeout(Duration::from_millis(300), manager.forward(&TEST_QUERY, false))
+                .await;
+        assert!(pending.is_err(), "timeout=0 must hang, not fail over");
+
+        let mut buf = [0u8; 512];
+        assert!(blackhole.try_recv_from(&mut buf).is_ok());
+        assert!(
+            healthy.try_recv_from(&mut buf).is_err(),
+            "healthy upstream must receive zero packets"
+        );
+    }
+
+    /// Control group: any positive timeout restores ordered failover.
+    #[tokio::test]
+    async fn bounded_timeout_fails_over_to_the_healthy_upstream() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (n, peer) = healthy.recv_from(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            healthy.send_to(&query[..n], peer).await.unwrap();
+        });
+
+        let manager = Manager::new(
+            vec![
+                test_upstream("blackhole", blackhole.local_addr().unwrap(), 200),
+                test_upstream("healthy", healthy_addr, 200),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let response = manager.forward(&TEST_QUERY, false).await.unwrap();
+        assert_eq!(&response[..2], &TEST_QUERY[..2]);
+        assert_ne!(response[2] & 0x80, 0);
+        responder.await.unwrap();
+
+        let mut buf = [0u8; 512];
+        assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
     #[tokio::test]
     async fn exhausted_upstreams_record_missing_system_fallback_once() {
         let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
