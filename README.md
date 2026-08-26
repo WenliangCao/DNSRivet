@@ -60,7 +60,8 @@ cargo build --release
 
 ## Install
 
-DNSRivet is distributed as a signed and notarized macOS package.
+DNSRivet supports two alternative installation methods. Do not combine them
+on the same machine.
 
 ### Signed macOS package
 
@@ -77,6 +78,32 @@ sudo dnsrivet start \
 
 Installing a newer PKG restarts an already running DNSRivet service while
 preserving its configuration and DNS backup.
+
+### Homebrew
+
+```bash
+brew install dnsrivet/tap/dnsrivet
+sudo dnsrivet start \
+  --upstream 'doh3=https://resolver.example/profile'
+```
+
+The tap installs the signed universal binary from the GitHub release. If Homebrew
+refuses to load a non-official tap, trust it first with
+`brew trust --tap dnsrivet/tap`.
+
+After an upgrade, explicitly load the new binary into the system service:
+
+```bash
+brew upgrade dnsrivet
+sudo dnsrivet restart
+```
+
+Before removing the formula, restore system DNS and remove the launchd service:
+
+```bash
+sudo dnsrivet uninstall
+brew uninstall dnsrivet
+```
 
 ## Run in the foreground
 
@@ -327,7 +354,7 @@ cp example.config.toml dnsrivet.toml
 
 ## 安装
 
-DNSRivet 以签名并通过 Apple 公证的 macOS 安装包分发。
+DNSRivet 提供两种互斥的安装方式，请不要在同一台机器上混用。
 
 ### 签名 macOS 安装包
 
@@ -343,6 +370,31 @@ sudo dnsrivet start \
 
 以后安装新版 PKG 时，如果 DNSRivet 已在运行，安装器会保留配置和 DNS 备份并
 自动重启服务。
+
+### Homebrew
+
+```bash
+brew install dnsrivet/tap/dnsrivet
+sudo dnsrivet start \
+  --upstream 'doh3=https://resolver.example/profile'
+```
+
+Homebrew 会安装 GitHub Release 中签名过的 Universal 2 二进制。如果 Homebrew 拒绝
+加载非官方 tap，先执行 `brew trust --tap dnsrivet/tap` 信任它。
+
+升级后需要显式让系统服务载入新版本：
+
+```bash
+brew upgrade dnsrivet
+sudo dnsrivet restart
+```
+
+移除公式前，应先恢复系统 DNS 并卸载 launchd 服务：
+
+```bash
+sudo dnsrivet uninstall
+brew uninstall dnsrivet
+```
 
 ## macOS 服务模式
 
