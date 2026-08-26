@@ -35,7 +35,7 @@ symbol stripping, and abort-on-panic behavior.
 
 | Measurement | Observed value |
 | --- | ---: |
-| Release binary | 2,506,016 bytes (2.39 MiB) |
+| Release binary | 2,523,120 bytes (2.41 MiB) |
 | RSS after a fresh DoH3 connection | 4,656 KiB |
 | RSS after load and about four minutes | 4,912 KiB |
 | Tokio runtime threads | 1 |
@@ -260,7 +260,7 @@ release 配置启用 LTO、单 codegen unit、符号剥离和 panic abort，以�
 
 | 测量项 | 实测值 |
 | --- | ---: |
-| release 二进制 | 2,506,016 bytes（2.39 MiB） |
+| release 二进制 | 2,523,120 bytes（2.41 MiB） |
 | 新建 DoH3 连接后的 RSS | 4,656 KiB |
 | 负载结束约四分钟后的 RSS | 4,912 KiB |
 | Tokio 运行时线程 | 1 |
