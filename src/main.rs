@@ -12,6 +12,7 @@ mod osdns;
 mod proxy;
 mod service;
 mod upstream;
+mod wire;
 
 fn main() -> ExitCode {
     let cmd = match cli::parse() {

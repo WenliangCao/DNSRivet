@@ -1,4 +1,4 @@
-use super::wire::{self, QueryMeta};
+use crate::wire::{self, QueryMeta};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;

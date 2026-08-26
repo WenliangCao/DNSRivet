@@ -220,6 +220,75 @@ pub fn truncate_to(message: &mut Vec<u8>, limit: usize) {
     }
 }
 
+/// Why an upstream response was rejected as an answer to a given query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationError {
+    TooShort,
+    NotAResponse,
+    OpcodeMismatch,
+    QdCountMismatch,
+    QuestionMismatch,
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ValidationError::TooShort => "response shorter than a DNS header",
+            ValidationError::NotAResponse => "QR flag not set",
+            ValidationError::OpcodeMismatch => "opcode differs from the query",
+            ValidationError::QdCountMismatch => "QDCOUNT differs from the query",
+            ValidationError::QuestionMismatch => "question differs from the query",
+        })
+    }
+}
+
+/// RFC 5452 §4.2: accept a response only when it matches the outstanding
+/// query — QR set, same opcode, same QDCOUNT, and (for single-question
+/// queries) the same canonicalized QNAME/QTYPE/QCLASS. DNS IDs are
+/// deliberately not compared here: encrypted transports pin them to 0 on the
+/// wire, so ID equality is enforced by the legacy transport alone.
+///
+/// A query with QDCOUNT = 0 (for example an RFC 7873 cookie probe) degrades
+/// to count equality; there is no question to compare.
+pub fn validate_response(query: &[u8], response: &[u8]) -> Result<(), ValidationError> {
+    if query.len() < HEADER_LEN || response.len() < HEADER_LEN {
+        return Err(ValidationError::TooShort);
+    }
+    if response[2] & 0x80 == 0 {
+        return Err(ValidationError::NotAResponse);
+    }
+    if (query[2] ^ response[2]) & 0x78 != 0 {
+        return Err(ValidationError::OpcodeMismatch);
+    }
+    let qd_query = read_u16(query, 4).ok_or(ValidationError::TooShort)?;
+    let qd_response = read_u16(response, 4).ok_or(ValidationError::TooShort)?;
+    if qd_response != qd_query {
+        return Err(ValidationError::QdCountMismatch);
+    }
+    if qd_query != 1 {
+        return Ok(());
+    }
+    match (parse_question(query), parse_question(response)) {
+        (Some(sent), Some(echoed)) if sent == echoed => Ok(()),
+        _ => Err(ValidationError::QuestionMismatch),
+    }
+}
+
+/// (canonical lowercase QNAME, QTYPE, QCLASS) of the first question.
+fn parse_question(message: &[u8]) -> Option<(Vec<u8>, u16, u16)> {
+    let (name, end) = read_name(message, HEADER_LEN)?;
+    Some((name, read_u16(message, end)?, read_u16(message, end + 2)?))
+}
+
+/// True for a client QUERY carrying more than one question. RFC 9619 requires
+/// such a message to be answered with FORMERR and never forwarded.
+pub fn is_multi_question_query(message: &[u8]) -> bool {
+    message.len() >= HEADER_LEN
+        && message[2] & 0x80 == 0
+        && message[2] & 0x78 == 0
+        && read_u16(message, 4).is_some_and(|count| count > 1)
+}
+
 #[derive(Clone, Copy)]
 struct ResourceRecord {
     kind: u16,
@@ -437,5 +506,90 @@ mod tests {
     fn clamps_rfc2308_negative_ttl() {
         assert_eq!(cache_ttl(&negative_response(30, 15), 1), Some(60));
         assert_eq!(cache_ttl(&negative_response(1200, 900), 1), Some(600));
+    }
+
+    #[test]
+    fn accepts_matching_response_case_insensitively() {
+        // The test fixtures use mixed-case names; canonicalization must make
+        // the comparison case-insensitive.
+        let query = question(7, false);
+        let response = positive_response(7, 60, false);
+        assert_eq!(validate_response(&query, &response), Ok(()));
+    }
+
+    #[test]
+    fn rejects_mismatched_responses_with_specific_errors() {
+        let query = question(7, false);
+        let good = positive_response(7, 60, false);
+
+        let mut not_a_response = good.clone();
+        not_a_response[2] &= !0x80;
+        assert_eq!(
+            validate_response(&query, &not_a_response),
+            Err(ValidationError::NotAResponse)
+        );
+
+        let mut wrong_opcode = good.clone();
+        wrong_opcode[2] |= 0x08;
+        assert_eq!(
+            validate_response(&query, &wrong_opcode),
+            Err(ValidationError::OpcodeMismatch)
+        );
+
+        let mut wrong_name = good.clone();
+        wrong_name[13] = b'z'; // first label byte of the echoed question
+        assert_eq!(
+            validate_response(&query, &wrong_name),
+            Err(ValidationError::QuestionMismatch)
+        );
+
+        let mut wrong_type = good.clone();
+        wrong_type[26] = 28; // A -> AAAA in the echoed question
+        assert_eq!(
+            validate_response(&query, &wrong_type),
+            Err(ValidationError::QuestionMismatch)
+        );
+
+        // Minimal header-only SERVFAIL with QDCOUNT=0: count mismatch.
+        let mut minimal = vec![0u8; 12];
+        minimal[..2].copy_from_slice(&7u16.to_be_bytes());
+        minimal[2] = 0x80;
+        minimal[3] = 0x82;
+        assert_eq!(
+            validate_response(&query, &minimal),
+            Err(ValidationError::QdCountMismatch)
+        );
+    }
+
+    #[test]
+    fn question_less_queries_degrade_to_count_equality() {
+        let mut probe = vec![0u8; 12];
+        probe[..2].copy_from_slice(&9u16.to_be_bytes());
+        probe[2] = 0x00;
+        let mut reply = probe.clone();
+        reply[2] = 0x80;
+        assert_eq!(validate_response(&probe, &reply), Ok(()));
+
+        let full = positive_response(9, 60, false);
+        assert_eq!(
+            validate_response(&probe, &full),
+            Err(ValidationError::QdCountMismatch)
+        );
+    }
+
+    #[test]
+    fn detects_multi_question_queries_only() {
+        let mut multi = question(1, false);
+        multi[4..6].copy_from_slice(&2u16.to_be_bytes());
+        assert!(is_multi_question_query(&multi));
+        assert!(!is_multi_question_query(&question(1, false)));
+
+        let mut response = multi.clone();
+        response[2] |= 0x80;
+        assert!(!is_multi_question_query(&response));
+
+        let mut status = multi;
+        status[2] |= 0x10; // non-QUERY opcode
+        assert!(!is_multi_question_query(&status));
     }
 }

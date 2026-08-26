@@ -181,9 +181,16 @@ example. DoH and DoH3 default to port 443; DoT and DoQ default to 853;
 conventional DNS defaults to 53.
 
 The cache accepts standard single-question recursive queries. Queries with
-EDNS options, TSIG, a non-zero EDNS version, multiple questions, or `RD=0`
-bypass the cache and are still forwarded normally. Cache keys include the
-canonical name, record type, class, and DNSSEC request bit.
+EDNS options, TSIG, a non-zero EDNS version, or `RD=0` bypass the cache and
+are still forwarded normally. Cache keys include the canonical name, record
+type, class, and DNSSEC request bit.
+
+A QUERY carrying more than one question is answered locally with a
+header-only FORMERR and never forwarded (RFC 9619). Question-less queries
+such as RFC 7873 cookie probes are forwarded to `legacy` upstreams only;
+encrypted transports require exactly one question. Every upstream and
+fallback response must echo the query's question before it is returned or
+cached (RFC 5452).
 
 ## Security boundary
 
@@ -334,9 +341,14 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 回退，持续请求会逐个挂起并最终耗尽 512 项并发额度，导致后续 UDP 查询被丢弃。
 仅在完全信任首上游可达性时使用。
 
-缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本、多问题或
+缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本或
 `RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别和
 DNSSEC 请求位。
+
+携带多个 question 的查询会在本地直接返回仅含报文头的 FORMERR，不会被转发
+（RFC 9619）。不含 question 的查询（如 RFC 7873 Cookie 探询）只会转发给
+`legacy` 上游；加密传输要求恰好一个 question。所有上游与回退响应必须与请求的
+question 一致，才会被返回或写入缓存（RFC 5452）。
 
 ## 安全边界
 

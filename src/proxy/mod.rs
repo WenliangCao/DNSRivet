@@ -1,10 +1,10 @@
 //! UDP + TCP DNS listener loops feeding the cache and upstream manager.
 
 mod cache;
-mod wire;
 
 use crate::config::Config;
 use crate::upstream::Manager;
+use crate::wire;
 use cache::Cache;
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,6 +187,12 @@ async fn resolve(
     client_tcp: bool,
     meta: Option<&wire::QueryMeta>,
 ) -> Vec<u8> {
+    // RFC 9619: a QUERY with more than one question is malformed. Answer it
+    // locally with FORMERR; it must never reach the cache or any upstream.
+    if wire::is_multi_question_query(query) {
+        return formerr(query);
+    }
+
     if let Some(meta) = meta
         && let Some(response) = cache.get(meta, [query[0], query[1]])
     {
@@ -214,11 +220,87 @@ fn servfail(query: &[u8]) -> Vec<u8> {
     response
 }
 
+/// Header-only FORMERR for multi-question queries. The question section is
+/// dropped and every count zeroed: RFC 9619 constrains all OPCODE=0 messages,
+/// so echoing QDCOUNT > 1 would make the error response itself malformed.
+fn formerr(query: &[u8]) -> Vec<u8> {
+    let mut response = vec![0u8; 12];
+    response[..2].copy_from_slice(&query[..2]);
+    response[2] = (query[2] & 0x79) | 0x80; // QR=1, keep opcode/RD, clear AA+TC
+    response[3] = 0x81; // RA=1, RCODE=FORMERR
+    response
+}
+
 async fn wait_for_shutdown() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{IpStack, Proto, Upstream};
+
+    fn multi_question_query() -> Vec<u8> {
+        let mut query = vec![0xab, 0xcd, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0];
+        query.extend_from_slice(&[1, b'a', 0, 0, 1, 0, 1]);
+        query.extend_from_slice(&[1, b'b', 0, 0, 1, 0, 1]);
+        query
+    }
+
+    #[test]
+    fn formerr_is_a_header_only_response() {
+        let query = multi_question_query();
+        let response = formerr(&query);
+        assert_eq!(response.len(), 12);
+        assert_eq!(&response[..2], &query[..2]);
+        assert_ne!(response[2] & 0x80, 0); // QR
+        assert_eq!(response[2] & 0x01, query[2] & 0x01); // RD echoed
+        assert_eq!(response[3] & 0x0f, 1); // FORMERR
+        assert_eq!(&response[4..12], &[0u8; 8]); // all four counts zero
+    }
+
+    #[tokio::test]
+    async fn multi_question_queries_never_reach_an_upstream() {
+        let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream_sock.local_addr().unwrap();
+        let manager = Manager::new(
+            vec![Upstream {
+                name: "counting".into(),
+                proto: Proto::Legacy,
+                host: addr.ip().to_string(),
+                port: addr.port(),
+                path: String::new(),
+                bootstrap_ip: Some(addr.ip()),
+                timeout_ms: 50,
+                ip_stack: IpStack::Both,
+            }],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+        let cache = Cache::new(false, 1);
+        let query = multi_question_query();
+        let meta = wire::parse_query_meta(&query);
+        assert!(meta.is_none(), "multi-question queries must bypass the cache");
+
+        for client_tcp in [false, true] {
+            let response = resolve(&manager, &cache, &query, client_tcp, meta.as_ref()).await;
+            assert_eq!(response.len(), 12);
+            assert_eq!(&response[..2], &query[..2]);
+            assert_ne!(response[2] & 0x80, 0);
+            assert_eq!(response[3] & 0x0f, 1);
+            assert_eq!(&response[4..12], &[0u8; 8]);
+        }
+
+        let mut buf = [0u8; 512];
+        assert!(
+            upstream_sock.try_recv_from(&mut buf).is_err(),
+            "upstream received a packet for a FORMERR-gated query"
+        );
     }
 }

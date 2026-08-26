@@ -118,6 +118,13 @@ impl Manager {
             };
             match result {
                 Ok(mut response) => {
+                    // Reject before touching recovery flags, the ID, or the
+                    // cache: an answer to the wrong question is an upstream
+                    // failure, not a recovery (RFC 5452).
+                    if let Err(err) = crate::wire::validate_response(query, &response) {
+                        log::debug!("upstream {}: rejected response: {err}", entry.name);
+                        continue;
+                    }
                     let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
                     let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
                     if fallback_was_active {
@@ -154,6 +161,12 @@ impl Manager {
             let attempt = legacy::query(*server, query, client_tcp);
             match tokio::time::timeout(Duration::from_secs(2), attempt).await {
                 Ok(Ok(response)) => {
+                    // Same gate as the configured-upstream path: this loop
+                    // returns directly and must validate for itself.
+                    if let Err(err) = crate::wire::validate_response(query, &response) {
+                        log::debug!("system DNS fallback {server}: rejected response: {err}");
+                        continue;
+                    }
                     if self.fallback_failed.swap(false, Ordering::Relaxed) {
                         log::info!("system DNS fallback recovered");
                     }
@@ -350,6 +363,69 @@ mod tests {
             healthy.try_recv_from(&mut buf).is_err(),
             "healthy upstream must receive zero packets"
         );
+    }
+
+    fn labeled_query(id: u16) -> Vec<u8> {
+        let mut query = Vec::from(id.to_be_bytes());
+        query.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        query.extend_from_slice(&[1, b'a', 0, 0, 1, 0, 1]);
+        query
+    }
+
+    /// Spawn a UDP responder that echoes with QR set; `mutate_name` turns it
+    /// into a liar answering a different question.
+    async fn udp_responder(mutate_name: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut message = [0u8; 512];
+            let (n, peer) = sock.recv_from(&mut message).await.unwrap();
+            message[2] |= 0x80;
+            if mutate_name {
+                message[13] = b'z';
+            }
+            sock.send_to(&message[..n], peer).await.unwrap();
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn responses_answering_a_different_question_are_rejected() {
+        let (liar_addr, liar) = udp_responder(true).await;
+        let (healthy_addr, healthy) = udp_responder(false).await;
+        let manager = Manager::new(
+            vec![
+                test_upstream("liar", liar_addr, 200),
+                test_upstream("healthy", healthy_addr, 200),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let query = labeled_query(0x4242);
+        let response = manager.forward(&query, false).await.unwrap();
+        assert_eq!(response[13], b'a', "answer must echo the real question");
+        liar.await.unwrap();
+        healthy.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_responses_are_validated_too() {
+        let (liar_addr, liar) = udp_responder(true).await;
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let manager = Manager::new(
+            vec![test_upstream("dead", dead.local_addr().unwrap(), 20)],
+            &["127.0.0.1:5354".parse().unwrap()],
+            vec![liar_addr],
+        )
+        .unwrap();
+
+        let query = labeled_query(0x4243);
+        assert!(manager.forward(&query, false).await.is_none());
+        assert!(manager.fallback_failed.load(Ordering::Relaxed));
+        liar.await.unwrap();
+        drop(dead);
     }
 
     /// Control group: any positive timeout restores ordered failover.
