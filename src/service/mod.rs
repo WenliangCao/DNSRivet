@@ -52,7 +52,7 @@ pub fn start(
         .and_then(std::fs::canonicalize)
         .map_err(|e| format!("resolve current executable: {e}"))?;
     let binary = install_binary(&current_binary)?;
-    install_command(&binary)?;
+    install_command(&binary, &current_binary)?;
     launchd::write_plist(&binary, &installed_config)?;
     drop(listeners);
 
@@ -114,6 +114,7 @@ pub fn restart(
     if !launchd::is_loaded() {
         return Err("service is not loaded; use `dnsrivet start`".into());
     }
+    refresh_installed_binary()?;
     if config_path.is_some() || generated_config.is_some() {
         let replacement = config_bytes(config_path, generated_config)?
             .expect("replacement requested when a config source is present");
@@ -384,11 +385,26 @@ fn install_binary(source: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(BINARY_PATH))
 }
 
-fn install_command(binary: &Path) -> Result<(), String> {
-    install_command_at(Path::new(COMMAND_PATH), binary)
+/// Refresh the daemon copy when `restart` is invoked from a package manager's
+/// binary. Calls through DNSRivet's own stable link resolve to `BINARY_PATH`
+/// and therefore remain a no-op.
+fn refresh_installed_binary() -> Result<(), String> {
+    let current = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|e| format!("resolve current executable: {e}"))?;
+    let installed =
+        std::fs::canonicalize(BINARY_PATH).unwrap_or_else(|_| PathBuf::from(BINARY_PATH));
+    if current != installed {
+        install_binary(&current)?;
+    }
+    Ok(())
 }
 
-fn install_command_at(command: &Path, binary: &Path) -> Result<(), String> {
+fn install_command(binary: &Path, invoking_binary: &Path) -> Result<(), String> {
+    install_command_at(Path::new(COMMAND_PATH), binary, invoking_binary)
+}
+
+fn install_command_at(command: &Path, binary: &Path, invoking_binary: &Path) -> Result<(), String> {
     let parent = command
         .parent()
         .ok_or_else(|| format!("command path {} has no parent", command.display()))?;
@@ -400,6 +416,12 @@ fn install_command_at(command: &Path, binary: &Path) -> Result<(), String> {
             let target = std::fs::read_link(command)
                 .map_err(|e| format!("read command link {}: {e}", command.display()))?;
             if target != binary {
+                // Homebrew owns its prefix link. If that link resolves to the
+                // executable which invoked `start`, leave it under Homebrew's
+                // ownership instead of replacing it with DNSRivet's link.
+                if paths_resolve_to_same_file(command, invoking_binary) {
+                    return Ok(());
+                }
                 return Err(format!(
                     "refusing to replace command link {} -> {}",
                     command.display(),
@@ -408,6 +430,9 @@ fn install_command_at(command: &Path, binary: &Path) -> Result<(), String> {
             }
         }
         Ok(_) => {
+            if paths_resolve_to_same_file(command, invoking_binary) {
+                return Ok(());
+            }
             return Err(format!(
                 "refusing to replace existing command path {}",
                 command.display()
@@ -427,6 +452,13 @@ fn install_command_at(command: &Path, binary: &Path) -> Result<(), String> {
         .map_err(|e| format!("create command link {}: {e}", temporary.display()))?;
     std::fs::rename(&temporary, command)
         .map_err(|e| format!("install command link {}: {e}", command.display()))
+}
+
+fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn remove_command() -> Result<(), String> {
@@ -609,15 +641,43 @@ mod tests {
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         std::fs::write(&binary, b"binary").unwrap();
 
-        install_command_at(&command, &binary).unwrap();
+        install_command_at(&command, &binary, &binary).unwrap();
         assert_eq!(std::fs::read_link(&command).unwrap(), binary);
         remove_command_at(&command, &binary).unwrap();
         assert!(!command.exists());
 
         std::fs::write(&command, b"unrelated").unwrap();
-        assert!(install_command_at(&command, &binary).is_err());
+        assert!(install_command_at(&command, &binary, &binary).is_err());
         remove_command_at(&command, &binary).unwrap();
         assert_eq!(std::fs::read(&command).unwrap(), b"unrelated");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaves_package_manager_command_link_owned_by_package_manager() {
+        let root = std::env::temp_dir().join(format!(
+            "dnsrivet-package-manager-command-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let package_binary = root.join("cellar/dnsrivet");
+        let installed_binary = root.join("support/dnsrivet");
+        let command = root.join("bin/dnsrivet");
+        std::fs::create_dir_all(package_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(installed_binary.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(command.parent().unwrap()).unwrap();
+        std::fs::write(&package_binary, b"package binary").unwrap();
+        std::fs::write(&installed_binary, b"installed binary").unwrap();
+        std::os::unix::fs::symlink(&package_binary, &command).unwrap();
+
+        install_command_at(&command, &installed_binary, &package_binary).unwrap();
+        assert_eq!(std::fs::read_link(&command).unwrap(), package_binary);
+        remove_command_at(&command, &installed_binary).unwrap();
+        assert!(command.is_symlink());
+
         std::fs::remove_dir_all(root).unwrap();
     }
 }
