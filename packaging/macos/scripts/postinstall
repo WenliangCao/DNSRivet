@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+binary="/Library/Application Support/DNSRivet/dnsrivet"
+command_path="/usr/local/bin/dnsrivet"
+label="system/io.github.wenliangcao.dnsrivet"
+
+/bin/mkdir -p /usr/local/bin
+if [ ! -L "$command_path" ]; then
+    /bin/ln -s "$binary" "$command_path"
+fi
+
+# A first-time package installation only installs the command. Configuration
+# remains an explicit user choice. During an upgrade, restart an already loaded
+# service so the newly installed binary takes effect immediately.
+if /bin/launchctl print "$label" >/dev/null 2>&1; then
+    "$binary" restart
+fi
+
+exit 0

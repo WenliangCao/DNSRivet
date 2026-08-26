@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+target_volume="${3:-/}"
+target_volume="${target_volume%/}"
+command_path="${target_volume}/usr/local/bin/dnsrivet"
+managed_binary="/Library/Application Support/DNSRivet/dnsrivet"
+homebrew_arm="${target_volume}/opt/homebrew/bin/dnsrivet"
+
+if [ -e "$homebrew_arm" ] || [ -L "$homebrew_arm" ]; then
+    echo "DNSRivet is already installed by Homebrew. Run 'brew uninstall dnsrivet' before installing the PKG." >&2
+    exit 1
+fi
+
+if [ -L "$command_path" ]; then
+    if [ "$(readlink "$command_path")" = "$managed_binary" ]; then
+        exit 0
+    fi
+    echo "Refusing to replace existing command link: /usr/local/bin/dnsrivet" >&2
+    exit 1
+fi
+
+if [ -e "$command_path" ]; then
+    echo "Refusing to replace existing command: /usr/local/bin/dnsrivet" >&2
+    exit 1
+fi
+
+exit 0
