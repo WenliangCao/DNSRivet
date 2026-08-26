@@ -25,7 +25,9 @@ struct FsLock {
 }
 
 fn lock() -> Result<FsLock, String> {
-    let parent = Path::new(LOCK_PATH).parent().expect("lock path has a parent");
+    let parent = Path::new(LOCK_PATH)
+        .parent()
+        .expect("lock path has a parent");
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
     let file = OpenOptions::new()

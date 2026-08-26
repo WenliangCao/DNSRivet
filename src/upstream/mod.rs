@@ -373,9 +373,11 @@ mod tests {
         )
         .unwrap();
 
-        let pending =
-            tokio::time::timeout(Duration::from_millis(300), manager.forward(&TEST_QUERY, false))
-                .await;
+        let pending = tokio::time::timeout(
+            Duration::from_millis(300),
+            manager.forward(&TEST_QUERY, false),
+        )
+        .await;
         assert!(pending.is_err(), "timeout=0 must hang, not fail over");
 
         let mut buf = [0u8; 512];

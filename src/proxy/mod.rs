@@ -110,15 +110,14 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
         interval.tick().await;
         // networksetup/scutil are blocking subprocess calls; keep them off
         // the single-threaded reactor.
-        let outcome = match tokio::task::spawn_blocking(move || crate::osdns::watchdog_tick(server))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                log::warn!("takeover watchdog task failed: {err}");
-                continue;
-            }
-        };
+        let outcome =
+            match tokio::task::spawn_blocking(move || crate::osdns::watchdog_tick(server)).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    log::warn!("takeover watchdog task failed: {err}");
+                    continue;
+                }
+            };
         match outcome {
             Ok(crate::osdns::TickOutcome::NotActive) => {
                 log::debug!("takeover watchdog idle: takeover not active");
@@ -390,7 +389,10 @@ mod tests {
         let cache = Cache::new(false, 1);
         let query = multi_question_query();
         let meta = wire::parse_query_meta(&query);
-        assert!(meta.is_none(), "multi-question queries must bypass the cache");
+        assert!(
+            meta.is_none(),
+            "multi-question queries must bypass the cache"
+        );
 
         for client_tcp in [false, true] {
             let response = resolve(&manager, &cache, &query, client_tcp, meta.as_ref()).await;
