@@ -159,17 +159,35 @@ fn wait_for_reassertion(server: IpAddr, timeout: Duration) -> bool {
     }
 }
 
-pub fn status() -> Result<String, String> {
-    let takeover = match osdns::takeover_state() {
-        osdns::TakeoverState::Active => "takeover: active",
-        osdns::TakeoverState::NotTakenOver => "takeover: not active",
+/// One status line for the takeover. "Armed" (backup + marker) is not proof
+/// that queries flow through the proxy — inside the watchdog's check window
+/// the system DNS can already be drifted — so when the installed config and
+/// backup are readable (root), verify the actual per-service DNS lists too.
+fn takeover_status_line() -> String {
+    match osdns::takeover_state() {
+        osdns::TakeoverState::NotTakenOver => "takeover: not active".into(),
         osdns::TakeoverState::Indeterminate => {
-            "takeover: indeterminate (backup without marker); run `sudo dnsrivet stop`"
+            "takeover: indeterminate (backup without marker); run `sudo dnsrivet stop`".into()
         }
         osdns::TakeoverState::Corrupted => {
-            "takeover: state corrupted (marker without backup); run `sudo dnsrivet stop`"
+            "takeover: state corrupted (marker without backup); run `sudo dnsrivet stop`".into()
         }
-    };
+        osdns::TakeoverState::Active => match installed_probe_address() {
+            Ok(addr) => match osdns::takeover_intact(addr.ip()) {
+                Ok(true) => "takeover: active".into(),
+                Ok(false) => "takeover: armed but drifted (system DNS is not pointing at the \
+                              proxy); the watchdog reasserts it within its check interval"
+                    .into(),
+                Err(err) => format!("takeover: armed (verification failed: {err})"),
+            },
+            // Unprivileged runs cannot read the installed config or backup.
+            Err(_) => "takeover: armed (rerun with sudo to verify the system DNS)".into(),
+        },
+    }
+}
+
+pub fn status() -> Result<String, String> {
+    let takeover = takeover_status_line();
     if !launchd::is_loaded() {
         return Ok(format!(
             "{}\n{takeover}",
@@ -185,7 +203,12 @@ pub fn status() -> Result<String, String> {
         Err(config_err) => {
             let addresses = osdns::current_loopback_dns()?;
             if addresses.is_empty() {
-                return Err(config_err);
+                // No readable config and no loopback resolver to probe —
+                // exactly the drifted-takeover situation where diagnostics
+                // matter most; report what is known instead of erroring out.
+                return Ok(format!(
+                    "service: loaded; DNS probe unavailable ({config_err})\n{takeover}"
+                ));
             }
             addresses
         }
