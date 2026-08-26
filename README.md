@@ -1,6 +1,6 @@
 # DNSRivet
 
-> Compact encrypted DNS forwarding for macOS.
+> Compact encrypted DNS forwarding for macOS 11 or later.
 
 English | [中文](#中文)
 
@@ -48,7 +48,7 @@ development machine and network path; they are not universal guarantees.
 
 ## Build
 
-Requirements: macOS and stable Rust.
+Requirements: macOS 11 or later and stable Rust.
 
 ```bash
 git clone https://github.com/WenliangCao/DNSRivet.git
@@ -57,6 +57,26 @@ cargo test --all-targets --all-features
 cargo build --release
 ./target/release/dnsrivet version
 ```
+
+## Install
+
+DNSRivet is distributed as a signed and notarized macOS package.
+
+### Signed macOS package
+
+Download `DNSRivet-*.pkg` from the
+[latest release](https://github.com/WenliangCao/DNSRivet/releases/latest) and
+open it in Finder. The signed and notarized installer places the universal
+Apple Silicon/Intel binary on the system, but deliberately does not choose an
+upstream or take over DNS. Configure and start it explicitly:
+
+```bash
+sudo dnsrivet start \
+  --upstream 'doh3=https://resolver.example/profile'
+```
+
+Installing a newer PKG restarts an already running DNSRivet service while
+preserving its configuration and DNS backup.
 
 ## Run in the foreground
 
@@ -118,9 +138,9 @@ listener, then backs up and replaces DNS settings for each active network
 service. A partial failure rolls back services already changed.
 
 The first successful `start` installs a stable command at
-`/usr/local/bin/dnsrivet`. It is an ownership-checked symbolic link to the
-installed binary: DNSRivet refuses to replace an unrelated path and removes
-the link only if it still owns it.
+`/usr/local/bin/dnsrivet` unless that command is already the package-manager
+entry which invoked DNSRivet. It never replaces an unrelated path, and removes
+the link only if DNSRivet owns it.
 
 Installed state lives under `/Library/Application Support/DNSRivet/`. The DNS
 backup is written atomically with mode `0600`; without that backup, DNSRivet
@@ -230,7 +250,7 @@ MIT. See [`LICENSE`](LICENSE).
 
 ## 中文
 
-> 面向 macOS 的紧凑型加密 DNS 转发器。
+> 面向 macOS 11 及后续版本的紧凑型加密 DNS 转发器。
 
 DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收本机 UDP/TCP
 查询，通过加密传输转发，并尽量缩短高频路径。
@@ -272,7 +292,7 @@ release 配置启用 LTO、单 codegen unit、符号剥离和 panic abort，以�
 
 ## 构建与前台运行
 
-需要 macOS 和稳定版 Rust：
+需要 macOS 11 或更高版本以及稳定版 Rust：
 
 ```bash
 cargo test --all-targets --all-features
@@ -305,6 +325,25 @@ cp example.config.toml dnsrivet.toml
 查找顺序为 `./dnsrivet.toml`，然后是
 `/Library/Application Support/DNSRivet/config.toml`。
 
+## 安装
+
+DNSRivet 以签名并通过 Apple 公证的 macOS 安装包分发。
+
+### 签名 macOS 安装包
+
+从 [最新版本](https://github.com/WenliangCao/DNSRivet/releases/latest) 下载
+`DNSRivet-*.pkg`，在 Finder 中双击安装。安装包已经签名并通过 Apple 公证，包含
+同时支持 Apple Silicon 与 Intel Mac 的 Universal 2 二进制。安装器不会擅自选择
+上游或接管 DNS；安装完成后显式配置并启动：
+
+```bash
+sudo dnsrivet start \
+  --upstream 'doh3=https://resolver.example/profile'
+```
+
+以后安装新版 PKG 时，如果 DNSRivet 已在运行，安装器会保留配置和 DNS 备份并
+自动重启服务。
+
 ## macOS 服务模式
 
 服务模式要求配置中存在 loopback 的 53 端口监听器。启动服务前，请先替换示例配置中
@@ -323,9 +362,9 @@ sudo dnsrivet uninstall
 `io.github.wenliangcao.dnsrivet`，探测本地 DNS，再逐项备份并替换活动网络服务的
 DNS。中途失败会回滚已修改的服务。
 
-首次成功启动后会安装稳定入口 `/usr/local/bin/dnsrivet`。它是指向已安装二进制的
-符号链接；如果路径已被其他文件占用，DNSRivet 会拒绝覆盖。卸载时也只删除仍由
-DNSRivet 持有的链接。
+首次成功启动后会安装稳定入口 `/usr/local/bin/dnsrivet`；如果当前命令本身由
+Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会覆盖无关路径，卸载时
+也只删除仍由自己持有的链接。
 
 安装状态位于 `/Library/Application Support/DNSRivet/`。DNS 备份以 `0600` 权限
 原子写入；没有备份时，DNSRivet 不会猜测性改写原有 DNS。日志位于
