@@ -63,7 +63,20 @@ jobs:
         run: |
           set -eu
           archive="dnsrivet-v${VERSION}-macos-universal2.zip"
-          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$archive" --dir .
+
+          # `release: published` can fire while the release's assets are still
+          # uploading, so wait for the archive to appear rather than failing the
+          # release over a few seconds of upload time.
+          attempt=1
+          until gh release download "$TAG" --repo "$REPOSITORY" --pattern "$archive" --dir . 2>/dev/null; do
+              if [ "$attempt" -ge 20 ]; then
+                  echo "release $TAG still has no $archive after $attempt attempts" >&2
+                  exit 1
+              fi
+              echo "waiting for $archive to finish uploading (attempt $attempt)"
+              attempt=$((attempt + 1))
+              sleep 15
+          done
 
           work=$(mktemp -d)
           /usr/bin/unzip -q "$archive" -d "$work"
