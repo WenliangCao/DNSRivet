@@ -1,0 +1,125 @@
+name: Update Homebrew tap
+
+# Keeps dnsrivet/homebrew-tap pointing at the newest published release so the
+# formula never has to be bumped by hand. The job refuses to publish a formula
+# for an archive whose binary is not signed with a Developer ID Application
+# certificate under the hardened runtime, so a mis-uploaded or unsigned asset
+# cannot silently become the thing `brew install` hands to users.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish to the tap, for example v0.3.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  update-tap:
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    # macOS runner: codesign is the whole point of the verification step.
+    runs-on: macos-latest
+    steps:
+      - name: Check out DNSRivet
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve the release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          tag=${RELEASE_TAG:-$INPUT_TAG}
+          case $tag in
+              v*) ;;
+              *) echo "release tag must start with v: $tag" >&2; exit 1 ;;
+          esac
+          version=${tag#v}
+          case $version in
+              ''|*[!0-9.]*) echo "invalid version: $version" >&2; exit 1 ;;
+          esac
+          {
+              echo "tag=$tag"
+              echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the release archive and verify its signature
+        id: archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+          archive="dnsrivet-v${VERSION}-macos-universal2.zip"
+          gh release download "$TAG" --repo "$REPOSITORY" --pattern "$archive" --dir .
+
+          work=$(mktemp -d)
+          /usr/bin/unzip -q "$archive" -d "$work"
+          binary=$(/usr/bin/find "$work" -type f -name dnsrivet -perm -111 -print -quit)
+          if [ -z "$binary" ]; then
+              echo "release archive contains no dnsrivet executable" >&2
+              exit 1
+          fi
+
+          /usr/bin/codesign --verify --strict --verbose=2 "$binary"
+          signature=$(/usr/bin/codesign -d --verbose=4 "$binary" 2>&1)
+          if ! printf '%s\n' "$signature" | grep -q 'Authority=Developer ID Application'; then
+              echo "binary is not signed with a Developer ID Application certificate" >&2
+              exit 1
+          fi
+          if ! printf '%s\n' "$signature" | grep -qE 'flags=0x[0-9a-f]*\(.*runtime.*\)'; then
+              echo "binary is not signed under the hardened runtime" >&2
+              exit 1
+          fi
+
+          sha256=$(/usr/bin/shasum -a 256 "$archive" | /usr/bin/awk '{print $1}')
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Render the formula
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA256: ${{ steps.archive.outputs.sha256 }}
+        run: scripts/render-homebrew-formula.sh "$VERSION" "$SHA256" rendered/dnsrivet.rb
+
+      - name: Publish the formula to the tap
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -eu
+          if [ -z "${DEPLOY_KEY:-}" ]; then
+              echo "HOMEBREW_TAP_DEPLOY_KEY is not configured" >&2
+              exit 1
+          fi
+
+          keydir=$(mktemp -d)
+          trap 'rm -rf "$keydir"' EXIT HUP INT TERM
+          printf '%s\n' "$DEPLOY_KEY" > "$keydir/id_ed25519"
+          chmod 600 "$keydir/id_ed25519"
+          export GIT_SSH_COMMAND="ssh -i $keydir/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          git clone --depth 1 git@github.com:dnsrivet/homebrew-tap.git tap
+          cp rendered/dnsrivet.rb tap/Formula/dnsrivet.rb
+          cd tap
+          if git diff --quiet -- Formula/dnsrivet.rb; then
+              echo "tap formula is already current for $TAG"
+              exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Update dnsrivet to $VERSION" -- Formula/dnsrivet.rb
+          git push
+          echo "tap updated to $VERSION"
