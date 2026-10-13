@@ -1,10 +1,11 @@
 //! Transactional macOS DNS configuration through `networksetup`.
 
+use nix::net::if_::if_nametoindex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
@@ -130,7 +131,7 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
         fallback_servers.extend(
             servers
                 .iter()
-                .filter_map(|value| value.parse::<IpAddr>().ok()),
+                .filter_map(|value| parse_dns_socket(value).ok()),
         );
         // Snapshotting a service that already lists the takeover address
         // would write our own loopback into the restore backup: after a later
@@ -158,7 +159,7 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
         services,
         fallback_servers: filter_fallback_servers(fallback_servers, &[server])
             .into_iter()
-            .map(|ip| ip.to_string())
+            .map(serialize_dns_socket)
             .collect(),
     };
     if backup.fallback_servers.is_empty() {
@@ -279,10 +280,10 @@ pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, Str
         if !matches!(backup.version, 1 | 2) {
             return Err(format!("unsupported DNS backup version {}", backup.version));
         }
-        let mut candidates: Vec<IpAddr> = backup
+        let mut candidates: Vec<SocketAddr> = backup
             .fallback_servers
             .iter()
-            .filter_map(|value| value.parse().ok())
+            .filter_map(|value| parse_dns_socket(value).ok())
             .collect();
         if candidates.is_empty() {
             candidates.extend(
@@ -290,17 +291,14 @@ pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, Str
                     .services
                     .iter()
                     .flat_map(|service| &service.servers)
-                    .filter_map(|value| value.parse::<IpAddr>().ok()),
+                    .filter_map(|value| parse_dns_socket(value).ok()),
             );
         }
         candidates
     } else {
         effective_dns_servers()?
     };
-    Ok(filter_fallback_servers(candidates, &denied)
-        .into_iter()
-        .map(|ip| SocketAddr::new(ip, 53))
-        .collect())
+    Ok(filter_fallback_servers(candidates, &denied))
 }
 
 pub enum TickOutcome {
@@ -356,12 +354,7 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
     // Capture before reassert: right now scutil still shows the network's
     // own resolvers; afterwards it will only show the loopback again.
     let captured: Vec<SocketAddr> = effective_dns_servers()
-        .map(|ips| {
-            filter_fallback_servers(ips, &[server])
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, 53))
-                .collect()
-        })
+        .map(|ips| filter_fallback_servers(ips, &[server]))
         .unwrap_or_default();
 
     let mut errors = Vec::new();
@@ -442,8 +435,7 @@ pub fn current_loopback_dns() -> Result<Vec<SocketAddr>, String> {
     let mut seen = HashSet::new();
     Ok(effective_dns_servers()?
         .into_iter()
-        .filter(|ip| ip.is_loopback() && seen.insert(*ip))
-        .map(|ip| SocketAddr::new(ip, 53))
+        .filter(|address| address.ip().is_loopback() && seen.insert(*address))
         .collect())
 }
 
@@ -453,10 +445,10 @@ fn read_backup() -> Result<Backup, String> {
     toml::from_str(&text).map_err(|e| format!("parse DNS backup {BACKUP_PATH}: {e}"))
 }
 
-fn effective_dns_servers() -> Result<Vec<IpAddr>, String> {
+fn effective_dns_servers() -> Result<Vec<SocketAddr>, String> {
     let output = run(SCUTIL, &["--dns"])?;
     let text = stdout(&output, "read effective system DNS")?;
-    Ok(parse_scutil_global_dns(&text))
+    parse_scutil_global_dns(&text)
 }
 
 /// Global default resolvers only. Accepted resolver blocks must sit in the
@@ -464,8 +456,8 @@ fn effective_dns_servers() -> Result<Vec<IpAddr>, String> {
 /// (...)` variant (scoped or service-specific) is excluded — and must carry
 /// no `domain` restriction: a split-DNS VPN resolver in the main section
 /// serves only its own domain and must never become a global fallback.
-fn parse_scutil_global_dns(text: &str) -> Vec<IpAddr> {
-    fn commit(pending: &mut Vec<IpAddr>, domain_scoped: &mut bool, out: &mut Vec<IpAddr>) {
+fn parse_scutil_global_dns(text: &str) -> Result<Vec<SocketAddr>, String> {
+    fn commit(pending: &mut Vec<SocketAddr>, domain_scoped: &mut bool, out: &mut Vec<SocketAddr>) {
         if !*domain_scoped {
             out.append(pending);
         }
@@ -495,26 +487,49 @@ fn parse_scutil_global_dns(text: &str) -> Vec<IpAddr> {
         } else if line.starts_with("nameserver[")
             && let Some((_, value)) = line.split_once(':')
         {
-            let value = value.trim();
-            if !value.contains('%')
-                && let Ok(ip) = value.parse()
-            {
-                pending.push(ip);
-            }
+            pending.push(parse_dns_socket(value.trim())?);
         }
     }
     commit(&mut pending, &mut domain_scoped, &mut servers);
-    servers
+    Ok(servers)
 }
 
-fn filter_fallback_servers(mut servers: Vec<IpAddr>, denied: &[IpAddr]) -> Vec<IpAddr> {
+fn parse_dns_socket(value: &str) -> Result<SocketAddr, String> {
+    let value = value.trim();
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+    let (address, scope) = value
+        .rsplit_once('%')
+        .ok_or_else(|| format!("invalid DNS server address {value:?}"))?;
+    let ip = address
+        .parse::<Ipv6Addr>()
+        .map_err(|err| format!("invalid IPv6 DNS server address {value:?}: {err}"))?;
+    let scope_id = scope.parse::<u32>().or_else(|_| {
+        if_nametoindex(scope).map_err(|err| format!("unknown IPv6 DNS interface {scope:?}: {err}"))
+    })?;
+    Ok(SocketAddr::V6(SocketAddrV6::new(ip, 53, 0, scope_id)))
+}
+
+fn serialize_dns_socket(address: SocketAddr) -> String {
+    match address {
+        SocketAddr::V4(address) => address.ip().to_string(),
+        SocketAddr::V6(address) if address.scope_id() != 0 => {
+            format!("{}%{}", address.ip(), address.scope_id())
+        }
+        SocketAddr::V6(address) => address.ip().to_string(),
+    }
+}
+
+fn filter_fallback_servers(mut servers: Vec<SocketAddr>, denied: &[IpAddr]) -> Vec<SocketAddr> {
     let mut seen = HashSet::new();
-    servers.retain(|ip| {
+    servers.retain(|address| {
+        let ip = address.ip();
         !ip.is_loopback()
             && !ip.is_unspecified()
             && !ip.is_multicast()
-            && !denied.contains(ip)
-            && seen.insert(*ip)
+            && !denied.contains(&ip)
+            && seen.insert(*address)
     });
     servers
 }
@@ -640,7 +655,7 @@ fn parse_dns_servers(text: &str) -> Option<Vec<String>> {
     }
     lines
         .iter()
-        .map(|line| line.parse::<IpAddr>().ok().map(|ip| ip.to_string()))
+        .map(|line| parse_dns_socket(line).ok().map(|_| (*line).to_string()))
         .collect()
 }
 
@@ -716,17 +731,18 @@ resolver #1
   nameserver[1] : 127.0.0.1
 resolver #2
   nameserver[0] : 192.168.1.1
-  nameserver[1] : fe80::1%en0
+  nameserver[1] : fe80::1%7
   nameserver[2] : 2001:db8::53
 "#;
         assert_eq!(
             filter_fallback_servers(
-                parse_scutil_global_dns(text),
+                parse_scutil_global_dns(text).unwrap(),
                 &["127.0.0.1".parse().unwrap()]
             ),
             [
-                "192.168.1.1".parse::<IpAddr>().unwrap(),
-                "2001:db8::53".parse::<IpAddr>().unwrap()
+                "192.168.1.1:53".parse::<SocketAddr>().unwrap(),
+                "[fe80::1%7]:53".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::53]:53".parse::<SocketAddr>().unwrap()
             ]
         );
     }
@@ -756,11 +772,22 @@ resolver #1
   if_index : 12 (en0)
 "#;
         assert_eq!(
-            parse_scutil_global_dns(text),
+            parse_scutil_global_dns(text).unwrap(),
             [
-                "192.168.1.1".parse::<IpAddr>().unwrap(),
-                "fdfd:3b1d:1c26::1".parse::<IpAddr>().unwrap()
+                "192.168.1.1:53".parse::<SocketAddr>().unwrap(),
+                "[fdfd:3b1d:1c26::1]:53".parse::<SocketAddr>().unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn parses_and_serializes_scoped_ipv6_dns_servers() {
+        let address = parse_dns_socket("fe80::1%7").unwrap();
+        assert_eq!(address, "[fe80::1%7]:53".parse().unwrap());
+        assert_eq!(serialize_dns_socket(address), "fe80::1%7");
+        assert_eq!(
+            serialize_dns_socket(parse_dns_socket("2001:db8::53").unwrap()),
+            "2001:db8::53"
         );
     }
 
