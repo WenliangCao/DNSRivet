@@ -37,7 +37,7 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 log = { version = "0.4", features = ["std"] }
 lru = "0.18"
 lexopt = "0.3"
-libc = "0.2"
+nix = { version = "0.31.3", default-features = false, features = ["user", "net"] }
 
 [profile.release]
 opt-level = "z"

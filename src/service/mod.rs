@@ -258,7 +258,7 @@ pub fn uninstall() -> Result<String, String> {
 }
 
 fn require_root() -> Result<(), String> {
-    if unsafe { libc::geteuid() } == 0 {
+    if nix::unistd::geteuid().is_root() {
         Ok(())
     } else {
         Err("this command changes a system LaunchDaemon or DNS settings; rerun it with sudo".into())

@@ -6,7 +6,6 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -38,12 +37,7 @@ fn lock() -> Result<FsLock, String> {
         .mode(0o600)
         .open(LOCK_PATH)
         .map_err(|e| format!("open lock file {LOCK_PATH}: {e}"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "lock {LOCK_PATH}: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    file.lock().map_err(|e| format!("lock {LOCK_PATH}: {e}"))?;
     Ok(FsLock { _file: file })
 }
 

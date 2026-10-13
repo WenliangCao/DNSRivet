@@ -97,7 +97,7 @@ pub async fn serve(config: Config) -> Result<(), String> {
 /// The first tick fires immediately, so a daemon restarted while DNS is
 /// already drifted recovers in seconds rather than a full interval.
 async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
-    if unsafe { libc::geteuid() } != 0 {
+    if !nix::unistd::geteuid().is_root() {
         log::info!("takeover watchdog inactive: not running as root");
         return;
     }
