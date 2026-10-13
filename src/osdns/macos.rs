@@ -305,7 +305,10 @@ pub enum TickOutcome {
     /// Gate not satisfied (no backup, no marker): nothing to guard.
     NotActive,
     /// Every backed-up service still points exactly at the takeover address.
-    Clean,
+    Clean {
+        captured: Option<Vec<SocketAddr>>,
+        capture_error: Option<String>,
+    },
     /// Drift was detected and corrected.
     Reasserted {
         corrected: Vec<String>,
@@ -313,6 +316,7 @@ pub enum TickOutcome {
         /// current network's real resolvers are visible. Runtime-only; the
         /// restore backup is never rewritten.
         captured: Vec<SocketAddr>,
+        capture_error: Option<String>,
     },
 }
 
@@ -347,15 +351,20 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
         .into_iter()
         .map(str::to_string)
         .collect();
+    let capture = capture_runtime_fallback(server);
     if drifted.is_empty() {
-        return Ok(TickOutcome::Clean);
+        return Ok(TickOutcome::Clean {
+            captured: capture.as_ref().ok().cloned(),
+            capture_error: capture.err(),
+        });
     }
 
     // Capture before reassert: right now scutil still shows the network's
     // own resolvers; afterwards it will only show the loopback again.
-    let captured: Vec<SocketAddr> = effective_dns_servers()
-        .map(|ips| filter_fallback_servers(ips, &[server]))
-        .unwrap_or_default();
+    let (captured, capture_error) = match capture {
+        Ok(servers) => (servers, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
     let mut errors = Vec::new();
     for name in &drifted {
@@ -370,6 +379,7 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
     Ok(TickOutcome::Reasserted {
         corrected: drifted,
         captured,
+        capture_error,
     })
 }
 
@@ -414,6 +424,24 @@ fn add_new_service_snapshots(
         added = true;
     }
     Ok(added)
+}
+
+fn capture_runtime_fallback(server: IpAddr) -> Result<Vec<SocketAddr>, String> {
+    let current = effective_dns_servers()
+        .map_err(|err| format!("could not read current system DNS: {err}"))?;
+    usable_runtime_fallback(current, server)
+}
+
+fn usable_runtime_fallback(
+    current: Vec<SocketAddr>,
+    server: IpAddr,
+) -> Result<Vec<SocketAddr>, String> {
+    let usable = filter_fallback_servers(current, &[server]);
+    if usable.is_empty() {
+        Err("macOS exposed no non-loopback global DNS server while the takeover was active".into())
+    } else {
+        Ok(usable)
+    }
 }
 
 /// Exact-list check: anything other than exactly `[server]` is drift, even a
@@ -788,6 +816,24 @@ resolver #1
         assert_eq!(
             serialize_dns_socket(parse_dns_socket("2001:db8::53").unwrap()),
             "2001:db8::53"
+        );
+    }
+
+    #[test]
+    fn runtime_fallback_rejects_only_loopback_servers() {
+        let error = usable_runtime_fallback(
+            vec!["127.0.0.1:53".parse().unwrap()],
+            "127.0.0.1".parse().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("no non-loopback"));
+        assert_eq!(
+            usable_runtime_fallback(
+                vec!["192.0.2.53:53".parse().unwrap()],
+                "127.0.0.1".parse().unwrap(),
+            )
+            .unwrap(),
+            ["192.0.2.53:53".parse::<SocketAddr>().unwrap()]
         );
     }
 

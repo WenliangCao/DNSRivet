@@ -122,7 +122,16 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
             Ok(crate::osdns::TickOutcome::NotActive) => {
                 log::debug!("takeover watchdog idle: takeover not active");
             }
-            Ok(crate::osdns::TickOutcome::Clean) => {
+            Ok(crate::osdns::TickOutcome::Clean {
+                captured,
+                capture_error,
+            }) => {
+                if let Some(captured) = captured {
+                    log::info!("runtime system DNS fallback refreshed: {captured:?}");
+                    manager.set_system_fallback(captured);
+                } else if let Some(reason) = capture_error {
+                    log::debug!("runtime system DNS fallback not refreshed: {reason}");
+                }
                 if slow_mode {
                     slow_mode = false;
                     flap_strikes = 0;
@@ -142,13 +151,17 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
             Ok(crate::osdns::TickOutcome::Reasserted {
                 corrected,
                 captured,
+                capture_error,
             }) => {
                 log::warn!(
                     "system DNS no longer pointed at {server} on {corrected:?}; takeover reasserted"
                 );
                 if captured.is_empty() {
                     log::warn!(
-                        "could not capture the current network DNS; keeping the previous fallback list"
+                        "could not capture the current network DNS; keeping the previous fallback list: {}",
+                        capture_error
+                            .as_deref()
+                            .unwrap_or("no usable DNS server was reported")
                     );
                 } else {
                     log::info!("runtime system DNS fallback refreshed: {captured:?}");

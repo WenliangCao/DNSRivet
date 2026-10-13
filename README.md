@@ -203,6 +203,14 @@ re-applies the takeover. The restore backup itself is never rewritten. If an
 external tool keeps rewriting DNS, the watchdog backs off to a 30-minute
 cadence and says so in the log instead of fighting it.
 
+If macOS reports an enabled network service that was not present at startup,
+the watchdog records that service's original DNS settings before pointing it
+at DNSRivet. `stop` restores those settings together with the original
+services. On every watchdog cycle DNSRivet also tries to refresh the runtime
+fallback from non-loopback global resolvers. When macOS exposes only the local
+takeover resolver, or cannot read the current DNS configuration, DNSRivet keeps
+the previous fallback list and records the reason in the log.
+
 ## Configuration
 
 ```toml
@@ -259,9 +267,9 @@ cached (RFC 5452).
   leaves queries on the system's own DNS.
 - VPN and Network Extension scoped resolvers are outside the takeover and are
   never used as fallback servers.
-- When the takeover is intact but the network changed underneath it, the
-  fallback list stays as captured and only refreshes on the next takeover
-  loss. This is a known limitation of this release.
+- When macOS cannot expose the post-change network DNS while the takeover is
+  intact, the fallback list stays unchanged and the log explains why it was
+  not refreshed.
 - Debug logs can contain queried domain names and complete upstream URLs.
 - Service commands modify system-wide `launchd` and network DNS state and
   therefore require `sudo`.
@@ -414,6 +422,12 @@ sudo dnsrivet uninstall
 `io.github.wenliangcao.dnsrivet`，探测本地 DNS，再逐项备份并替换活动网络服务的
 DNS。中途失败会回滚已修改的服务。
 
+如果 macOS 报告了启动后新出现的启用网络服务，看门狗会先记录该服务原有的 DNS，
+再将它指向 DNSRivet；执行 `stop` 时会连同原有服务一起恢复。每次看门狗检查时，
+DNSRivet 还会尝试从非 loopback 的全局 resolver 刷新运行时回退列表。如果 macOS
+只暴露本机接管 resolver，或无法读取当前 DNS 配置，DNSRivet 会保留旧回退列表，
+并在日志中说明原因。
+
 首次成功启动后会安装稳定入口 `/usr/local/bin/dnsrivet`；如果当前命令本身由
 Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会覆盖无关路径，卸载时
 也只删除仍由自己持有的链接。
@@ -472,8 +486,8 @@ question 一致，才会被返回或写入缓存（RFC 5452）。
   外部清除的接管会让查询走系统自身 DNS。
 - VPN 与 Network Extension 的 scoped resolver 不在接管范围内，也不会被用作
   回退服务器。
-- 接管完好但底层网络已切换时，回退列表保持接管时捕获的值，仅在下一次接管
-  丢失时刷新。此为本版本的已知限制。
+- 接管完好但 macOS 没有暴露换网后的 DNS 时，回退列表保持不变，日志会说明
+  没有刷新的原因。
 - debug 日志可能包含查询域名和完整上游 URL。
 - 服务命令修改系统级 `launchd` 和网络 DNS，因此需要 `sudo`。
 - 源码会主动拒绝在非 macOS 目标上编译。
