@@ -328,6 +328,22 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
         return Ok(TickOutcome::NotActive);
     }
     let expected = server.to_string();
+    let mut backup = read_backup()?;
+    let known_services: HashSet<&str> = backup
+        .services
+        .iter()
+        .map(|service| service.name.as_str())
+        .collect();
+    let new_services: Vec<(String, Vec<String>)> = list_services()?
+        .into_iter()
+        .filter(|name| !known_services.contains(name.as_str()))
+        .map(|name| get_dns_servers(&name).map(|servers| (name, servers)))
+        .collect::<Result<_, _>>()?;
+    if add_new_service_snapshots(&mut backup, new_services, &expected)? {
+        // Persist every original DNS list before changing any newly discovered
+        // service. A partial reassertion must remain recoverable by `stop`.
+        write_backup(&backup)?;
+    }
     let current = service_dns_snapshot()?;
     let drifted: Vec<String> = services_needing_reassert(&current, &expected)
         .into_iter()
@@ -383,6 +399,28 @@ fn service_dns_snapshot() -> Result<Vec<(String, Vec<String>)>, String> {
         snapshot.push((service.name.clone(), get_dns_servers(&service.name)?));
     }
     Ok(snapshot)
+}
+
+fn add_new_service_snapshots(
+    backup: &mut Backup,
+    snapshots: Vec<(String, Vec<String>)>,
+    expected: &str,
+) -> Result<bool, String> {
+    let mut added = false;
+    for (name, servers) in snapshots {
+        if backup.services.iter().any(|service| service.name == name) {
+            continue;
+        }
+        if servers.iter().any(|server| server == expected) {
+            return Err(format!(
+                "network service {name:?} already lists {expected} as a DNS server; \
+                 refusing to capture an unknown restore state"
+            ));
+        }
+        backup.services.push(ServiceDns { name, servers });
+        added = true;
+    }
+    Ok(added)
 }
 
 /// Exact-list check: anything other than exactly `[server]` is drift, even a
@@ -740,6 +778,58 @@ resolver #1
             services_needing_reassert(&current, "127.0.0.1"),
             ["USB LAN", "Bridge"]
         );
+    }
+
+    #[test]
+    fn new_service_snapshots_are_added_once_before_reassertion() {
+        let mut backup = Backup {
+            version: 2,
+            services: vec![ServiceDns {
+                name: "Wi-Fi".into(),
+                servers: vec!["192.0.2.53".into()],
+            }],
+            fallback_servers: Vec::new(),
+        };
+        assert!(
+            add_new_service_snapshots(
+                &mut backup,
+                vec![
+                    ("Wi-Fi".into(), vec!["192.0.2.53".into()]),
+                    ("iPhone USB".into(), Vec::new()),
+                ],
+                "127.0.0.1"
+            )
+            .unwrap()
+        );
+        assert_eq!(backup.services.len(), 2);
+        assert_eq!(backup.services[1].name, "iPhone USB");
+        assert!(backup.services[1].servers.is_empty());
+        assert!(
+            !add_new_service_snapshots(
+                &mut backup,
+                vec![("iPhone USB".into(), Vec::new())],
+                "127.0.0.1"
+            )
+            .unwrap()
+        );
+        assert_eq!(backup.services.len(), 2);
+    }
+
+    #[test]
+    fn new_service_already_pointing_at_proxy_is_rejected() {
+        let mut backup = Backup {
+            version: 2,
+            services: Vec::new(),
+            fallback_servers: Vec::new(),
+        };
+        let error = add_new_service_snapshots(
+            &mut backup,
+            vec![("iPhone USB".into(), vec!["127.0.0.1".into()])],
+            "127.0.0.1",
+        )
+        .unwrap_err();
+        assert!(error.contains("iPhone USB"));
+        assert!(backup.services.is_empty());
     }
 
     #[test]
