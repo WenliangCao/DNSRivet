@@ -7,15 +7,17 @@ use crate::upstream::legacy;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-const SERVERS: [IpAddr; 2] = [
+const SERVERS: [IpAddr; 4] = [
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
     IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
 ];
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_TTL_SECS: u64 = 60;
@@ -58,7 +60,7 @@ impl Bootstrap {
         let mut ips = Vec::new();
         let mut min_ttl = MAX_TTL_SECS;
         let mut last_err = String::from("no bootstrap servers");
-        for server in SERVERS {
+        for server in ordered_servers(stack) {
             for &rtype in rtypes {
                 match query(server, &name, rtype).await {
                     Ok((mut got, ttl)) => {
@@ -95,6 +97,16 @@ impl Bootstrap {
         let host = host.to_ascii_lowercase();
         self.cache.lock().await.retain(|(h, _), _| *h != host);
     }
+}
+
+fn ordered_servers(stack: IpStack) -> [IpAddr; 4] {
+    let mut servers = SERVERS;
+    servers.sort_by_key(|server| match stack {
+        IpStack::V4 => server.is_ipv6(),
+        IpStack::V6 => server.is_ipv4(),
+        IpStack::Both => false,
+    });
+    servers
 }
 
 async fn query(
@@ -143,4 +155,22 @@ fn next_id() -> u16 {
         .unwrap_or_default()
         .subsec_nanos() as u16;
     nanos ^ COUNTER.fetch_add(0x9e37, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_stack_prefers_ipv6_bootstrap_servers() {
+        let servers = ordered_servers(IpStack::V6);
+        assert!(servers[..2].iter().all(IpAddr::is_ipv6));
+        assert!(servers[2..].iter().all(IpAddr::is_ipv4));
+    }
+
+    #[test]
+    fn bootstrap_server_addresses_include_both_ip_stacks() {
+        assert!(SERVERS.iter().any(IpAddr::is_ipv4));
+        assert!(SERVERS.iter().any(IpAddr::is_ipv6));
+    }
 }
