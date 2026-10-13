@@ -28,6 +28,14 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
+## 0.3.2 changes
+
+- IPv4 and IPv6 bootstrap resolvers, with address-family-aware ordering
+- Scoped IPv6 system DNS fallback such as `fe80::1%en0`
+- Watchdog capture and restoration for network services added after startup
+- Conservative runtime fallback refresh after network changes; unavailable
+  DNS state is left untouched and explained in the log
+
 ## Runtime profile
 
 The release profile is optimized for size with LTO, a single codegen unit,
@@ -308,6 +316,13 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 事务式接管和恢复系统 DNS
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
+
+## 0.3.2 更新
+
+- 同时使用 IPv4 和 IPv6 bootstrap resolver，并按地址族调整顺序
+- 支持 `fe80::1%en0` 这类带接口标识的 IPv6 系统 DNS 回退
+- 看门狗会接管启动后新增的网络服务，并在停止时恢复原 DNS
+- 换网后的运行时回退仅在可靠读取到 DNS 时刷新；读取不到则保留旧值并写明原因
 
 ## 运行开销
 
