@@ -239,15 +239,18 @@ impl Entry {
                 Err(last_err)
             }
             Backend::Encrypted(channel) => {
-                if parsed.is_none() {
-                    let message =
-                        Message::from_vec(query).map_err(|e| format!("unparseable query: {e}"))?;
-                    if !safe_encrypted_query(&message) {
-                        return Err("unsupported query shape for encrypted forwarding".into());
+                let message = match parsed {
+                    Some(message) => message,
+                    None => {
+                        let message = Message::from_vec(query)
+                            .map_err(|e| format!("unparseable query: {e}"))?;
+                        if !safe_encrypted_query(&message) {
+                            return Err("unsupported query shape for encrypted forwarding".into());
+                        }
+                        parsed.insert(message)
                     }
-                    *parsed = Some(message);
-                }
-                channel.query(parsed.clone().unwrap(), deadline).await
+                };
+                channel.query(message, deadline).await
             }
         }
     }

@@ -146,7 +146,7 @@ impl Channel {
     /// backstop with no side effects here.
     pub async fn query(
         &self,
-        message: Message,
+        message: &Message,
         deadline: Option<Instant>,
     ) -> Result<Vec<u8>, String> {
         let mut lease = self.acquire(deadline).await?;
