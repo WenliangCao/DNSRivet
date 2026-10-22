@@ -245,7 +245,9 @@ impl Channel {
                 self.up.name,
                 self.up.proto.as_str()
             );
-            match connect(&self.up, &self.tls, addr, deadline).await {
+            // Connection setup carries large TLS/QUIC futures. Allocate only
+            // when dialing, so every forwarded query has a smaller future.
+            match Box::pin(connect(&self.up, &self.tls, addr, deadline)).await {
                 Ok(exchange) => {
                     log::info!(
                         "upstream {}: connected {} to {addr}",
@@ -376,6 +378,27 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::sync::{mpsc, oneshot};
 
+    #[test]
+    fn forwarding_future_keeps_connection_setup_out_of_line() {
+        let upstream = Upstream {
+            name: "future sizing".into(),
+            proto: Proto::Doh,
+            host: "resolver.test".into(),
+            port: 443,
+            path: "/dns-query".into(),
+            bootstrap_ip: Some("192.0.2.53".parse().unwrap()),
+            timeout_ms: 5000,
+            ip_stack: IpStack::V4,
+        };
+        let manager = Manager::new(vec![upstream], &[], Vec::new()).unwrap();
+        let message = encrypted_test_query(0);
+        let query = message.to_vec().unwrap();
+        let size = std::mem::size_of_val(&manager.forward(&query, false));
+        // Leave room for compiler/layout differences while detecting inline
+        // connection futures being carried by every concurrent request.
+        assert!(size < 3072, "forwarding future grew to {size} bytes");
+    }
+
     #[derive(Default)]
     struct TestTransport {
         closed: bool,
@@ -489,6 +512,54 @@ mod tests {
         }
         drop(manager);
         background.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_connection_attempt_releases_lock_and_socket() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let manager = Arc::new(
+                Manager::new(
+                    vec![Upstream {
+                        name: "pending TLS handshake".into(),
+                        proto: Proto::Dot,
+                        host: "resolver.test".into(),
+                        port: addr.port(),
+                        path: String::new(),
+                        bootstrap_ip: Some(addr.ip()),
+                        timeout_ms: 0,
+                        ip_stack: IpStack::V4,
+                    }],
+                    &[],
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let query = start_query(&manager, None);
+            // Leave the TLS handshake pending after TCP connects.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            let state = channel.state.lock().await;
+            assert!(state.exchange.is_none());
+            assert_eq!(state.generation, 0);
+            assert_eq!(state.connect_failures, 0);
+            assert!(state.cooldown_until.is_none());
+            drop(state);
+
+            // Dropping the boxed dial future must close its TCP connection.
+            socket.read_to_end(&mut Vec::new()).await.unwrap();
+        })
+        .await
+        .expect("cancelled dialing must release its resources");
     }
 
     #[tokio::test]

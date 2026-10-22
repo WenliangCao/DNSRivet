@@ -83,6 +83,84 @@ mod tests {
         message
     }
 
+    fn query_with_edns() -> Vec<u8> {
+        let mut message = query_bytes(0x1234);
+        message[11] = 1;
+        message.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 6, 0, 12, 0, 2, 0, 0]);
+        message
+    }
+
+    #[tokio::test]
+    async fn udp_preserves_query_and_truncated_response_bytes() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let request = query_with_edns();
+        let mut response = request.clone();
+        response[2] |= 0x82; // QR and TC: UDP clients receive this unchanged.
+        response[3] |= 0x80;
+        let expected_request = request.clone();
+        let sent_response = response.clone();
+        let responder = tokio::spawn(async move {
+            let mut received = [0u8; 512];
+            let (n, peer) = socket.recv_from(&mut received).await.unwrap();
+            assert_eq!(&received[..n], expected_request);
+            socket.send_to(&sent_response, peer).await.unwrap();
+        });
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            query(addr, &request, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, response);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_retry_preserves_query_and_response_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let socket = UdpSocket::bind(addr).await.unwrap();
+        let request = query_with_edns();
+        let mut response = request.clone();
+        response[2] |= 0x80;
+        response[3] |= 0x80;
+        let expected_request = request.clone();
+        let sent_response = response.clone();
+        let responder = tokio::spawn(async move {
+            let mut received = [0u8; 512];
+            let (n, peer) = socket.recv_from(&mut received).await.unwrap();
+            assert_eq!(&received[..n], expected_request);
+            let mut truncated = sent_response.clone();
+            truncated[2] |= 0x02;
+            socket.send_to(&truncated, peer).await.unwrap();
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut len = [0; 2];
+            stream.read_exact(&mut len).await.unwrap();
+            assert_eq!(u16::from_be_bytes(len) as usize, expected_request.len());
+            stream.read_exact(&mut received[..n]).await.unwrap();
+            assert_eq!(&received[..n], expected_request);
+            stream
+                .write_all(&(sent_response.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&sent_response).await.unwrap();
+        });
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            query(addr, &request, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received, response);
+        responder.await.unwrap();
+    }
+
     async fn tcp_responder(respond_with_id: u16) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

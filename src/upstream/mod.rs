@@ -225,18 +225,18 @@ impl Entry {
                 stack,
                 bootstrap,
             } => {
-                let ips = match ip {
-                    Some(ip) => vec![*ip],
-                    None => bootstrap.resolve(host, *stack).await?,
-                };
-                let mut last_err = String::from("no addresses");
+                if let Some(ip) = ip {
+                    return legacy::query(SocketAddr::new(*ip, *port), query, client_tcp).await;
+                }
+                let ips = bootstrap.resolve(host, *stack).await?;
+                let mut last_err = None;
                 for ip in ips {
                     match legacy::query(SocketAddr::new(ip, *port), query, client_tcp).await {
                         Ok(response) => return Ok(response),
-                        Err(err) => last_err = err,
+                        Err(err) => last_err = Some(err),
                     }
                 }
-                Err(last_err)
+                Err(last_err.unwrap_or_else(|| "no addresses".into()))
             }
             Backend::Encrypted(channel) => {
                 let message = match parsed {
