@@ -13,7 +13,8 @@
 //!   invalidate + backoff;
 //! - deadline expiry: invalidate + backoff, no retry (a wedged-but-accepting
 //!   upstream must not tax every query with its full timeout);
-//! - errors from a superseded generation: no state change at all.
+//! - errors from a superseded generation: no state change; retry once on
+//!   the successor while budget remains if the failed lease was reused.
 
 use crate::config::{Proto, Upstream};
 use crate::upstream::bootstrap::Bootstrap;
@@ -163,19 +164,20 @@ impl Channel {
                 }
                 Err(SendFailure::Transport(err)) => {
                     let mut state = self.state.lock().await;
-                    if !state.invalidate(lease.generation) {
-                        // A concurrent query already replaced this
-                        // generation; leave the successor alone.
-                        return Err(err);
-                    }
+                    let invalidated = state.invalidate(lease.generation);
                     let redial = lease.reused && !retried && budget_allows_redial(deadline);
                     if !redial {
-                        state.backoff();
+                        if invalidated {
+                            state.backoff();
+                        }
                         return Err(err);
                     }
+                    // A concurrent query may already have invalidated or
+                    // replaced this generation. Share its successor without
+                    // changing that connection's state or backoff.
                     drop(state);
                     log::debug!(
-                        "upstream {}: stale connection ({err}); redialing once",
+                        "upstream {}: stale connection ({err}); retrying once",
                         self.up.name
                     );
                     retried = true;
@@ -372,13 +374,15 @@ mod tests {
     use hickory_proto::xfer::{DnsResponse, DnsResponseStream};
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use tokio::sync::{mpsc, oneshot};
 
     #[derive(Default)]
-    struct EchoTransport {
+    struct TestTransport {
         closed: bool,
+        failures: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
     }
 
-    impl Stream for EchoTransport {
+    impl Stream for TestTransport {
         type Item = Result<(), ProtoError>;
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -390,8 +394,17 @@ mod tests {
         }
     }
 
-    impl DnsRequestSender for EchoTransport {
+    impl DnsRequestSender for TestTransport {
         fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
+            if let Some(failures) = &self.failures {
+                let (release, pending) = oneshot::channel();
+                failures.send(release).unwrap();
+                return Box::pin(async move {
+                    let _ = pending.await;
+                    Err(ProtoError::from("stale connection"))
+                })
+                .into();
+            }
             let (mut message, _) = request.into_parts();
             // Model DoQ's zero ID so the manager must restore the client's ID.
             message.set_message_type(MessageType::Response).set_id(0);
@@ -407,7 +420,9 @@ mod tests {
         }
     }
 
-    async fn echo_manager() -> (Manager, tokio::task::JoinHandle<Result<(), ProtoError>>) {
+    async fn test_manager(
+        transport: TestTransport,
+    ) -> (Manager, tokio::task::JoinHandle<Result<(), ProtoError>>) {
         let upstream = Upstream {
             name: "in-memory encrypted transport".into(),
             proto: Proto::Doh,
@@ -422,8 +437,7 @@ mod tests {
         let Backend::Encrypted(channel) = &manager.entries[0].backend else {
             panic!("the test upstream must use an encrypted channel");
         };
-        let (exchange, background) =
-            DnsExchange::from_stream::<_, TokioTime>(EchoTransport::default());
+        let (exchange, background) = DnsExchange::from_stream::<_, TokioTime>(transport);
         channel.state.lock().await.store(exchange);
         (manager, tokio::spawn(background))
     }
@@ -447,9 +461,22 @@ mod tests {
         message
     }
 
+    fn start_query(
+        manager: &Arc<Manager>,
+        deadline: Option<Instant>,
+    ) -> tokio::task::JoinHandle<Result<Vec<u8>, String>> {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            channel.query(&encrypted_test_query(0), deadline).await
+        })
+    }
+
     #[tokio::test]
     async fn encrypted_forward_preserves_question_id_and_edns() {
-        let (manager, background) = echo_manager().await;
+        let (manager, background) = test_manager(TestTransport::default()).await;
         for padding in [0, 1024] {
             let query = encrypted_test_query(padding);
             let wire_query = query.to_vec().unwrap();
@@ -462,6 +489,159 @@ mod tests {
         }
         drop(manager);
         background.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_stale_failures_share_successor_without_fallback() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (failure_tx, mut failures) = mpsc::unbounded_channel();
+            let (manager, old_background) = test_manager(TestTransport {
+                failures: Some(failure_tx),
+                ..TestTransport::default()
+            })
+            .await;
+            let manager = Arc::new(manager);
+            let mut queries = Vec::new();
+            for record_type in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+                let manager = manager.clone();
+                let mut query = encrypted_test_query(0);
+                query.queries_mut()[0].set_query_type(record_type);
+                let wire_query = query.to_vec().unwrap();
+                queries.push(tokio::spawn(async move {
+                    let response = manager.forward(&wire_query, false).await.unwrap();
+                    crate::wire::validate_response(&wire_query, &response).unwrap();
+                }));
+            }
+
+            // Every query holds the old lease before any send can fail.
+            let mut pending = Vec::new();
+            for _ in 0..3 {
+                pending.push(failures.recv().await.unwrap());
+            }
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            let (successor, background) =
+                DnsExchange::from_stream::<_, TokioTime>(TestTransport::default());
+            let background = tokio::spawn(background);
+            // Model a concurrent query having already reconnected. No real
+            // network or production connector hook is needed for this race.
+            let generation = channel.state.lock().await.store(successor);
+            for release in pending {
+                release.send(()).unwrap();
+            }
+            for query in queries {
+                query.await.unwrap();
+            }
+
+            let state = channel.state.lock().await;
+            assert_eq!(state.generation, generation);
+            assert!(state.exchange.is_some());
+            assert_eq!(state.connect_failures, 0);
+            assert!(state.cooldown_until.is_none());
+            assert!(
+                !manager
+                    .fallback_failed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+            drop(state);
+            drop(manager);
+            old_background.await.unwrap().unwrap();
+            background.await.unwrap().unwrap();
+        })
+        .await
+        .expect("concurrent queries must finish");
+    }
+
+    #[tokio::test]
+    async fn failed_successor_backs_off_once_and_late_stale_failure_respects_cooldown() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (failure_tx, mut failures) = mpsc::unbounded_channel();
+            let (manager, old_background) = test_manager(TestTransport {
+                failures: Some(failure_tx),
+                ..TestTransport::default()
+            })
+            .await;
+            let manager = Arc::new(manager);
+            let first = start_query(&manager, None);
+            let first_failure = failures.recv().await.unwrap();
+            let late = start_query(&manager, None);
+            let late_failure = failures.recv().await.unwrap();
+
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            let (retry_tx, mut retries) = mpsc::unbounded_channel();
+            let (successor, background) = DnsExchange::from_stream::<_, TokioTime>(TestTransport {
+                failures: Some(retry_tx),
+                ..TestTransport::default()
+            });
+            let background = tokio::spawn(background);
+            let generation = channel.state.lock().await.store(successor);
+            first_failure.send(()).unwrap();
+            retries.recv().await.unwrap().send(()).unwrap();
+            assert_eq!(first.await.unwrap().unwrap_err(), "stale connection");
+
+            let state = channel.state.lock().await;
+            assert_eq!(state.generation, generation);
+            assert!(state.exchange.is_none());
+            assert_eq!(state.connect_failures, 1);
+            let cooldown = state.cooldown_until;
+            assert!(cooldown.is_some());
+            drop(state);
+
+            // A late failure from the original connection must neither dial
+            // through the successor's cooldown nor increase its backoff.
+            late_failure.send(()).unwrap();
+            assert!(late.await.unwrap().unwrap_err().contains("in cooldown"));
+            let state = channel.state.lock().await;
+            assert_eq!(state.generation, generation);
+            assert!(state.exchange.is_none());
+            assert_eq!(state.connect_failures, 1);
+            assert_eq!(state.cooldown_until, cooldown);
+            drop(state);
+            drop(manager);
+            old_background.await.unwrap().unwrap();
+            background.await.unwrap().unwrap();
+        })
+        .await
+        .expect("failed retries must finish");
+    }
+
+    #[tokio::test]
+    async fn stale_failure_without_retry_budget_preserves_successor() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (failure_tx, mut failures) = mpsc::unbounded_channel();
+            let (manager, old_background) = test_manager(TestTransport {
+                failures: Some(failure_tx),
+                ..TestTransport::default()
+            })
+            .await;
+            let manager = Arc::new(manager);
+            let query = start_query(&manager, Some(Instant::now() + MIN_REDIAL_BUDGET));
+            let failure = failures.recv().await.unwrap();
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            let (successor, background) =
+                DnsExchange::from_stream::<_, TokioTime>(TestTransport::default());
+            let background = tokio::spawn(background);
+            let generation = channel.state.lock().await.store(successor);
+            failure.send(()).unwrap();
+            assert_eq!(query.await.unwrap().unwrap_err(), "stale connection");
+
+            let state = channel.state.lock().await;
+            assert_eq!(state.generation, generation);
+            assert!(state.exchange.is_some());
+            assert_eq!(state.connect_failures, 0);
+            assert!(state.cooldown_until.is_none());
+            drop(state);
+            drop(manager);
+            old_background.await.unwrap().unwrap();
+            background.await.unwrap().unwrap();
+        })
+        .await
+        .expect("queries without retry budget must finish");
     }
 
     #[test]
