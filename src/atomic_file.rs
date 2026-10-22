@@ -72,18 +72,22 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
+            // The wall clock can return the same value to parallel tests.
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "dnsrivet-atomic-test-{}-{nonce}",
+                "dnsrivet-atomic-test-{}-{nonce}-{sequence}",
                 std::process::id()
             ));
             std::fs::create_dir(&path).unwrap();
