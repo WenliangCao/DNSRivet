@@ -354,15 +354,22 @@ fn soa_minimum(message: &[u8], rr: &ResourceRecord) -> Option<u32> {
 }
 
 fn skip_name(message: &[u8], offset: usize) -> Option<usize> {
-    read_name(message, offset).map(|(_, end)| end)
+    walk_name(message, offset, None)
 }
 
 /// Decode a possibly-compressed name into canonical lowercase wire form.
 fn read_name(message: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     let mut name = Vec::new();
+    let end = walk_name(message, start, Some(&mut name))?;
+    Some((name, end))
+}
+
+/// Validate the full expanded name, optionally collecting its canonical form.
+fn walk_name(message: &[u8], start: usize, mut output: Option<&mut Vec<u8>>) -> Option<usize> {
     let mut cursor = start;
     let mut end = None;
     let mut jumps = 0usize;
+    let mut name_len = 0usize;
     loop {
         let len = *message.get(cursor)?;
         if len & 0xc0 == 0xc0 {
@@ -381,15 +388,21 @@ fn read_name(message: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
         }
         cursor += 1;
         if len == 0 {
-            name.push(0);
-            return (name.len() <= 255).then_some((name, end.unwrap_or(cursor)));
+            if let Some(name) = &mut output {
+                name.push(0);
+            }
+            return Some(end.unwrap_or(cursor));
         }
         let label_end = cursor.checked_add(usize::from(len))?;
         let label = message.get(cursor..label_end)?;
-        name.push(len);
-        name.extend(label.iter().map(u8::to_ascii_lowercase));
-        if name.len() >= 255 {
+        name_len += 1 + usize::from(len);
+        // The expanded name must leave one byte for its terminating root label.
+        if name_len >= 255 {
             return None;
+        }
+        if let Some(name) = &mut output {
+            name.push(len);
+            name.extend(label.iter().map(u8::to_ascii_lowercase));
         }
         cursor = label_end;
     }
@@ -591,5 +604,97 @@ mod tests {
         let mut status = multi;
         status[2] |= 0x10; // non-QUERY opcode
         assert!(!is_multi_question_query(&status));
+    }
+
+    #[test]
+    fn walks_compressed_uncompressed_and_root_names() {
+        let message = b"\x07ExAmPlE\x03COM\0\x03WWW\xc0\x00";
+        let cases = [
+            (0, 13, b"\x07example\x03com\0".as_slice()),
+            (13, 19, b"\x03www\x07example\x03com\0".as_slice()),
+            (12, 13, b"\0".as_slice()),
+        ];
+        for (start, end, expected) in cases {
+            assert_eq!(skip_name(message, start), Some(end));
+            let (name, decoded_end) = read_name(message, start).unwrap();
+            assert_eq!(name, expected);
+            assert_eq!(decoded_end, end);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_names_even_when_only_skipping() {
+        let malformed = [
+            b"".as_slice(),
+            b"\x03ab",
+            b"\x01a",
+            b"\xc0",
+            b"\xc0\x02",
+            b"\xc0\x02\x03ab",
+            b"\xc0\x00",
+            b"\xc0\x02\xc0\x00",
+            b"\x40\0",
+            b"\x80\0",
+        ];
+        for message in malformed {
+            assert!(
+                skip_name(message, 0).is_none(),
+                "malformed name: {message:?}"
+            );
+            assert!(
+                read_name(message, 0).is_none(),
+                "malformed name: {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_expanded_name_length_with_and_without_compression() {
+        for (last_label_len, valid) in [(61, true), (62, false)] {
+            let mut message = Vec::new();
+            for length in [63, 63, 63, last_label_len] {
+                message.push(length as u8);
+                message.resize(message.len() + length, b'a');
+            }
+            message.push(0);
+            let pointer_offset = message.len();
+            message.extend_from_slice(&[0xc0, 0]);
+
+            for (start, end) in [(0, pointer_offset), (pointer_offset, message.len())] {
+                if valid {
+                    assert_eq!(skip_name(&message, start), Some(end));
+                    let (name, decoded_end) = read_name(&message, start).unwrap();
+                    assert_eq!(name.len(), 255);
+                    assert_eq!(decoded_end, end);
+                } else {
+                    assert_eq!(pointer_offset, 256);
+                    assert!(skip_name(&message, start).is_none());
+                    assert!(read_name(&message, start).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permits_128_compression_jumps_but_rejects_129() {
+        let mut message = vec![0];
+        let mut previous = 0;
+        for _ in 0..128 {
+            let offset = message.len();
+            let pointer = 0xc000 | u16::try_from(previous).unwrap();
+            message.extend_from_slice(&pointer.to_be_bytes());
+            previous = offset;
+        }
+        assert_eq!(skip_name(&message, previous), Some(message.len()));
+        assert_eq!(
+            read_name(&message, previous),
+            Some((vec![0], message.len()))
+        );
+
+        let over_limit = message.len();
+        let pointer = 0xc000 | u16::try_from(previous).unwrap();
+        message.extend_from_slice(&pointer.to_be_bytes());
+        assert!(skip_name(&message, over_limit).is_none());
+        assert!(read_name(&message, over_limit).is_none());
     }
 }
