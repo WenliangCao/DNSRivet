@@ -28,13 +28,11 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
-## 0.3.3 changes
+## 0.3.4 changes
 
-- Service commands now report `launchctl` failures instead of treating them
-  as "not loaded"
-- If a failed start cannot stop the service, the launchd plist is kept and
-  the error says to run `dnsrivet stop`
-- Fewer allocations when scanning response TTLs and looking up the cache
+- When several queries fail together on a stale encrypted connection (for
+  example right after the Mac wakes), each retries once on the reconnected
+  connection instead of failing over and falling back to plaintext system DNS
 
 ## Runtime profile
 
@@ -317,11 +315,9 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
 
-## 0.3.3 更新
+## 0.3.4 更新
 
-- 服务命令遇到 `launchctl` 执行失败时会如实报错，不再当作"未加载"
-- 启动失败且无法停止服务时保留 launchd plist，并提示运行 `dnsrivet stop`
-- 扫描响应 TTL 和查询缓存时减少内存分配
+- 多个查询同时在已失效的加密连接上失败时（例如 Mac 刚唤醒），每个查询都会在重连后的连接上重试一次，不再切换上游并回退到明文系统 DNS
 
 ## 运行开销
 

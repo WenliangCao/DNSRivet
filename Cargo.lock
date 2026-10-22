@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "dnsrivet"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "futures-core",
  "hickory-proto",
