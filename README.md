@@ -28,11 +28,18 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
-## 0.3.4 changes
+## 0.3.5 changes
 
-- When several queries fail together on a stale encrypted connection (for
-  example right after the Mac wakes), each retries once on the reconnected
-  connection instead of failing over and falling back to plaintext system DNS
+Targeted improvements following a review against Microsoft's
+[Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/):
+
+- Avoid redundant parsing on fresh cache hits and reduce cache metadata
+- Reduce per-query allocations and memory used by pending forwarding tasks
+- Harden temporary file handling and atomic replacement; stream executable copies
+- Fix `config init` when using its default relative output path
+- Apply security patches to encrypted transport dependencies
+
+DNS forwarding, retry, timeout, and failover policies remain unchanged.
 
 ## Runtime profile
 
@@ -315,9 +322,18 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
 
-## 0.3.4 更新
+## 0.3.5 更新
 
-- 多个查询同时在已失效的加密连接上失败时（例如 Mac 刚唤醒），每个查询都会在重连后的连接上重试一次，不再切换上游并回退到明文系统 DNS
+参考微软官方 [Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/)
+完成审查，并实施针对性改进：
+
+- 避免新鲜缓存命中时的重复解析，减少缓存元数据
+- 减少每次查询的内存分配和等待中的转发任务内存占用
+- 加固临时文件处理与原子替换，安装二进制改为流式复制
+- 修复 `config init` 使用默认相对输出路径时失败的问题
+- 更新加密传输依赖的安全补丁版本
+
+DNS 转发、重试、超时及故障转移策略保持不变。
 
 ## 运行开销
 
