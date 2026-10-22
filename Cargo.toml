@@ -39,6 +39,9 @@ lru = "0.18"
 lexopt = "0.3"
 nix = { version = "0.31.3", default-features = false, features = ["user", "net"] }
 
+[dev-dependencies]
+futures-core = { version = "0.3", default-features = false }
+
 [profile.release]
 opt-level = "z"
 lto = true

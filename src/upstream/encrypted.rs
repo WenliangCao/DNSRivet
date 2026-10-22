@@ -363,6 +363,106 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IpStack;
+    use crate::upstream::{Backend, Manager};
+    use futures_core::Stream;
+    use hickory_proto::op::{Edns, MessageType, Query};
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::xfer::{DnsResponse, DnsResponseStream};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct EchoTransport {
+        closed: bool,
+    }
+
+    impl Stream for EchoTransport {
+        type Item = Result<(), ProtoError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.closed {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl DnsRequestSender for EchoTransport {
+        fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
+            let (mut message, _) = request.into_parts();
+            // Model DoQ's zero ID so the manager must restore the client's ID.
+            message.set_message_type(MessageType::Response).set_id(0);
+            Box::pin(async move { DnsResponse::from_message(message) }).into()
+        }
+
+        fn shutdown(&mut self) {
+            self.closed = true;
+        }
+
+        fn is_shutdown(&self) -> bool {
+            self.closed
+        }
+    }
+
+    async fn echo_manager() -> (Manager, tokio::task::JoinHandle<Result<(), ProtoError>>) {
+        let upstream = Upstream {
+            name: "in-memory encrypted transport".into(),
+            proto: Proto::Doh,
+            host: "resolver.test".into(),
+            port: 443,
+            path: "/dns-query".into(),
+            bootstrap_ip: Some("192.0.2.53".parse().unwrap()),
+            timeout_ms: 0,
+            ip_stack: IpStack::V4,
+        };
+        let manager = Manager::new(vec![upstream], &[], Vec::new()).unwrap();
+        let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+            panic!("the test upstream must use an encrypted channel");
+        };
+        let (exchange, background) =
+            DnsExchange::from_stream::<_, TokioTime>(EchoTransport::default());
+        channel.state.lock().await.store(exchange);
+        (manager, tokio::spawn(background))
+    }
+
+    fn encrypted_test_query(padding: usize) -> Message {
+        let mut message = Message::new();
+        message
+            .set_id(0x1234)
+            .set_recursion_desired(true)
+            .add_query(Query::query(
+                Name::from_ascii("example.com.").unwrap(),
+                RecordType::A,
+            ));
+        if padding > 0 {
+            let mut edns = Edns::new();
+            edns.set_max_payload(1232);
+            edns.options_mut()
+                .insert(EdnsOption::Unknown(12, vec![0; padding]));
+            message.set_edns(edns);
+        }
+        message
+    }
+
+    #[tokio::test]
+    async fn encrypted_forward_preserves_question_id_and_edns() {
+        let (manager, background) = echo_manager().await;
+        for padding in [0, 1024] {
+            let query = encrypted_test_query(padding);
+            let wire_query = query.to_vec().unwrap();
+            let response = manager.forward(&wire_query, false).await.unwrap();
+            crate::wire::validate_response(&wire_query, &response).unwrap();
+            let response = Message::from_vec(&response).unwrap();
+            assert_eq!(response.id(), query.id());
+            assert_eq!(response.queries(), query.queries());
+            assert_eq!(response.extensions(), query.extensions());
+        }
+        drop(manager);
+        background.await.unwrap().unwrap();
+    }
 
     #[test]
     fn store_bumps_generation_and_clears_backoff_state() {
