@@ -10,13 +10,19 @@ const TYPE_SOA: u16 = 6;
 const TYPE_OPT: u16 = 41;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct QueryMeta {
+pub struct QueryKey {
     pub qname: Vec<u8>,
     pub qtype: u16,
     pub qclass: u16,
     pub do_bit: bool,
     /// AD/CD request bits. They can change DNSSEC-aware upstream responses.
     pub dnssec_header_bits: u8,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct QueryMeta {
+    pub key: QueryKey,
+    /// Transport limit; it does not affect which cached answer is selected.
     pub udp_size: usize,
 }
 
@@ -70,11 +76,13 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
     }
 
     Some(QueryMeta {
-        qname,
-        qtype,
-        qclass,
-        do_bit,
-        dnssec_header_bits: message[3] & 0x30,
+        key: QueryKey {
+            qname,
+            qtype,
+            qclass,
+            do_bit,
+            dnssec_header_bits: message[3] & 0x30,
+        },
         udp_size,
     })
 }
@@ -474,11 +482,11 @@ mod tests {
     #[test]
     fn parses_query_key_edns_size_and_do() {
         let meta = parse_query_meta(&question(0x1234, true)).unwrap();
-        assert_eq!(meta.qname, b"\x07example\x03com\0");
-        assert_eq!(meta.qtype, 1);
-        assert_eq!(meta.qclass, 1);
+        assert_eq!(meta.key.qname, b"\x07example\x03com\0");
+        assert_eq!(meta.key.qtype, 1);
+        assert_eq!(meta.key.qclass, 1);
         assert_eq!(meta.udp_size, 4096);
-        assert!(meta.do_bit);
+        assert!(meta.key.do_bit);
     }
 
     #[test]

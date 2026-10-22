@@ -1,29 +1,8 @@
-use crate::wire::{self, QueryMeta};
+use crate::wire::{self, QueryKey, QueryMeta};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::Instant;
-
-#[derive(Clone, Eq, Hash, PartialEq)]
-struct Key {
-    qname: Vec<u8>,
-    qtype: u16,
-    qclass: u16,
-    do_bit: bool,
-    dnssec_header_bits: u8,
-}
-
-impl From<&QueryMeta> for Key {
-    fn from(meta: &QueryMeta) -> Self {
-        Self {
-            qname: meta.qname.clone(),
-            qtype: meta.qtype,
-            qclass: meta.qclass,
-            do_bit: meta.do_bit,
-            dnssec_header_bits: meta.dnssec_header_bits,
-        }
-    }
-}
 
 struct Entry {
     response: Vec<u8>,
@@ -32,7 +11,7 @@ struct Entry {
 }
 
 pub struct Cache {
-    entries: Option<Mutex<LruCache<Key, Entry>>>,
+    entries: Option<Mutex<LruCache<QueryKey, Entry>>>,
 }
 
 impl Cache {
@@ -46,20 +25,14 @@ impl Cache {
 
     pub fn get(&self, meta: &QueryMeta, request_id: [u8; 2]) -> Option<Vec<u8>> {
         let entries = self.entries.as_ref()?;
-        let key = Key::from(meta);
         let mut entries = entries.lock().unwrap();
-        let (mut response, elapsed, ttl) = {
-            let entry = entries.get(&key)?;
-            (
-                entry.response.clone(),
-                entry.stored_at.elapsed().as_secs(),
-                entry.ttl,
-            )
-        };
-        if elapsed >= u64::from(ttl) {
-            entries.pop(&key);
+        let entry = entries.get(&meta.key)?;
+        let elapsed = entry.stored_at.elapsed().as_secs();
+        if elapsed >= u64::from(entry.ttl) {
+            entries.pop(&meta.key);
             return None;
         }
+        let mut response = entry.response.clone();
         drop(entries);
 
         if !wire::adjust_ttls(&mut response, elapsed) {
@@ -73,13 +46,13 @@ impl Cache {
         let Some(entries) = &self.entries else {
             return;
         };
-        let Some(ttl) = wire::cache_ttl(response, meta.qtype) else {
+        let Some(ttl) = wire::cache_ttl(response, meta.key.qtype) else {
             return;
         };
         let mut stored = response.to_vec();
         stored[..2].fill(0);
         entries.lock().unwrap().put(
-            Key::from(meta),
+            meta.key.clone(),
             Entry {
                 response: stored,
                 stored_at: Instant::now(),
@@ -112,6 +85,15 @@ mod tests {
         message
     }
 
+    fn edns_query(id: u16, udp_size: u16) -> Vec<u8> {
+        let mut message = query(id);
+        message[11] = 1;
+        message.extend_from_slice(&[0, 0, 41]);
+        message.extend_from_slice(&udp_size.to_be_bytes());
+        message.extend_from_slice(&[0; 6]);
+        message
+    }
+
     #[test]
     fn restores_each_clients_id() {
         let cache = Cache::new(true, 2);
@@ -137,13 +119,78 @@ mod tests {
         let query = query(1);
         let meta = wire::parse_query_meta(&query).unwrap();
         cache.insert(&meta, &response(1, 60));
-        let key = Key::from(&meta);
         let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
-        let entry = entries.get_mut(&key).unwrap();
+        let entry = entries.get_mut(&meta.key).unwrap();
         entry.ttl = 1;
         entry.stored_at = Instant::now() - Duration::from_secs(2);
         drop(entries);
         assert!(cache.get(&meta, [0, 1]).is_none());
         assert!(cache.entries.as_ref().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn separates_queries_that_can_produce_different_answers() {
+        let query = edns_query(1, 4096);
+        let meta = wire::parse_query_meta(&query).unwrap();
+        let cache = Cache::new(true, 2);
+        cache.insert(&meta, &response(1, 60));
+        assert!(cache.get(&meta, [0, 1]).is_some());
+
+        let cases = [
+            ("QNAME", 13, b'b'),
+            ("QTYPE", 16, 28),
+            ("QCLASS", 18, 3),
+            ("DO", 26, 0x80),
+            ("AD", 3, 0x20),
+            ("CD", 3, 0x10),
+        ];
+        for (field, offset, value) in cases {
+            let mut different = query.clone();
+            different[offset] = value;
+            let meta = wire::parse_query_meta(&different).unwrap();
+            assert!(cache.get(&meta, [0, 2]).is_none(), "different {field}");
+        }
+    }
+
+    #[test]
+    fn reuses_answers_across_udp_payload_sizes() {
+        let large = wire::parse_query_meta(&edns_query(1, 4096)).unwrap();
+        let small = wire::parse_query_meta(&edns_query(2, 512)).unwrap();
+        assert_eq!(large.udp_size, 4096);
+        assert_eq!(small.udp_size, 512);
+
+        let cache = Cache::new(true, 2);
+        cache.insert(&large, &response(1, 60));
+        let got = cache.get(&small, [0, 2]).unwrap();
+        assert_eq!(&got[..2], &[0, 2]);
+    }
+
+    #[test]
+    fn keeps_cached_id_and_ttls_unchanged_between_clients() {
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        let original = response(1, 120);
+        let cache = Cache::new(true, 2);
+        cache.insert(&meta, &original);
+
+        for (id, age) in [([0x12, 0x34], 20), ([0xab, 0xcd], 40)] {
+            let stored_at = Instant::now() - Duration::from_secs(age);
+            {
+                let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
+                entries.get_mut(&meta.key).unwrap().stored_at = stored_at;
+            }
+            let elapsed_before = stored_at.elapsed().as_secs().min(120) as u32;
+            let mut got = cache.get(&meta, id).unwrap();
+            let elapsed_after = stored_at.elapsed().as_secs().min(120) as u32;
+            assert_eq!(&got[..2], &id);
+            let ttl = wire::cache_ttl(&got, 1).unwrap();
+            assert!((120 - elapsed_after..=120 - elapsed_before).contains(&ttl));
+
+            // A client owns its response and can change it without changing the cache.
+            got.fill(0);
+            let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
+            let entry = entries.get(&meta.key).unwrap();
+            assert_eq!(&entry.response[..2], &[0, 0]);
+            assert_eq!(&entry.response[2..], &original[2..]);
+        }
     }
 }
