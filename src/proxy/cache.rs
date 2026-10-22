@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 struct Entry {
-    response: Vec<u8>,
+    response: Box<[u8]>,
     stored_at: Instant,
     ttl: u32,
 }
@@ -32,10 +32,12 @@ impl Cache {
             entries.pop(&meta.key);
             return None;
         }
-        let mut response = entry.response.clone();
+        let mut response = entry.response.to_vec();
         drop(entries);
 
-        if !wire::adjust_ttls(&mut response, elapsed) {
+        // Insertion validates every record. Until a whole second has elapsed,
+        // all TTLs are unchanged, so another full wire walk would do no work.
+        if elapsed > 0 && !wire::adjust_ttls(&mut response, elapsed) {
             return None;
         }
         response[..2].copy_from_slice(&request_id);
@@ -49,7 +51,7 @@ impl Cache {
         let Some(ttl) = wire::cache_ttl(response, meta.key.qtype) else {
             return;
         };
-        let mut stored = response.to_vec();
+        let mut stored: Box<[u8]> = response.into();
         stored[..2].fill(0);
         entries.lock().unwrap().put(
             meta.key.clone(),
@@ -75,13 +77,19 @@ mod tests {
     }
 
     fn response(id: u16, ttl: u32) -> Vec<u8> {
+        response_with_records(id, ttl, 1)
+    }
+
+    fn response_with_records(id: u16, ttl: u32, count: u16) -> Vec<u8> {
         let mut message = query(id);
         message[2] = 0x81;
         message[3] = 0x80;
-        message[6..8].copy_from_slice(&1u16.to_be_bytes());
-        message.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
-        message.extend_from_slice(&ttl.to_be_bytes());
-        message.extend_from_slice(&[0, 4, 1, 1, 1, 1]);
+        message[6..8].copy_from_slice(&count.to_be_bytes());
+        for _ in 0..count {
+            message.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+            message.extend_from_slice(&ttl.to_be_bytes());
+            message.extend_from_slice(&[0, 4, 1, 1, 1, 1]);
+        }
         message
     }
 
@@ -105,12 +113,38 @@ mod tests {
     }
 
     #[test]
+    fn fresh_cache_hits_preserve_every_byte_except_the_id() {
+        let meta = wire::parse_query_meta(&edns_query(1, 4096)).unwrap();
+        let cache = Cache::new(true, 2);
+        let mut original = response_with_records(1, 120, 32);
+        original[11] = 1;
+        original.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0x80, 0, 0, 0]);
+        cache.insert(&meta, &original);
+
+        let request_id = [0xab, 0xcd];
+        let got = cache.get(&meta, request_id).unwrap();
+        original[..2].copy_from_slice(&request_id);
+        assert_eq!(got, original);
+    }
+
+    #[test]
     fn disabled_cache_is_a_noop() {
         let cache = Cache::new(false, 2);
         let query = query(1);
         let meta = wire::parse_query_meta(&query).unwrap();
         cache.insert(&meta, &response(1, 60));
         assert!(cache.get(&meta, [0, 1]).is_none());
+    }
+
+    #[test]
+    fn malformed_records_never_enter_the_cache() {
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        let cache = Cache::new(true, 2);
+        let complete = response(1, 120);
+        for end in 0..complete.len() {
+            cache.insert(&meta, &complete[..end]);
+            assert!(cache.get(&meta, [0, 1]).is_none());
+        }
     }
 
     #[test]
@@ -168,7 +202,10 @@ mod tests {
     #[test]
     fn keeps_cached_id_and_ttls_unchanged_between_clients() {
         let meta = wire::parse_query_meta(&query(1)).unwrap();
-        let original = response(1, 120);
+        let mut original = response(1, 120);
+        original[11] = 1;
+        let opt = [0, 0, 41, 0x10, 0, 0, 0, 0x80, 0, 0, 0];
+        original.extend_from_slice(&opt);
         let cache = Cache::new(true, 2);
         cache.insert(&meta, &original);
 
@@ -184,6 +221,7 @@ mod tests {
             assert_eq!(&got[..2], &id);
             let ttl = wire::cache_ttl(&got, 1).unwrap();
             assert!((120 - elapsed_after..=120 - elapsed_before).contains(&ttl));
+            assert_eq!(&got[got.len() - opt.len()..], &opt);
 
             // A client owns its response and can change it without changing the cache.
             got.fill(0);
@@ -191,6 +229,60 @@ mod tests {
             let entry = entries.get(&meta.key).unwrap();
             assert_eq!(&entry.response[..2], &[0, 0]);
             assert_eq!(&entry.response[2..], &original[2..]);
+        }
+    }
+
+    /// Run with `mbx test --release benchmark_cache_hits -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual cache hot-path benchmark"]
+    fn benchmark_cache_hits() {
+        use std::hint::black_box;
+
+        const ITERATIONS: usize = 100_000;
+        const SAMPLES: usize = 7;
+        println!(
+            "cache entry metadata: {} bytes",
+            std::mem::size_of::<Entry>()
+        );
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        for records in [1, 32] {
+            let cache = Cache::new(true, 1);
+            cache.insert(&meta, &response_with_records(1, 120, records));
+            for age in [0, 20] {
+                let mut samples = [0.0; SAMPLES];
+                for sample in &mut samples {
+                    cache
+                        .entries
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .get_mut(&meta.key)
+                        .unwrap()
+                        .stored_at = Instant::now() - Duration::from_secs(age);
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        black_box(
+                            cache
+                                .get(black_box(&meta), black_box([0xab, 0xcd]))
+                                .unwrap(),
+                        );
+                    }
+                    let elapsed = start.elapsed();
+                    assert!(
+                        elapsed < Duration::from_secs(1),
+                        "sample crossed a TTL tick"
+                    );
+                    *sample = elapsed.as_nanos() as f64 / ITERATIONS as f64;
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "records={records} age={age}s median={:.1} ns/hit min={:.1} max={:.1}",
+                    samples[SAMPLES / 2],
+                    samples[0],
+                    samples[SAMPLES - 1]
+                );
+            }
         }
     }
 }
