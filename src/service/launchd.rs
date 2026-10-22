@@ -69,7 +69,7 @@ pub fn is_installed() -> bool {
 }
 
 pub fn bootout() -> Result<bool, String> {
-    if !is_loaded() {
+    if !is_loaded()? {
         return Ok(false);
     }
     checked(
@@ -90,11 +90,18 @@ pub fn restart() -> Result<(), String> {
     )
 }
 
-pub fn is_loaded() -> bool {
-    Command::new(LAUNCHCTL)
-        .args(["print", &format!("system/{LABEL}")])
-        .output()
-        .is_ok_and(|output| output.status.success())
+pub fn is_loaded() -> Result<bool, String> {
+    loaded_from_output(
+        Command::new(LAUNCHCTL)
+            .args(["print", &format!("system/{LABEL}")])
+            .output(),
+    )
+}
+
+fn loaded_from_output(output: std::io::Result<Output>) -> Result<bool, String> {
+    output
+        .map(|output| output.status.success())
+        .map_err(|err| format!("query launchd service {LABEL}: {err}"))
 }
 
 fn checked(output: std::io::Result<Output>, action: &str) -> Result<(), String> {
@@ -155,6 +162,35 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_query_preserves_normal_exit_statuses() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for (status, loaded) in [(0, true), (1, false)] {
+            let output = Output {
+                status: std::process::ExitStatus::from_raw(status << 8),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(loaded_from_output(Ok(output)).unwrap(), loaded);
+        }
+    }
+
+    #[test]
+    fn loaded_query_reports_execution_errors() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error =
+                loaded_from_output(Err(std::io::Error::new(kind, "launchctl execution failed")))
+                    .unwrap_err();
+            assert!(error.contains("query launchd service"));
+            assert!(error.contains(LABEL));
+            assert!(error.contains("launchctl execution failed"));
+        }
+    }
 
     #[test]
     fn plist_escapes_paths_and_contains_required_service_keys() {

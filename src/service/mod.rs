@@ -19,7 +19,7 @@ pub fn start(
     generated_config: Option<String>,
 ) -> Result<String, String> {
     require_root()?;
-    if launchd::is_loaded() {
+    if launchd::is_loaded()? {
         return Err("service is already loaded; use `dnsrivet restart`".into());
     }
     match osdns::takeover_state() {
@@ -64,9 +64,11 @@ pub fn start(
 
     let probe_addr = SocketAddr::new(dns_ip, 53);
     if let Err(err) = wait_for_dns(probe_addr, Duration::from_secs(15)) {
-        let _ = launchd::bootout();
-        let _ = launchd::remove_plist();
-        return Err(format!("service started but failed its DNS probe: {err}"));
+        return Err(cleanup_failed_start(
+            &format!("service started but failed its DNS probe: {err}"),
+            launchd::bootout,
+            launchd::remove_plist,
+        ));
     }
 
     if let Err(err) = osdns::take_over(dns_ip) {
@@ -75,10 +77,10 @@ pub fn start(
                 "DNS takeover failed and rollback was incomplete: {err}; the service was left running so any network service still using {dns_ip} can resolve—run `dnsrivet stop` to retry restoration"
             ));
         }
-        let _ = launchd::bootout();
-        let _ = launchd::remove_plist();
-        return Err(format!(
-            "service was stopped because DNS takeover failed: {err}"
+        return Err(cleanup_failed_start(
+            &format!("DNS takeover failed: {err}"),
+            launchd::bootout,
+            launchd::remove_plist,
         ));
     }
 
@@ -88,10 +90,35 @@ pub fn start(
     ))
 }
 
+fn cleanup_failed_start(
+    failure: &str,
+    stop: impl FnOnce() -> Result<bool, String>,
+    remove_plist: impl FnOnce() -> Result<(), String>,
+) -> String {
+    let stopped = match stop() {
+        Ok(stopped) => stopped,
+        Err(err) => {
+            return format!(
+                "{failure}; could not stop service: {err}; service may still be running, \
+                 so the launchd plist was retained; run `dnsrivet stop` to retry"
+            );
+        }
+    };
+    let status = if stopped {
+        "service was stopped"
+    } else {
+        "service was not loaded"
+    };
+    match remove_plist() {
+        Ok(()) => format!("{failure}; {status}"),
+        Err(err) => format!("{failure}; {status}; could not remove launchd plist: {err}"),
+    }
+}
+
 pub fn stop() -> Result<String, String> {
     require_root()?;
     let restored = osdns::release()?;
-    let managed = launchd::is_installed() || launchd::is_loaded();
+    let managed = launchd::is_installed() || launchd::is_loaded()?;
     if managed {
         launchd::set_enabled(false)?;
     }
@@ -111,7 +138,7 @@ pub fn restart(
     generated_config: Option<String>,
 ) -> Result<String, String> {
     require_root()?;
-    if !launchd::is_loaded() {
+    if !launchd::is_loaded()? {
         return Err("service is not loaded; use `dnsrivet start`".into());
     }
     refresh_installed_binary()?;
@@ -189,7 +216,7 @@ fn takeover_status_line() -> String {
 
 pub fn status() -> Result<String, String> {
     let takeover = takeover_status_line();
-    if !launchd::is_loaded() {
+    if !launchd::is_loaded()? {
         return Ok(format!(
             "{}\n{takeover}",
             if launchd::is_installed() {
@@ -234,7 +261,7 @@ pub fn status() -> Result<String, String> {
 pub fn uninstall() -> Result<String, String> {
     require_root()?;
     let restored = osdns::release()?;
-    let managed = launchd::is_installed() || launchd::is_loaded();
+    let managed = launchd::is_installed() || launchd::is_loaded()?;
     if managed {
         launchd::set_enabled(false)?;
     }
@@ -600,6 +627,64 @@ fn dns_probe(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_start_keeps_plist_when_stopping_fails() {
+        let error = cleanup_failed_start(
+            "DNS takeover failed: original error",
+            || Err("launchctl bootout failed".into()),
+            || panic!("must retain the plist while the service may still be running"),
+        );
+        assert!(error.contains("DNS takeover failed: original error"));
+        assert!(error.contains("launchctl bootout failed"));
+        assert!(error.contains("service may still be running"));
+        assert!(error.contains("plist was retained"));
+        assert!(!error.contains("service was stopped"));
+    }
+
+    #[test]
+    fn failed_start_removes_plist_after_confirming_service_is_stopped() {
+        use std::cell::Cell;
+
+        for stopped in [true, false] {
+            let stop_finished = Cell::new(false);
+            let mut removed = false;
+            let error = cleanup_failed_start(
+                "DNS probe failed",
+                || {
+                    stop_finished.set(true);
+                    Ok(stopped)
+                },
+                || {
+                    assert!(
+                        stop_finished.get(),
+                        "stop must finish before removing the plist"
+                    );
+                    removed = true;
+                    Ok(())
+                },
+            );
+            assert!(removed);
+            assert!(error.contains("DNS probe failed"));
+            assert!(error.contains(if stopped {
+                "service was stopped"
+            } else {
+                "service was not loaded"
+            }));
+        }
+    }
+
+    #[test]
+    fn failed_start_reports_plist_removal_failure() {
+        let error = cleanup_failed_start(
+            "DNS probe failed",
+            || Ok(true),
+            || Err("permission denied".into()),
+        );
+        assert!(error.contains("DNS probe failed"));
+        assert!(error.contains("service was stopped"));
+        assert!(error.contains("could not remove launchd plist: permission denied"));
+    }
 
     #[test]
     fn chooses_ipv4_loopback_listener_on_port_53() {
