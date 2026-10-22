@@ -12,25 +12,20 @@ pub fn write_plist(binary: &Path, config: &Path) -> Result<(), String> {
         return Err("launchd binary and config paths must be absolute".into());
     }
     let plist = render_plist(binary, config);
-    atomic_file::write(
-        Path::new(PLIST_PATH),
-        0o644,
-        atomic_file::Overwrite::Allow,
-        |file, temporary| {
-            file.write_all(plist.as_bytes())?;
-            let output = Command::new("/usr/bin/plutil")
-                .args(["-lint", "--"])
-                .arg(temporary)
-                .output()?;
-            if !output.status.success() {
-                return Err(std::io::Error::other(format!(
-                    "invalid generated launchd plist: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            Ok(())
-        },
-    )
+    atomic_file::write(Path::new(PLIST_PATH), 0o644, |file, temporary| {
+        file.write_all(plist.as_bytes())?;
+        let output = Command::new("/usr/bin/plutil")
+            .args(["-lint", "--"])
+            .arg(temporary)
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "invalid generated launchd plist: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    })
     .map_err(|e| format!("install launchd plist {PLIST_PATH}: {e}"))
 }
 

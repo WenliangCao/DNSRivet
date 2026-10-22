@@ -621,10 +621,8 @@ fn write_backup(backup: &Backup) -> Result<(), String> {
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
     let text = toml::to_string(backup).map_err(|e| format!("serialize DNS backup: {e}"))?;
-    atomic_file::write(path, 0o600, atomic_file::Overwrite::Allow, |file, _| {
-        file.write_all(text.as_bytes())
-    })
-    .map_err(|e| format!("install DNS backup {BACKUP_PATH}: {e}"))
+    atomic_file::write(path, 0o600, |file, _| file.write_all(text.as_bytes()))
+        .map_err(|e| format!("install DNS backup {BACKUP_PATH}: {e}"))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<Output, String> {

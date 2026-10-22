@@ -371,10 +371,8 @@ fn restart_with_config(replacement: &[u8]) -> Result<String, String> {
 fn write_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::create_dir_all(SUPPORT_DIR)
         .map_err(|e| format!("create support directory {SUPPORT_DIR}: {e}"))?;
-    atomic_file::write(path, 0o600, atomic_file::Overwrite::Allow, |file, _| {
-        file.write_all(bytes)
-    })
-    .map_err(|e| format!("install config {}: {e}", path.display()))
+    atomic_file::write(path, 0o600, |file, _| file.write_all(bytes))
+        .map_err(|e| format!("install config {}: {e}", path.display()))
 }
 
 fn install_binary(source: &Path) -> Result<PathBuf, String> {
@@ -387,12 +385,9 @@ fn install_binary(source: &Path) -> Result<PathBuf, String> {
 fn install_binary_at(source: &Path, destination: &Path) -> Result<(), String> {
     let mut source_file = std::fs::File::open(source)
         .map_err(|e| format!("read executable {}: {e}", source.display()))?;
-    atomic_file::write(
-        destination,
-        0o755,
-        atomic_file::Overwrite::Allow,
-        |file, _| std::io::copy(&mut source_file, file).map(|_| ()),
-    )
+    atomic_file::write(destination, 0o755, |file, _| {
+        std::io::copy(&mut source_file, file).map(|_| ())
+    })
     .map_err(|e| format!("install executable {}: {e}", destination.display()))
 }
 

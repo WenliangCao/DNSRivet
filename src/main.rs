@@ -192,21 +192,8 @@ fn write_local_config(path: &std::path::Path, bytes: &[u8], force: bool) -> Resu
             parent.display()
         ));
     }
-    let overwrite = if force {
-        atomic_file::Overwrite::Allow
-    } else {
-        atomic_file::Overwrite::Deny
-    };
-    atomic_file::write(path, 0o600, overwrite, |file, _| file.write_all(bytes)).map_err(|err| {
-        if !force && err.kind() == std::io::ErrorKind::AlreadyExists {
-            format!(
-                "refusing to replace {}; use --force to overwrite it",
-                path.display()
-            )
-        } else {
-            format!("install config {}: {err}", path.display())
-        }
-    })
+    atomic_file::write(path, 0o600, |file, _| file.write_all(bytes))
+        .map_err(|err| format!("install config {}: {err}", path.display()))
 }
 
 /// --config wins; otherwise try ./dnsrivet.toml (dev convenience), then the

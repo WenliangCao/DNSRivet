@@ -6,18 +6,12 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub enum Overwrite {
-    Allow,
-    Deny,
-}
-
 /// Write and validate privately, then publish the complete file in one step.
 /// The parent directory must be trusted: this does not defend against a caller
 /// that can rename directories or replace entries while the write is in flight.
 pub fn write(
     destination: &Path,
     mode: u32,
-    overwrite: Overwrite,
     contents: impl FnOnce(&mut File, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut temporary = TemporaryFile::new(destination)?;
@@ -26,12 +20,7 @@ pub fn write(
         .file
         .set_permissions(std::fs::Permissions::from_mode(mode))?;
     temporary.file.sync_all()?;
-    match overwrite {
-        Overwrite::Allow => std::fs::rename(&temporary.path, destination),
-        // Linking within the same directory atomically rejects any existing
-        // entry, including dangling symlinks. Drop removes the temporary name.
-        Overwrite::Deny => std::fs::hard_link(&temporary.path, destination),
-    }
+    std::fs::rename(&temporary.path, destination)
 }
 
 struct TemporaryFile {
@@ -125,7 +114,7 @@ mod tests {
         let directory = TestDirectory::new();
         let destination = directory.0.join("binary");
         std::fs::write(&destination, b"old").unwrap();
-        write(&destination, 0o755, Overwrite::Allow, |file, path| {
+        write(&destination, 0o755, |file, path| {
             assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
             assert_eq!(std::fs::read(&destination)?, b"old");
             assert_ne!(path, destination);
@@ -149,7 +138,7 @@ mod tests {
         let directory = TestDirectory::new();
         let destination = directory.0.join("config");
         std::fs::write(&destination, b"original").unwrap();
-        let error = write(&destination, 0o600, Overwrite::Allow, |file, _| {
+        let error = write(&destination, 0o600, |file, _| {
             file.write_all(b"incomplete")?;
             Err(io::Error::other("injected write failure"))
         })
@@ -166,7 +155,7 @@ mod tests {
         std::fs::create_dir(&destination).unwrap();
         std::fs::write(destination.join("existing"), b"original").unwrap();
         assert!(
-            write(&destination, 0o600, Overwrite::Allow, |file, _| {
+            write(&destination, 0o600, |file, _| {
                 file.write_all(b"replacement")
             })
             .is_err()
@@ -179,48 +168,13 @@ mod tests {
     }
 
     #[test]
-    fn no_clobber_rejects_existing_files_and_dangling_symlinks() {
-        let directory = TestDirectory::new();
-        let existing = directory.0.join("existing");
-        let link = directory.0.join("link");
-        let missing = directory.0.join("missing");
-        std::fs::write(&existing, b"original").unwrap();
-        symlink(&missing, &link).unwrap();
-        for destination in [&existing, &link] {
-            let error = write(destination, 0o600, Overwrite::Deny, |file, _| {
-                file.write_all(b"replacement")
-            })
-            .unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        }
-        assert_eq!(std::fs::read(existing).unwrap(), b"original");
-        assert_eq!(std::fs::read_link(link).unwrap(), missing);
-        assert!(!missing.exists());
-        directory.assert_no_temporary_files();
-    }
-
-    #[test]
-    fn no_clobber_rejects_a_destination_created_during_the_write() {
-        let directory = TestDirectory::new();
-        let destination = directory.0.join("config");
-        let error = write(&destination, 0o600, Overwrite::Deny, |file, _| {
-            file.write_all(b"replacement")?;
-            std::fs::write(&destination, b"concurrent writer")
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(destination).unwrap(), b"concurrent writer");
-        directory.assert_no_temporary_files();
-    }
-
-    #[test]
     fn replacement_does_not_follow_destination_symlinks() {
         let directory = TestDirectory::new();
         let target = directory.0.join("target");
         let destination = directory.0.join("config");
         std::fs::write(&target, b"unrelated").unwrap();
         symlink(&target, &destination).unwrap();
-        write(&destination, 0o600, Overwrite::Allow, |file, _| {
+        write(&destination, 0o600, |file, _| {
             file.write_all(b"replacement")
         })
         .unwrap();
@@ -239,7 +193,7 @@ mod tests {
                 let destination = &destination;
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {
-                    write(destination, 0o600, Overwrite::Allow, |file, _| {
+                    write(destination, 0o600, |file, _| {
                         file.write_all(&[value; 8192])?;
                         barrier.wait();
                         file.write_all(&[value; 8192])
