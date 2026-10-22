@@ -1,11 +1,9 @@
 mod launchd;
 
-use crate::{config, osdns};
-use std::fs::OpenOptions;
+use crate::{atomic_file, config, osdns};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::symlink;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -373,43 +371,29 @@ fn restart_with_config(replacement: &[u8]) -> Result<String, String> {
 fn write_config(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::create_dir_all(SUPPORT_DIR)
         .map_err(|e| format!("create support directory {SUPPORT_DIR}: {e}"))?;
-    let temporary = Path::new(SUPPORT_DIR).join(".config.toml.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|e| format!("write config {}: {e}", temporary.display()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write config {}: {e}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("set config permissions {}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("install config {}: {e}", path.display()))
+    atomic_file::write(path, 0o600, atomic_file::Overwrite::Allow, |file, _| {
+        file.write_all(bytes)
+    })
+    .map_err(|e| format!("install config {}: {e}", path.display()))
 }
 
 fn install_binary(source: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(SUPPORT_DIR)
         .map_err(|e| format!("create support directory {SUPPORT_DIR}: {e}"))?;
-    let bytes =
-        std::fs::read(source).map_err(|e| format!("read executable {}: {e}", source.display()))?;
-    let temporary = Path::new(SUPPORT_DIR).join(".dnsrivet.tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o755)
-        .open(&temporary)
-        .map_err(|e| format!("write executable {}: {e}", temporary.display()))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write executable {}: {e}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("set executable permissions {}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, BINARY_PATH)
-        .map_err(|e| format!("install executable {BINARY_PATH}: {e}"))?;
+    install_binary_at(source, Path::new(BINARY_PATH))?;
     Ok(PathBuf::from(BINARY_PATH))
+}
+
+fn install_binary_at(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut source_file = std::fs::File::open(source)
+        .map_err(|e| format!("read executable {}: {e}", source.display()))?;
+    atomic_file::write(
+        destination,
+        0o755,
+        atomic_file::Overwrite::Allow,
+        |file, _| std::io::copy(&mut source_file, file).map(|_| ()),
+    )
+    .map_err(|e| format!("install executable {}: {e}", destination.display()))
 }
 
 /// Refresh the daemon copy when `restart` is invoked from a package manager's
@@ -627,6 +611,45 @@ fn dns_probe(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_install_streams_large_files_and_can_replace_its_source() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "dnsrivet-binary-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("installed");
+        let mut original = std::fs::File::create(&source).unwrap();
+        for byte in 0..128u8 {
+            original.write_all(&[byte; 65536]).unwrap();
+        }
+        drop(original);
+
+        install_binary_at(&source, &destination).unwrap();
+        install_binary_at(&destination, &destination).unwrap();
+        let mut installed = std::fs::File::open(&destination).unwrap();
+        let mut bytes = [0; 65536];
+        for byte in 0..128u8 {
+            installed.read_exact(&mut bytes).unwrap();
+            assert!(bytes.iter().all(|value| *value == byte));
+        }
+        assert_eq!(installed.read(&mut bytes).unwrap(), 0);
+        assert_eq!(
+            installed.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn failed_start_keeps_plist_when_stopping_fails() {

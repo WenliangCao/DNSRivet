@@ -1,12 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+mod atomic_file;
 mod cli;
 mod config;
 mod logger;
@@ -178,39 +176,37 @@ fn config_check(explicit: Option<PathBuf>) -> Result<String, String> {
 }
 
 fn write_local_config(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<(), String> {
-    if path.exists() && !force {
+    if path.symlink_metadata().is_ok() && !force {
         return Err(format!(
             "refusing to replace {}; use --force to overwrite it",
             path.display()
         ));
     }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     if !parent.is_dir() {
         return Err(format!(
             "config destination directory does not exist: {}",
             parent.display()
         ));
     }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temporary = parent.join(format!(
-        ".dnsrivet-config-{}-{nonce}.tmp",
-        std::process::id()
-    ));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|e| format!("write temporary config {}: {e}", temporary.display()))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write temporary config {}: {e}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("secure temporary config {}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("install config {}: {e}", path.display()))
+    let overwrite = if force {
+        atomic_file::Overwrite::Allow
+    } else {
+        atomic_file::Overwrite::Deny
+    };
+    atomic_file::write(path, 0o600, overwrite, |file, _| file.write_all(bytes)).map_err(|err| {
+        if !force && err.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "refusing to replace {}; use --force to overwrite it",
+                path.display()
+            )
+        } else {
+            format!("install config {}: {err}", path.display())
+        }
+    })
 }
 
 /// --config wins; otherwise try ./dnsrivet.toml (dev convenience), then the

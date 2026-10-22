@@ -1,12 +1,13 @@
 //! Transactional macOS DNS configuration through `networksetup`.
 
+use crate::atomic_file;
 use nix::net::if_::if_nametoindex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -619,21 +620,11 @@ fn write_backup(backup: &Backup) -> Result<(), String> {
     let parent = path.parent().expect("backup path has a parent");
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
-    let temporary = parent.join(".dns-backup.toml.tmp");
     let text = toml::to_string(backup).map_err(|e| format!("serialize DNS backup: {e}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|e| format!("write DNS backup {}: {e}", temporary.display()))?;
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("write DNS backup {}: {e}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("secure DNS backup {}: {e}", temporary.display()))?;
-    std::fs::rename(&temporary, path).map_err(|e| format!("install DNS backup {BACKUP_PATH}: {e}"))
+    atomic_file::write(path, 0o600, atomic_file::Overwrite::Allow, |file, _| {
+        file.write_all(text.as_bytes())
+    })
+    .map_err(|e| format!("install DNS backup {BACKUP_PATH}: {e}"))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<Output, String> {

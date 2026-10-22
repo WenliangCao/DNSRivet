@@ -1,4 +1,5 @@
-use std::os::unix::fs::PermissionsExt;
+use crate::atomic_file;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -11,24 +12,26 @@ pub fn write_plist(binary: &Path, config: &Path) -> Result<(), String> {
         return Err("launchd binary and config paths must be absolute".into());
     }
     let plist = render_plist(binary, config);
-    let temporary = Path::new("/Library/LaunchDaemons/.io.github.wenliangcao.dnsrivet.plist.tmp");
-    std::fs::write(temporary, plist)
-        .map_err(|e| format!("write temporary launchd plist {}: {e}", temporary.display()))?;
-    let output = Command::new("/usr/bin/plutil")
-        .args(["-lint", "--", temporary.to_str().unwrap()])
-        .output()
-        .map_err(|e| format!("run plutil: {e}"))?;
-    if !output.status.success() {
-        let _ = std::fs::remove_file(temporary);
-        return Err(format!(
-            "invalid generated launchd plist: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o644))
-        .map_err(|e| format!("set launchd plist permissions {}: {e}", temporary.display()))?;
-    std::fs::rename(temporary, PLIST_PATH)
-        .map_err(|e| format!("install launchd plist {PLIST_PATH}: {e}"))
+    atomic_file::write(
+        Path::new(PLIST_PATH),
+        0o644,
+        atomic_file::Overwrite::Allow,
+        |file, temporary| {
+            file.write_all(plist.as_bytes())?;
+            let output = Command::new("/usr/bin/plutil")
+                .args(["-lint", "--"])
+                .arg(temporary)
+                .output()?;
+            if !output.status.success() {
+                return Err(std::io::Error::other(format!(
+                    "invalid generated launchd plist: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| format!("install launchd plist {PLIST_PATH}: {e}"))
 }
 
 pub fn remove_plist() -> Result<(), String> {
