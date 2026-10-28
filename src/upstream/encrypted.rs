@@ -26,8 +26,8 @@ use hickory_proto::quic::QuicClientStream;
 use hickory_proto::runtime::{TokioRuntimeProvider, TokioTime};
 use hickory_proto::rustls::tls_client_connect;
 use hickory_proto::xfer::{
-    DnsExchange, DnsExchangeConnect, DnsHandle, DnsMultiplexer, DnsRequest, DnsRequestOptions,
-    DnsRequestSender, FirstAnswer,
+    BufDnsStreamHandle, DnsClientStream, DnsExchange, DnsExchangeConnect, DnsHandle,
+    DnsMultiplexer, DnsRequest, DnsRequestOptions, DnsRequestSender, FirstAnswer,
 };
 use std::future::Future;
 use std::net::SocketAddr;
@@ -306,11 +306,7 @@ async fn connect(
     match up.proto {
         Proto::Dot => {
             let (conn, handle) = tls_client_connect(addr, up.host.clone(), tls.clone(), provider);
-            finish(
-                DnsExchange::connect(DnsMultiplexer::new(conn, handle, None)),
-                deadline,
-            )
-            .await
+            connect_dot(conn, handle, deadline).await
         }
         Proto::Doh => {
             let builder = HttpsClientStreamBuilder::with_client_config(tls.clone(), provider);
@@ -340,6 +336,31 @@ async fn connect(
         }
         Proto::Legacy => unreachable!("legacy upstreams don't use encrypted channels"),
     }
+}
+
+/// Only Channel's deadline may expire a DoT query. Hickory's default
+/// multiplexer imposes a hidden 5s limit, including for `timeout = 0`.
+async fn connect_dot<F, S>(
+    conn: F,
+    handle: BufDnsStreamHandle,
+    deadline: Option<Instant>,
+) -> Result<DnsExchange, String>
+where
+    F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
+    S: DnsClientStream<Time = TokioTime> + Send + Unpin + 'static,
+{
+    // Hickory requires a duration; Tokio saturates MAX to its far-future
+    // timer. Cancellation and positive deadlines remain owned by Channel.
+    finish(
+        DnsExchange::connect(DnsMultiplexer::with_timeout(
+            conn,
+            handle,
+            Duration::MAX,
+            None,
+        )),
+        deadline,
+    )
+    .await
 }
 
 async fn finish<F, S>(
@@ -375,6 +396,54 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test(start_paused = true)]
+    async fn dot_waits_past_five_seconds_but_obeys_the_channel_deadline() {
+        use hickory_proto::runtime::iocompat::AsyncIoTokioAsStd;
+        use hickory_proto::tcp::{TcpClientStream, TcpStream};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Exercise DoT's real framing and multiplexer over in-memory I/O. TLS
+        // only supplies this byte stream; no certificate fixtures are needed.
+        for timeout_ms in [0, 8000, 1000] {
+            let (manager, unused_background) = test_manager(TestTransport::default()).await;
+            let (client, mut server) = tokio::io::duplex(4096);
+            let (stream, handle) =
+                TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
+            let conn = std::future::ready(Ok(TcpClientStream::from_stream(stream)));
+            let exchange = connect_dot(conn, handle, None).await.unwrap();
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!()
+            };
+            channel.state.lock().await.store(exchange);
+            unused_background.await.unwrap().unwrap();
+            let (ready, received) = oneshot::channel();
+            let responder = tokio::spawn(async move {
+                let len = server.read_u16().await.unwrap();
+                let mut query = vec![0; usize::from(len)];
+                server.read_exact(&mut query).await.unwrap();
+                ready.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                query[2] |= 0x80;
+                let _ = server.write_u16(len).await;
+                let _ = server.write_all(&query).await;
+            });
+            let manager = Arc::new(manager);
+            let deadline = (timeout_ms > 0).then(|| {
+                (tokio::time::Instant::now() + Duration::from_millis(timeout_ms)).into_std()
+            });
+            let pending = start_query(&manager, deadline);
+            received.await.unwrap();
+            tokio::time::advance(Duration::from_secs(6)).await;
+            let result = pending.await.unwrap();
+            if timeout_ms == 1000 {
+                assert!(result.unwrap_err().contains("deadline"));
+            } else {
+                assert!(result.is_ok(), "timeout={timeout_ms}: {result:?}");
+            }
+            responder.await.unwrap();
+        }
+    }
 
     #[test]
     fn forwarding_future_keeps_connection_setup_out_of_line() {

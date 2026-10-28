@@ -41,6 +41,7 @@ nix = { version = "0.31.3", default-features = false, features = ["user", "net"]
 
 [dev-dependencies]
 futures-core = { version = "0.3", default-features = false }
+tokio = { version = "1", default-features = false, features = ["test-util"] }
 
 [profile.release]
 opt-level = "z"

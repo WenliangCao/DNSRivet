@@ -65,13 +65,13 @@ impl Manager {
         let mut entries = Vec::new();
         for up in all {
             // Static-address self-loop is a config error, not a runtime skip.
-            if let Some(ip) = up.bootstrap_ip {
-                if is_self_address(SocketAddr::new(ip, up.port), listeners) {
-                    return Err(format!(
-                        "upstream {}: endpoint {}:{} points at our own listener",
-                        up.name, ip, up.port
-                    ));
-                }
+            if let Some(ip) = up.bootstrap_ip
+                && is_self_address(SocketAddr::new(ip, up.port), listeners)
+            {
+                return Err(format!(
+                    "upstream {}: endpoint {}:{} points at our own listener",
+                    up.name, ip, up.port
+                ));
             }
             let name = up.name.clone();
             let timeout_ms = up.timeout_ms;
