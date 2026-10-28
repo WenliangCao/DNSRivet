@@ -7,8 +7,8 @@
 
 use crate::config::IpStack;
 use crate::upstream::legacy;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_net::proto::op::{Message, MessageType, OpCode, Query};
+use hickory_net::proto::rr::{Name, RData, RecordType};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -269,27 +269,24 @@ async fn query(
     name: &Name,
     rtype: RecordType,
 ) -> Result<(Vec<IpAddr>, u32), String> {
-    let mut msg = Message::new();
-    msg.set_id(next_id())
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(name.clone(), rtype));
+    let mut msg = Message::new(next_id(), MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(name.clone(), rtype));
     let bytes = msg.to_vec().map_err(|e| e.to_string())?;
 
     let response = exchange(server, &bytes).await?;
     let parsed = Message::from_vec(&response).map_err(|e| e.to_string())?;
     let mut ips = Vec::new();
     let mut ttl = u32::MAX;
-    for record in parsed.answers() {
-        match record.data() {
+    for record in &parsed.answers {
+        match &record.data {
             RData::A(a) => {
                 ips.push(IpAddr::V4(a.0));
-                ttl = ttl.min(record.ttl());
+                ttl = ttl.min(record.ttl);
             }
             RData::AAAA(aaaa) => {
                 ips.push(IpAddr::V6(aaaa.0));
-                ttl = ttl.min(record.ttl());
+                ttl = ttl.min(record.ttl);
             }
             _ => {} // CNAME chain links etc.
         }
@@ -341,8 +338,8 @@ fn next_id() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::rr::Record;
-    use hickory_proto::rr::rdata::{A, AAAA};
+    use hickory_net::proto::rr::Record;
+    use hickory_net::proto::rr::rdata::{A, AAAA};
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
@@ -352,13 +349,13 @@ mod tests {
 
     fn answer(request: &[u8]) -> Vec<u8> {
         let mut msg = Message::from_vec(request).unwrap();
-        let question = msg.queries()[0].clone();
+        let question = msg.queries[0].clone();
         let rdata = match question.query_type() {
             RecordType::A => RData::A(A(V4)),
             _ => RData::AAAA(AAAA(V6)),
         };
-        msg.set_message_type(MessageType::Response)
-            .add_answer(Record::from_rdata(question.name().clone(), 300, rdata));
+        msg.metadata.message_type = MessageType::Response;
+        msg.add_answer(Record::from_rdata(question.name().clone(), 300, rdata));
         msg.to_vec().unwrap()
     }
 
@@ -570,7 +567,7 @@ mod tests {
         // Every loopback on this port is denied, including IPv4-mapped IPv6.
         let ips = [self_ip, addr.ip(), "::ffff:127.0.0.1".parse().unwrap()];
         insert_cached(bootstrap, &ips, Instant::now() + Duration::from_secs(60)).await;
-        let mut query = Message::new();
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(
             Name::from_ascii("review.invalid.").unwrap(),
             RecordType::A,

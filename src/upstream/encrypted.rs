@@ -18,16 +18,16 @@
 
 use crate::config::{Proto, Upstream};
 use crate::upstream::bootstrap::Bootstrap;
-use hickory_proto::ProtoError;
-use hickory_proto::h2::HttpsClientStreamBuilder;
-use hickory_proto::h3::H3ClientStream;
-use hickory_proto::op::Message;
-use hickory_proto::quic::QuicClientStream;
-use hickory_proto::runtime::{TokioRuntimeProvider, TokioTime};
-use hickory_proto::rustls::tls_client_connect;
-use hickory_proto::xfer::{
-    BufDnsStreamHandle, DnsClientStream, DnsExchange, DnsExchangeConnect, DnsHandle,
-    DnsMultiplexer, DnsRequest, DnsRequestOptions, DnsRequestSender, FirstAnswer,
+use hickory_net::NetError;
+use hickory_net::h2::HttpsClientStream;
+use hickory_net::h3::H3ClientStream;
+use hickory_net::proto::op::{DnsRequest, DnsRequestOptions, Message};
+use hickory_net::quic::QuicClientStream;
+use hickory_net::runtime::{TokioRuntimeProvider, TokioTime};
+use hickory_net::tls::tls_client_connect;
+use hickory_net::xfer::{
+    BufDnsStreamHandle, DnsClientStream, DnsExchange, DnsHandle, DnsMultiplexer, DnsRequestSender,
+    FirstAnswer,
 };
 use std::future::Future;
 use std::net::SocketAddr;
@@ -106,7 +106,7 @@ impl<E: Clone> Slot<E> {
 }
 
 struct Lease {
-    exchange: DnsExchange,
+    exchange: DnsExchange<TokioRuntimeProvider>,
     generation: u64,
     reused: bool,
 }
@@ -122,7 +122,7 @@ pub struct Channel {
     bootstrap: Arc<Bootstrap>,
     /// Our own listener addresses — refuse to dial ourselves.
     deny: Arc<Vec<SocketAddr>>,
-    state: Mutex<Slot<DnsExchange>>,
+    state: Mutex<Slot<DnsExchange<TokioRuntimeProvider>>>,
 }
 
 impl Channel {
@@ -278,7 +278,7 @@ fn budget_allows_redial(deadline: Option<Instant>) -> bool {
 }
 
 async fn send(
-    exchange: &DnsExchange,
+    exchange: &DnsExchange<TokioRuntimeProvider>,
     message: Message,
     deadline: Option<Instant>,
 ) -> Result<Vec<u8>, SendFailure> {
@@ -301,35 +301,31 @@ async fn connect(
     tls: &Arc<rustls::ClientConfig>,
     addr: SocketAddr,
     deadline: Option<Instant>,
-) -> Result<DnsExchange, String> {
+) -> Result<DnsExchange<TokioRuntimeProvider>, String> {
     let provider = TokioRuntimeProvider::new();
     match up.proto {
         Proto::Dot => {
-            let (conn, handle) = tls_client_connect(addr, up.host.clone(), tls.clone(), provider);
+            let server_name = rustls::pki_types::ServerName::try_from(up.host.clone())
+                .map_err(|err| err.to_string())?;
+            let (conn, handle) = tls_client_connect(addr, server_name, tls.clone(), provider);
             connect_dot(conn, handle, deadline).await
         }
         Proto::Doh => {
-            let builder = HttpsClientStreamBuilder::with_client_config(tls.clone(), provider);
+            let builder = HttpsClientStream::builder(tls.clone(), provider);
             finish(
-                DnsExchange::connect(builder.build(addr, up.host.clone(), up.path.clone())),
+                builder.build(addr, up.host.as_str().into(), up.path.as_str().into()),
                 deadline,
             )
             .await
         }
         Proto::Doq => {
-            let mut builder = QuicClientStream::builder();
-            builder.crypto_config((**tls).clone());
-            finish(
-                DnsExchange::connect(builder.build(addr, up.host.clone())),
-                deadline,
-            )
-            .await
+            let builder = QuicClientStream::builder().crypto_config((**tls).clone());
+            finish(builder.build(addr, up.host.as_str().into()), deadline).await
         }
         Proto::Doh3 => {
-            let mut builder = H3ClientStream::builder();
-            builder.crypto_config((**tls).clone());
+            let builder = H3ClientStream::builder().crypto_config((**tls).clone());
             finish(
-                DnsExchange::connect(builder.build(addr, up.host.clone(), up.path.clone())),
+                builder.build(addr, up.host.as_str().into(), up.path.as_str().into()),
                 deadline,
             )
             .await
@@ -344,41 +340,41 @@ async fn connect_dot<F, S>(
     conn: F,
     handle: BufDnsStreamHandle,
     deadline: Option<Instant>,
-) -> Result<DnsExchange, String>
+) -> Result<DnsExchange<TokioRuntimeProvider>, String>
 where
-    F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
-    S: DnsClientStream<Time = TokioTime> + Send + Unpin + 'static,
+    F: Future<Output = Result<S, NetError>> + Send + 'static,
+    S: DnsClientStream<Time = TokioTime>,
 {
-    // Hickory requires a duration; Tokio saturates MAX to its far-future
-    // timer. Cancellation and positive deadlines remain owned by Channel.
     finish(
-        DnsExchange::connect(DnsMultiplexer::with_timeout(
-            conn,
-            handle,
-            Duration::MAX,
-            None,
-        )),
+        async move {
+            // Keep the deadline in Channel and use the manager's global budget,
+            // not Hickory's independent default limit of 32 active requests.
+            Ok(DnsMultiplexer::new(conn.await?, handle)
+                .with_timeout(Duration::MAX)
+                .with_max_active_requests(super::MAX_ATTEMPTS))
+        },
         deadline,
     )
     .await
 }
 
 async fn finish<F, S>(
-    connect: DnsExchangeConnect<F, S, TokioTime>,
+    connect: F,
     deadline: Option<Instant>,
-) -> Result<DnsExchange, String>
+) -> Result<DnsExchange<TokioRuntimeProvider>, String>
 where
-    F: Future<Output = Result<S, ProtoError>> + Send + Unpin + 'static,
-    S: DnsRequestSender + Send + Unpin + 'static,
+    F: Future<Output = Result<S, NetError>> + Send + 'static,
+    S: DnsRequestSender,
 {
     let limit = match deadline {
         Some(at) => CONNECT_TIMEOUT.min(at.saturating_duration_since(Instant::now())),
         None => CONNECT_TIMEOUT,
     };
-    let (exchange, background) = tokio::time::timeout(limit, connect)
+    let stream = tokio::time::timeout(limit, connect)
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| e.to_string())?;
+    let (exchange, background) = DnsExchange::from_stream(stream);
     tokio::spawn(background);
     Ok(exchange)
 }
@@ -389,18 +385,18 @@ mod tests {
     use crate::config::IpStack;
     use crate::upstream::{Backend, Manager};
     use futures_core::Stream;
-    use hickory_proto::op::{Edns, MessageType, Query};
-    use hickory_proto::rr::rdata::opt::EdnsOption;
-    use hickory_proto::rr::{Name, RecordType};
-    use hickory_proto::xfer::{DnsResponse, DnsResponseStream};
+    use hickory_net::proto::op::{DnsResponse, Edns, MessageType, OpCode, Query};
+    use hickory_net::proto::rr::rdata::opt::EdnsOption;
+    use hickory_net::proto::rr::{Name, RecordType};
+    use hickory_net::xfer::DnsResponseStream;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::sync::{mpsc, oneshot};
 
     #[tokio::test(start_paused = true)]
     async fn dot_waits_past_five_seconds_but_obeys_the_channel_deadline() {
-        use hickory_proto::runtime::iocompat::AsyncIoTokioAsStd;
-        use hickory_proto::tcp::{TcpClientStream, TcpStream};
+        use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
+        use hickory_net::tcp::{TcpClientStream, TcpStream};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Exercise DoT's real framing and multiplexer over in-memory I/O. TLS
@@ -416,7 +412,7 @@ mod tests {
                 unreachable!()
             };
             channel.state.lock().await.store(exchange);
-            unused_background.await.unwrap().unwrap();
+            unused_background.await.unwrap();
             let (ready, received) = oneshot::channel();
             let responder = tokio::spawn(async move {
                 let len = server.read_u16().await.unwrap();
@@ -487,7 +483,7 @@ mod tests {
     }
 
     impl Stream for TestTransport {
-        type Item = Result<(), ProtoError>;
+        type Item = Result<(), NetError>;
 
         fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             if self.closed {
@@ -508,17 +504,19 @@ mod tests {
                 failures.send(release).unwrap();
                 return Box::pin(async move {
                     let _ = pending.await;
-                    Err(ProtoError::from("stale connection"))
+                    Err(NetError::from("stale connection"))
                 })
                 .into();
             }
             let (mut message, _) = request.into_parts();
             if self.wrong_question {
-                message.queries_mut()[0].set_name(Name::from_ascii("wrong.invalid.").unwrap());
+                message.queries[0].set_name(Name::from_ascii("wrong.invalid.").unwrap());
             }
             // Model DoQ's zero ID so the manager must restore the client's ID.
-            message.set_message_type(MessageType::Response).set_id(0);
-            Box::pin(async move { DnsResponse::from_message(message) }).into()
+            message.metadata.message_type = MessageType::Response;
+            message.metadata.id = 0;
+            Box::pin(async move { DnsResponse::from_message(message).map_err(NetError::from) })
+                .into()
         }
 
         fn shutdown(&mut self) {
@@ -530,9 +528,7 @@ mod tests {
         }
     }
 
-    async fn test_manager(
-        transport: TestTransport,
-    ) -> (Manager, tokio::task::JoinHandle<Result<(), ProtoError>>) {
+    async fn test_manager(transport: TestTransport) -> (Manager, tokio::task::JoinHandle<()>) {
         let upstream = Upstream {
             name: "in-memory encrypted transport".into(),
             proto: Proto::Doh,
@@ -547,20 +543,18 @@ mod tests {
         let Backend::Encrypted(channel) = &manager.entries[0].backend else {
             panic!("the test upstream must use an encrypted channel");
         };
-        let (exchange, background) = DnsExchange::from_stream::<_, TokioTime>(transport);
+        let (exchange, background) = DnsExchange::from_stream(transport);
         channel.state.lock().await.store(exchange);
         (manager, tokio::spawn(background))
     }
 
     fn encrypted_test_query(padding: usize) -> Message {
-        let mut message = Message::new();
-        message
-            .set_id(0x1234)
-            .set_recursion_desired(true)
-            .add_query(Query::query(
-                Name::from_ascii("example.com.").unwrap(),
-                RecordType::A,
-            ));
+        let mut message = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        message.metadata.recursion_desired = true;
+        message.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
         if padding > 0 {
             let mut edns = Edns::new();
             edns.set_max_payload(1232);
@@ -622,7 +616,7 @@ mod tests {
             silent: true,
             ..TestTransport::default()
         };
-        let (exchange, background) = DnsExchange::from_stream::<_, TokioTime>(transport);
+        let (exchange, background) = DnsExchange::from_stream(transport);
         let background = tokio::spawn(background);
         channel.state.lock().await.store(exchange);
 
@@ -692,7 +686,7 @@ mod tests {
                         samples[3], samples[0], samples[6]
                     );
                 }).await.unwrap();
-                background.await.unwrap().unwrap();
+                background.await.unwrap();
             }
         }
     }
@@ -711,7 +705,7 @@ mod tests {
             let query = encrypted_test_query(0).to_vec().unwrap();
             assert!(manager.forward(&query, false).await.is_none());
             drop(manager);
-            background.await.unwrap().unwrap();
+            background.await.unwrap();
         }
     }
 
@@ -724,12 +718,12 @@ mod tests {
             let response = manager.forward(&wire_query, false).await.unwrap();
             crate::wire::validate_response(&wire_query, &response).unwrap();
             let response = Message::from_vec(&response).unwrap();
-            assert_eq!(response.id(), query.id());
-            assert_eq!(response.queries(), query.queries());
-            assert_eq!(response.extensions(), query.extensions());
+            assert_eq!(response.metadata.id, query.metadata.id);
+            assert_eq!(response.queries, query.queries);
+            assert_eq!(response.edns, query.edns);
         }
         drop(manager);
-        background.await.unwrap().unwrap();
+        background.await.unwrap();
     }
 
     #[tokio::test]
@@ -794,7 +788,7 @@ mod tests {
             for record_type in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
                 let manager = manager.clone();
                 let mut query = encrypted_test_query(0);
-                query.queries_mut()[0].set_query_type(record_type);
+                query.queries[0].set_query_type(record_type);
                 let wire_query = query.to_vec().unwrap();
                 queries.push(tokio::spawn(async move {
                     let response = manager.forward(&wire_query, false).await.unwrap();
@@ -810,8 +804,7 @@ mod tests {
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!();
             };
-            let (successor, background) =
-                DnsExchange::from_stream::<_, TokioTime>(TestTransport::default());
+            let (successor, background) = DnsExchange::from_stream(TestTransport::default());
             let background = tokio::spawn(background);
             // Model a concurrent query having already reconnected. No real
             // network or production connector hook is needed for this race.
@@ -835,8 +828,8 @@ mod tests {
             );
             drop(state);
             drop(manager);
-            old_background.await.unwrap().unwrap();
-            background.await.unwrap().unwrap();
+            old_background.await.unwrap();
+            background.await.unwrap();
         })
         .await
         .expect("concurrent queries must finish");
@@ -861,7 +854,7 @@ mod tests {
                 unreachable!();
             };
             let (retry_tx, mut retries) = mpsc::unbounded_channel();
-            let (successor, background) = DnsExchange::from_stream::<_, TokioTime>(TestTransport {
+            let (successor, background) = DnsExchange::from_stream(TestTransport {
                 failures: Some(retry_tx),
                 ..TestTransport::default()
             });
@@ -890,8 +883,8 @@ mod tests {
             assert_eq!(state.cooldown_until, cooldown);
             drop(state);
             drop(manager);
-            old_background.await.unwrap().unwrap();
-            background.await.unwrap().unwrap();
+            old_background.await.unwrap();
+            background.await.unwrap();
         })
         .await
         .expect("failed retries must finish");
@@ -912,8 +905,7 @@ mod tests {
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!();
             };
-            let (successor, background) =
-                DnsExchange::from_stream::<_, TokioTime>(TestTransport::default());
+            let (successor, background) = DnsExchange::from_stream(TestTransport::default());
             let background = tokio::spawn(background);
             let generation = channel.state.lock().await.store(successor);
             failure.send(()).unwrap();
@@ -926,8 +918,8 @@ mod tests {
             assert!(state.cooldown_until.is_none());
             drop(state);
             drop(manager);
-            old_background.await.unwrap().unwrap();
-            background.await.unwrap().unwrap();
+            old_background.await.unwrap();
+            background.await.unwrap();
         })
         .await
         .expect("queries without retry budget must finish");

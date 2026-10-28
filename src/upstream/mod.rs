@@ -4,7 +4,7 @@ pub mod legacy;
 
 use crate::config::{IpStack, Proto, Upstream};
 use bootstrap::Bootstrap;
-use hickory_proto::op::{Message, MessageType, OpCode};
+use hickory_net::proto::op::{Message, MessageType, OpCode};
 use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -440,26 +440,24 @@ fn is_self_address(addr: SocketAddr, listeners: &[SocketAddr]) -> bool {
     })
 }
 
-/// hickory-proto 0.25's transport API re-encodes requests. Bound that encoder
-/// to the only shape a recursive stub should send: one question, no resource
-/// records or signatures, and an optional EDNS record. Besides rejecting
-/// nonsensical client messages, this makes the record-amplification precondition
-/// from RUSTSEC-2026-0119 unreachable.
+/// Encrypted transports re-encode requests. Keep the supported stub-query
+/// shape bounded: one question, no resource records or signatures, and an
+/// optional EDNS record, even with the patched encoder.
 fn safe_encrypted_query(message: &Message) -> bool {
-    message.message_type() == MessageType::Query
-        && message.op_code() == OpCode::Query
-        && message.queries().len() == 1
-        && message.answers().is_empty()
-        && message.name_servers().is_empty()
-        && message.additionals().is_empty()
-        && message.signature().is_empty()
+    message.metadata.message_type == MessageType::Query
+        && message.metadata.op_code == OpCode::Query
+        && message.queries.len() == 1
+        && message.answers.is_empty()
+        && message.authorities.is_empty()
+        && message.additionals.is_empty()
+        && message.signature.is_none()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::Query;
-    use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A};
+    use hickory_net::proto::op::Query;
+    use hickory_net::proto::rr::{Name, RData, Record, RecordType, rdata::A};
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use tokio::net::UdpSocket;
@@ -512,11 +510,8 @@ mod tests {
     #[test]
     fn encrypted_encoder_accepts_only_single_question_queries() {
         let name = Name::from_str("example.com.").unwrap();
-        let mut query = Message::new();
-        query
-            .set_message_type(MessageType::Query)
-            .set_op_code(OpCode::Query)
-            .add_query(Query::query(name.clone(), RecordType::A));
+        let mut query = Message::new(0, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(name.clone(), RecordType::A));
         assert!(safe_encrypted_query(&query));
 
         query.add_answer(Record::from_rdata(

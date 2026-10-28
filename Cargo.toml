@@ -10,11 +10,9 @@ keywords = ["dns", "doh", "doh3", "dot", "doq"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-# DNS wire format + DoH/DoH3/DoT/DoQ client streams.
-# 0.25.2 is the last line with public transport streams (0.26 moved them into
-# hickory-resolver behind a private module); brings rustls 0.23, quinn 0.11,
-# h2 0.4, h3 0.0.7, tokio-rustls 0.26 — all on the ring provider via *-ring.
-hickory-proto = { version = "=0.25.2", default-features = false, features = [
+# Raw DoH/DoH3/DoT/DoQ transports and re-exported DNS wire types.
+# Enable only ring-backed transports, not local DNSSEC validation.
+hickory-net = { version = "0.26.3", default-features = false, features = [
     "tokio",
     "https-ring",
     "h3-ring",

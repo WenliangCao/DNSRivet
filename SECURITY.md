@@ -6,40 +6,43 @@ Please avoid publishing exploitable details before a fix is available. Include t
 version, configuration, reproduction steps, and whether the listener was loopback-only or exposed
 to a network.
 
-## Reviewed RustSec exceptions
+## Dependency security
 
-The project intentionally pins `hickory-proto 0.25.2`: version 0.26 moved its raw DoH, DoH3, DoT,
-and DoQ client transports out of the public `hickory-proto` API. Two 2026 advisories therefore need
-an explicit applicability review instead of an automatic upgrade.
+The project uses the public raw DoH, DoH3, DoT, and DoQ transports in `hickory-net 0.26.3`
+and its re-exported `hickory-proto 0.26.3` wire types. It does not use a higher-level resolver
+or enable local DNSSEC validation. `.cargo/audit.toml` has no advisory exceptions.
 
-### RUSTSEC-2026-0118 / GHSA-3v94-mw7p-v465
+The two former exceptions were removed by upgrading the affected dependencies:
 
-The NSEC3 closest-encloser loop is reachable only through `DnssecDnsHandle` when a
-`dnssec-ring`/`dnssec-aws-lc-rs` feature is enabled and local DNSSEC validation is configured.
-This project enables transport-only `*-ring` features, not either DNSSEC feature, and does not use
-`DnssecDnsHandle`. The affected code is not compiled into the active path.
+- [RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118.html): the NSEC3
+  implementation moved out of `hickory-proto` in 0.26. Its corresponding `hickory-net` issue,
+  [RUSTSEC-2026-0120](https://rustsec.org/advisories/RUSTSEC-2026-0120.html), was fixed in 0.26.1.
+- [RUSTSEC-2026-0119](https://rustsec.org/advisories/RUSTSEC-2026-0119.html): quadratic name
+  compression in the encoder was fixed in `hickory-proto 0.26.1`.
 
-### RUSTSEC-2026-0119 / GHSA-q2qq-hmj6-3wpp
+The 0.26.3 minimum also includes subsequent parsing and denial-of-service fixes from 0.26.2
+and their follow-up corrections. Keep the lockfile's TLS, HTTP, and QUIC dependencies up to date;
+upgrading Hickory alone is not a substitute for auditing the full dependency graph.
 
-The affected encoder becomes quadratic when an attacker supplies many records and compression
-candidates. `hickory-proto` is used to encode only encrypted-upstream requests. Before that call,
-`safe_encrypted_query` in `src/upstream/mod.rs` requires exactly one question and rejects every
-answer, authority, additional record, and signature; only the separately represented optional EDNS
-record remains. TCP and UDP inputs are also capped at 4 KiB, with at most 512 requests in flight.
+## Forwarding boundaries
 
-Upstream responses are returned through `DnsResponse::into_buffer()` as their original buffer and
-are never re-encoded by this project. Bootstrap requests are constructed internally with one
-question. These constraints remove the advisory's many-record amplification precondition.
+The patched encoder does not remove the need for input and resource limits. Before encrypted
+forwarding, `safe_encrypted_query` in `src/upstream/mod.rs` requires exactly one question and
+rejects answer, authority, additional records, and signatures; an optional EDNS record is allowed.
+TCP and UDP queries remain capped at 4 KiB. Client requests and upstream attempts each have a
+512-permit global budget, including encrypted attempts still running after a hedge wins.
 
-The matching entries in `.cargo/audit.toml` are scoped exceptions, not claims that the affected
-crate is generally safe. Do not weaken `safe_encrypted_query`, input-size limits, or concurrency
-limits while the project remains on 0.25.2. Revisit the pin when Hickory exposes a supported raw
-forwarding API or when the transports are replaced locally.
+Upstream responses are returned through `DnsResponse::into_buffer()` as their original bytes,
+not re-encoded. Client IDs are restored and responses are validated against the query. Channel
+deadlines, cancellation, and connection backoff remain under DNSRivet's control.
 
 Run the current checks with:
 
 ```bash
-cargo audit
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+mbx audit
+mbx test --all-targets --all-features
+mbx clippy --all-targets --all-features -- -D warnings
 ```
+
+A clean audit means no matching advisories in the database used for that run, not proof that the
+software is free of vulnerabilities.
