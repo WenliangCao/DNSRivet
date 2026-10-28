@@ -198,6 +198,7 @@ async fn udp_loop(
     // The extra byte detects datagrams clipped by recv_from. Oversized input
     // must not be forwarded as if it were a complete, valid 4 KiB query.
     let mut buf = vec![0u8; MAX_QUERY_SIZE + 1];
+    let mut cached_response = Vec::new();
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(received) => received,
@@ -213,13 +214,29 @@ async fn udp_loop(
             log::warn!("dropping query: {MAX_INFLIGHT} already in flight");
             continue;
         };
-        let query = buf[..n].to_vec();
+        let query = &buf[..n];
+        let meta = cache.query_meta(query);
+        if local_response(&cache, query, meta.as_ref(), &mut cached_response) {
+            wire::truncate_to(
+                &mut cached_response,
+                meta.as_ref().map_or(512, |meta| meta.udp_size),
+            );
+            // The socket is normally writable. Avoid registering an I/O waiter
+            // for a cached reply; recv_from above still enforces Tokio's budget.
+            if let Err(err) = sock.try_send_to(&cached_response, peer)
+                && err.kind() == std::io::ErrorKind::WouldBlock
+            {
+                let _ = sock.send_to(&cached_response, peer).await;
+            }
+            drop(permit);
+            continue;
+        }
+        let query = query.to_vec();
         let sock = sock.clone();
         let manager = manager.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            let meta = wire::parse_query_meta(&query);
-            let mut response = resolve(&manager, &cache, &query, false, meta.as_ref()).await;
+            let mut response = forward(&manager, &cache, &query, false, meta.as_ref()).await;
             wire::truncate_to(
                 &mut response,
                 meta.as_ref()
@@ -265,6 +282,8 @@ async fn tcp_conn(
     cache: Arc<Cache>,
     inflight: Arc<Semaphore>,
 ) -> std::io::Result<()> {
+    let mut query = Vec::new();
+    let mut response = Vec::new();
     loop {
         let mut lenbuf = [0u8; 2];
         match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut lenbuf)).await {
@@ -275,7 +294,7 @@ async fn tcp_conn(
         if !(12..=MAX_QUERY_SIZE).contains(&n) {
             return Ok(());
         }
-        let mut query = vec![0u8; n];
+        query.resize(n, 0);
         match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut query)).await {
             Err(_) | Ok(Err(_)) => return Ok(()),
             Ok(Ok(_)) => {}
@@ -284,8 +303,10 @@ async fn tcp_conn(
             .acquire()
             .await
             .expect("inflight semaphore is never closed");
-        let meta = wire::parse_query_meta(&query);
-        let response = resolve(&manager, &cache, &query, true, meta.as_ref()).await;
+        let meta = cache.query_meta(&query);
+        if !local_response(&cache, &query, meta.as_ref(), &mut response) {
+            response = forward(&manager, &cache, &query, true, meta.as_ref()).await;
+        }
         let len = u16::try_from(response.len()).unwrap_or(u16::MAX);
         let write = async {
             stream.write_all(&len.to_be_bytes()).await?;
@@ -298,26 +319,34 @@ async fn tcp_conn(
     }
 }
 
-async fn resolve(
+/// Try local answers before copying/spawning an upstream request.
+fn local_response(
+    cache: &Cache,
+    query: &[u8],
+    meta: Option<&wire::QueryMeta>,
+    response: &mut Vec<u8>,
+) -> bool {
+    // RFC 9619: malformed multi-question queries must never reach upstreams.
+    if wire::is_multi_question_query(query) {
+        *response = formerr(query);
+        return true;
+    }
+    if let Some(meta) = meta
+        && cache.get_into(meta, [query[0], query[1]], response)
+    {
+        log::debug!("cache hit");
+        return true;
+    }
+    false
+}
+
+async fn forward(
     manager: &Manager,
     cache: &Cache,
     query: &[u8],
     client_tcp: bool,
     meta: Option<&wire::QueryMeta>,
 ) -> Vec<u8> {
-    // RFC 9619: a QUERY with more than one question is malformed. Answer it
-    // locally with FORMERR; it must never reach the cache or any upstream.
-    if wire::is_multi_question_query(query) {
-        return formerr(query);
-    }
-
-    if let Some(meta) = meta
-        && let Some(response) = cache.get(meta, [query[0], query[1]])
-    {
-        log::debug!("cache hit");
-        return response;
-    }
-
     let response = match manager.forward(query, client_tcp).await {
         Some(response) => response,
         None => servfail(query),
@@ -383,6 +412,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_cache_fast_path_preserves_ids_truncation_and_inflight_budget() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let manager = Arc::new(
+            Manager::new(
+                vec![Upstream {
+                    name: "must remain unused".into(),
+                    proto: Proto::Legacy,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    path: String::new(),
+                    bootstrap_ip: Some(addr.ip()),
+                    timeout_ms: 50,
+                    ip_stack: IpStack::Both,
+                }],
+                &[],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let cache = Arc::new(Cache::new(true, 2));
+        let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        let meta = wire::parse_query_meta(&query).unwrap();
+        let mut answer = query.clone();
+        answer[2] = 0x81;
+        answer[3] = 0x80;
+        answer[7] = 40;
+        for _ in 0..40 {
+            answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        }
+        cache.insert(&meta, &answer);
+        let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listen_addr = listener.local_addr().unwrap();
+        let inflight = Arc::new(Semaphore::new(1));
+        let serving = tokio::spawn(udp_loop(listener, manager, cache, inflight.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(listen_addr).await.unwrap();
+        let mut response = [0; 1024];
+        for id in [3u16, 9, 42] {
+            query[..2].copy_from_slice(&id.to_be_bytes());
+            client.send(&query).await.unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&response[..2], &query[..2]);
+            assert!(n <= 512);
+            assert_ne!(response[2] & 2, 0);
+            wire::validate_response(&query, &response[..n]).unwrap();
+        }
+        assert!(upstream.try_recv_from(&mut [0; 512]).is_err());
+        let held = inflight.acquire().await.unwrap();
+        client.send(&query).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), client.recv(&mut response))
+                .await
+                .is_err()
+        );
+        drop(held);
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn multi_question_queries_never_reach_an_upstream() {
         let upstream_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream_sock.local_addr().unwrap();
@@ -410,7 +503,10 @@ mod tests {
         );
 
         for client_tcp in [false, true] {
-            let response = resolve(&manager, &cache, &query, client_tcp, meta.as_ref()).await;
+            let mut response = Vec::new();
+            if !local_response(&cache, &query, meta.as_ref(), &mut response) {
+                response = forward(&manager, &cache, &query, client_tcp, meta.as_ref()).await;
+            }
             assert_eq!(response.len(), 12);
             assert_eq!(&response[..2], &query[..2]);
             assert_ne!(response[2] & 0x80, 0);

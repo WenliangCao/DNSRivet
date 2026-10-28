@@ -2,11 +2,12 @@ use crate::wire::{self, QueryKey, QueryMeta};
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Entry {
     response: Box<[u8]>,
-    stored_at: Instant,
+    /// TTLs in response and ttl are relative to this whole-second boundary.
+    aged_at: Instant,
     ttl: u32,
 }
 
@@ -23,25 +24,47 @@ impl Cache {
         Self { entries }
     }
 
-    pub fn get(&self, meta: &QueryMeta, request_id: [u8; 2]) -> Option<Vec<u8>> {
-        let entries = self.entries.as_ref()?;
+    pub fn query_meta(&self, query: &[u8]) -> Option<QueryMeta> {
+        self.entries.as_ref()?;
+        wire::parse_query_meta(query)
+    }
+
+    /// Copy a hit into caller-owned storage; a miss leaves it unchanged.
+    pub fn get_into(&self, meta: &QueryMeta, request_id: [u8; 2], response: &mut Vec<u8>) -> bool {
+        let Some(entries) = &self.entries else {
+            return false;
+        };
         let mut entries = entries.lock().unwrap();
-        let entry = entries.get(&meta.key)?;
-        let elapsed = entry.stored_at.elapsed().as_secs();
+        let Some(entry) = entries.get_mut(&meta.key) else {
+            return false;
+        };
+        let elapsed = entry.aged_at.elapsed().as_secs();
         if elapsed >= u64::from(entry.ttl) {
             entries.pop(&meta.key);
-            return None;
+            return false;
         }
-        let mut response = entry.response.to_vec();
+        // Age the canonical entry once per whole second, not every client copy.
+        // Preserve the fractional second; resetting to now would extend TTLs.
+        if elapsed > 0 {
+            if !wire::adjust_ttls(&mut entry.response, elapsed) {
+                entries.pop(&meta.key);
+                return false;
+            }
+            entry.ttl -= elapsed as u32; // elapsed < ttl above
+            entry.aged_at += Duration::from_secs(elapsed);
+        }
+        response.clear();
+        response.extend_from_slice(&entry.response);
         drop(entries);
-
-        // Insertion validates every record. Until a whole second has elapsed,
-        // all TTLs are unchanged, so another full wire walk would do no work.
-        if elapsed > 0 && !wire::adjust_ttls(&mut response, elapsed) {
-            return None;
-        }
         response[..2].copy_from_slice(&request_id);
-        Some(response)
+        true
+    }
+
+    #[cfg(test)]
+    fn get(&self, meta: &QueryMeta, request_id: [u8; 2]) -> Option<Vec<u8>> {
+        let mut response = Vec::new();
+        self.get_into(meta, request_id, &mut response)
+            .then_some(response)
     }
 
     pub fn insert(&self, meta: &QueryMeta, response: &[u8]) {
@@ -57,7 +80,7 @@ impl Cache {
             meta.key.clone(),
             Entry {
                 response: stored,
-                stored_at: Instant::now(),
+                aged_at: Instant::now(),
                 ttl,
             },
         );
@@ -128,6 +151,23 @@ mod tests {
     }
 
     #[test]
+    fn repeated_hits_reuse_output_storage_and_misses_leave_it_unchanged() {
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        let cache = Cache::new(true, 2);
+        cache.insert(&meta, &response(1, 60));
+        let mut output = Vec::with_capacity(512);
+        let allocation = output.as_ptr();
+        for id in 0..100u16 {
+            assert!(cache.get_into(&meta, id.to_be_bytes(), &mut output));
+            assert_eq!(output.as_ptr(), allocation);
+            assert_eq!(&output[..2], &id.to_be_bytes());
+        }
+        let before = output.clone();
+        assert!(!Cache::new(false, 1).get_into(&meta, [0, 0], &mut output));
+        assert_eq!(output, before);
+    }
+
+    #[test]
     fn disabled_cache_is_a_noop() {
         let cache = Cache::new(false, 2);
         let query = query(1);
@@ -156,7 +196,7 @@ mod tests {
         let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
         let entry = entries.get_mut(&meta.key).unwrap();
         entry.ttl = 1;
-        entry.stored_at = Instant::now() - Duration::from_secs(2);
+        entry.aged_at = Instant::now() - Duration::from_secs(2);
         drop(entries);
         assert!(cache.get(&meta, [0, 1]).is_none());
         assert!(cache.entries.as_ref().unwrap().lock().unwrap().is_empty());
@@ -248,14 +288,14 @@ mod tests {
                     .unwrap()
                     .get_mut(&meta.key)
                     .unwrap()
-                    .stored_at = Instant::now() - Duration::from_secs(1);
+                    .aged_at = Instant::now() - Duration::from_secs(1);
             }
             assert!(cache.get(&meta, [0, 3]).is_none());
         }
     }
 
     #[test]
-    fn keeps_cached_id_and_ttls_unchanged_between_clients() {
+    fn ages_shared_ttls_once_without_sharing_client_mutations() {
         let meta = wire::parse_query_meta(&query(1)).unwrap();
         let mut original = response(1, 120);
         original[11] = 1;
@@ -264,26 +304,29 @@ mod tests {
         let cache = Cache::new(true, 2);
         cache.insert(&meta, &original);
 
-        for (id, age) in [([0x12, 0x34], 20), ([0xab, 0xcd], 40)] {
-            let stored_at = Instant::now() - Duration::from_secs(age);
-            {
-                let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
-                entries.get_mut(&meta.key).unwrap().stored_at = stored_at;
-            }
-            let elapsed_before = stored_at.elapsed().as_secs().min(120) as u32;
+        for (id, ttl) in [([0x12, 0x34], 100), ([0xab, 0xcd], 80)] {
+            let aged_at = Instant::now() - Duration::from_millis(20_500);
+            cache
+                .entries
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_mut(&meta.key)
+                .unwrap()
+                .aged_at = aged_at;
             let mut got = cache.get(&meta, id).unwrap();
-            let elapsed_after = stored_at.elapsed().as_secs().min(120) as u32;
             assert_eq!(&got[..2], &id);
-            let ttl = wire::cache_ttl(&got, 1).unwrap();
-            assert!((120 - elapsed_after..=120 - elapsed_before).contains(&ttl));
+            assert_eq!(wire::cache_ttl(&got, 1), Some(ttl));
             assert_eq!(&got[got.len() - opt.len()..], &opt);
-
-            // A client owns its response and can change it without changing the cache.
+            let again = cache.get(&meta, [0, 7]).unwrap();
+            assert_eq!(&again[2..], &got[2..], "must not age twice in one second");
             got.fill(0);
             let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
             let entry = entries.get(&meta.key).unwrap();
             assert_eq!(&entry.response[..2], &[0, 0]);
-            assert_eq!(&entry.response[2..], &original[2..]);
+            assert_eq!(&entry.response[2..], &again[2..]);
+            assert_eq!(entry.aged_at, aged_at + Duration::from_secs(20));
         }
     }
 
@@ -301,11 +344,11 @@ mod tests {
         );
         let meta = wire::parse_query_meta(&query(1)).unwrap();
         for records in [1, 32] {
-            let cache = Cache::new(true, 1);
-            cache.insert(&meta, &response_with_records(1, 120, records));
             for age in [0, 20] {
                 let mut samples = [0.0; SAMPLES];
                 for sample in &mut samples {
+                    let cache = Cache::new(true, 1);
+                    cache.insert(&meta, &response_with_records(1, 120, records));
                     cache
                         .entries
                         .as_ref()
@@ -314,7 +357,7 @@ mod tests {
                         .unwrap()
                         .get_mut(&meta.key)
                         .unwrap()
-                        .stored_at = Instant::now() - Duration::from_secs(age);
+                        .aged_at = Instant::now() - Duration::from_secs(age);
                     let start = Instant::now();
                     for _ in 0..ITERATIONS {
                         black_box(
