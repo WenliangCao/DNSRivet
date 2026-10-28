@@ -192,12 +192,16 @@ impl Manager {
                     }
                     continue;
                 };
-                let index = next;
-                next += 1;
                 let Ok(permit) = self.attempts.clone().try_acquire_owned() else {
-                    // Never queue unbudgeted work behind detached attempts.
+                    if attempts.is_empty() {
+                        break;
+                    }
+                    // Disable this hedge, not this upstream: retry it in order
+                    // when a pending attempt completes and returns its permit.
                     continue;
                 };
+                let index = next;
+                next += 1;
                 log::debug!(
                     "trying upstream {} (timeout {}ms)",
                     entry.name,
@@ -789,6 +793,34 @@ mod tests {
         healthy.await.unwrap();
         tokio::task::yield_now().await;
         assert_eq!(manager.attempts.available_permits(), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn budget_blocked_hedge_still_tries_the_backup_after_primary_timeout() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (healthy_addr, healthy) = udp_responder(false).await;
+        let manager = Manager::new(
+            vec![
+                test_upstream("blackhole", blackhole.local_addr().unwrap(), 400),
+                test_upstream("healthy", healthy_addr, 1000),
+            ],
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        let _reserved = manager
+            .attempts
+            .acquire_many((MAX_ATTEMPTS - 1) as u32)
+            .await
+            .unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), manager.forward(&TEST_QUERY, false))
+                .await
+                .unwrap()
+                .expect("the backup must not be skipped when the hedge has no budget");
+        assert_eq!(response[3] & 0x0f, 0);
+        healthy.await.unwrap();
+        assert_eq!(manager.attempts.available_permits(), 1);
     }
 
     #[tokio::test]
