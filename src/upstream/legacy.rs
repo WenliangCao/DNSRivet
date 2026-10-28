@@ -68,10 +68,13 @@ pub async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
         .read_exact(&mut response)
         .await
         .map_err(|e| e.to_string())?;
-    // TCP has no stray-datagram problem, but the ID must still round-trip.
+    // TCP has no stray-datagram problem, but the ID must still round-trip
+    // and, as over UDP, the response must answer our question (RFC 5452).
     if response.len() < 12 || response[..2] != query[..2] {
         return Err("tcp response ID mismatch".into());
     }
+    crate::wire::validate_response(query, &response)
+        .map_err(|e| format!("tcp response rejected: {e}"))?;
     Ok(response)
 }
 
@@ -165,7 +168,7 @@ mod tests {
         responder.await.unwrap();
     }
 
-    async fn tcp_responder(respond_with_id: u16) -> std::net::SocketAddr {
+    async fn tcp_responder(respond_with_id: u16, wrong_question: bool) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -176,6 +179,9 @@ mod tests {
             stream.read_exact(&mut received).await.unwrap();
             received[..2].copy_from_slice(&respond_with_id.to_be_bytes());
             received[2] |= 0x80;
+            if wrong_question {
+                received[13] = b'z';
+            }
             let len = u16::try_from(received.len()).unwrap();
             stream.write_all(&len.to_be_bytes()).await.unwrap();
             stream.write_all(&received).await.unwrap();
@@ -185,15 +191,22 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_accepts_matching_id() {
-        let addr = tcp_responder(0x1234).await;
+        let addr = tcp_responder(0x1234, false).await;
         let response = query_tcp(addr, &query_bytes(0x1234)).await.unwrap();
         assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
     }
 
     #[tokio::test]
     async fn tcp_rejects_id_mismatch() {
-        let addr = tcp_responder(0xbeef).await;
+        let addr = tcp_responder(0xbeef, false).await;
         let err = query_tcp(addr, &query_bytes(0x1234)).await.unwrap_err();
         assert!(err.contains("ID mismatch"));
+    }
+
+    #[tokio::test]
+    async fn tcp_rejects_answer_to_a_different_question() {
+        let addr = tcp_responder(0x1234, true).await;
+        let err = query_tcp(addr, &query_bytes(0x1234)).await.unwrap_err();
+        assert!(err.contains("rejected"), "{err}");
     }
 }

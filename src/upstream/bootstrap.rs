@@ -159,13 +159,17 @@ impl Bootstrap {
         }
     }
 
-    pub async fn resolve(&self, host: &str, stack: IpStack) -> Result<Vec<IpAddr>, String> {
+    pub async fn resolve(
+        self: &Arc<Self>,
+        host: &str,
+        stack: IpStack,
+    ) -> Result<Vec<IpAddr>, String> {
         let key = (host.to_ascii_lowercase(), stack);
         let (refresh, stale) = match self.plan(&key).await {
             Plan::Answer(result) => return result,
             Plan::Refresh { refresh, stale } => (refresh, stale),
         };
-        let _refreshing = match refresh.try_lock() {
+        let refreshing = match refresh.clone().try_lock_owned() {
             Ok(guard) => guard,
             // Another caller is refreshing: use stale addresses rather than
             // wait out its timeouts, or wait and share its outcome.
@@ -173,16 +177,26 @@ impl Bootstrap {
                 if let Some(ips) = stale {
                     return Ok(ips);
                 }
-                let guard = refresh.lock().await;
+                let guard = refresh.lock_owned().await;
                 if let Plan::Answer(result) = self.plan(&key).await {
                     return result;
                 }
                 guard
             }
         };
-        let result = self.lookup(host, stack).await;
-        let mut slots = self.slots.lock().await;
-        slots.entry(key).or_default().record(result, Instant::now())
+        // A full failed lookup outlasts typical upstream timeouts. Run it as
+        // its own task so a cancelled caller still records the outcome, which
+        // is what lets later callers use stale addresses and the retry pause.
+        let this = self.clone();
+        let host = host.to_owned();
+        tokio::spawn(async move {
+            let _refreshing = refreshing;
+            let result = this.lookup(&host, stack).await;
+            let mut slots = this.slots.lock().await;
+            slots.entry(key).or_default().record(result, Instant::now())
+        })
+        .await
+        .unwrap_or_else(|err| Err(format!("bootstrap refresh aborted: {err}")))
     }
 
     /// Force re-resolution after connect failures (host may have moved).
@@ -425,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn lost_udp_falls_back_to_tcp_with_a_and_aaaa_in_parallel() {
-        let boot = Bootstrap::with_servers(vec![udp_blackhole_server().await]);
+        let boot = Arc::new(Bootstrap::with_servers(vec![udp_blackhole_server().await]));
         let started = Instant::now();
         let ips = boot.resolve("dns.example", IpStack::Both).await.unwrap();
         assert_eq!(ips, [IpAddr::V4(V4), IpAddr::V6(V6)]);
@@ -439,7 +453,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidated_entry_survives_as_fallback_when_refresh_fails() {
-        let boot = Bootstrap::with_servers(vec![dead_server().await]);
+        let boot = Arc::new(Bootstrap::with_servers(vec![dead_server().await]));
         let cached = [IpAddr::V4(V4)];
         insert_cached(&boot, &cached, Instant::now() + Duration::from_secs(300)).await;
 
@@ -456,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_callers_share_one_failed_lookup_and_then_pause() {
         let (server, queries) = counting_blackhole_server().await;
-        let boot = Bootstrap::with_servers(vec![server]);
+        let boot = Arc::new(Bootstrap::with_servers(vec![server]));
 
         let (first, second) = tokio::join!(
             boot.resolve("dns.example", IpStack::V4),
@@ -479,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn stale_callers_do_not_wait_for_an_inflight_refresh() {
         let (server, queries) = counting_blackhole_server().await;
-        let boot = Bootstrap::with_servers(vec![server]);
+        let boot = Arc::new(Bootstrap::with_servers(vec![server]));
         let cached = [IpAddr::V4(V4)];
         insert_cached(&boot, &cached, Instant::now()).await;
 
@@ -497,8 +511,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_caller_still_records_the_failed_refresh() {
+        let (server, queries) = counting_blackhole_server().await;
+        let boot = Arc::new(Bootstrap::with_servers(vec![server]));
+        let cached = [IpAddr::V4(V4)];
+        insert_cached(&boot, &cached, Instant::now()).await;
+
+        // Upstream timeouts can be far shorter than a failed lookup.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(100),
+            boot.resolve("dns.example", IpStack::V4),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        tokio::time::sleep(UDP_TIMEOUT + Duration::from_millis(300)).await;
+
+        let started = Instant::now();
+        let ips = boot.resolve("dns.example", IpStack::V4).await.unwrap();
+        assert_eq!(ips, cached);
+        assert!(
+            started.elapsed() < UDP_TIMEOUT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn refresh_failure_without_cache_is_an_error() {
-        let boot = Bootstrap::with_servers(vec![dead_server().await]);
+        let boot = Arc::new(Bootstrap::with_servers(vec![dead_server().await]));
         let err = boot.resolve("dns.example", IpStack::V4).await.unwrap_err();
         assert!(err.contains("bootstrap failed for dns.example"), "{err}");
     }

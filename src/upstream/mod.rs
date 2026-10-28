@@ -135,9 +135,11 @@ impl Manager {
                     entry.name,
                     entry.timeout_ms
                 );
-                // With `timeout = 0` an upstream is waited on forever by
-                // contract, so it is never raced either.
-                if entry.timeout_ms > 0 && next < self.entries.len() {
+                // A `timeout = 0` upstream is waited on forever by contract:
+                // it is never raced, and never started as a race either,
+                // since a detached attempt without a deadline would leak.
+                let racer = self.entries.get(next);
+                if entry.timeout_ms > 0 && racer.is_some_and(|racer| racer.timeout_ms > 0) {
                     hedge_at = Some(Instant::now() + HEDGE_DELAY);
                 }
                 let (entry, query) = (entry.clone(), shared.clone());
@@ -565,6 +567,37 @@ mod tests {
 
         let mut buf = [0u8; 512];
         assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_upstream_is_never_started_as_a_race() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let slow_answer = tokio::spawn(async move {
+            let mut message = [0u8; 512];
+            let (n, peer) = primary.recv_from(&mut message).await.unwrap();
+            tokio::time::sleep(HEDGE_DELAY + Duration::from_millis(100)).await;
+            message[2] |= 0x80;
+            primary.send_to(&message[..n], peer).await.unwrap();
+        });
+        let unbounded = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(
+            vec![
+                test_upstream("slow primary", primary_addr, 5000),
+                test_upstream("unbounded", unbounded.local_addr().unwrap(), 0),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        manager.forward(&TEST_QUERY, false).await.unwrap();
+        slow_answer.await.unwrap();
+        let mut buf = [0u8; 512];
+        assert!(
+            unbounded.try_recv_from(&mut buf).is_err(),
+            "a deadline-free attempt must not be raced and then detached"
+        );
     }
 
     #[tokio::test]
