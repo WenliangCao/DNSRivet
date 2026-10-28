@@ -1,5 +1,6 @@
 //! Transactional macOS DNS configuration through `networksetup`.
 
+use super::lock::FsLock;
 use crate::atomic_file;
 use nix::net::if_::if_nametoindex;
 use serde::{Deserialize, Serialize};
@@ -19,28 +20,10 @@ pub const BACKUP_PATH: &str = "/Library/Application Support/DNSRivet/dns-backup.
 pub const MARKER_PATH: &str = "/Library/Application Support/DNSRivet/takeover-active";
 const LOCK_PATH: &str = "/Library/Application Support/DNSRivet/.lock";
 
-/// Cross-process critical section (flock) shared by the CLI lifecycle
-/// commands and the daemon watchdog. Dropping it releases the lock.
-struct FsLock {
-    _file: std::fs::File,
-}
-
+/// DNS-only critical section shared with the daemon watchdog. Never hold
+/// this while waiting for the daemon's reassertion during CLI restart.
 fn lock() -> Result<FsLock, String> {
-    let parent = Path::new(LOCK_PATH)
-        .parent()
-        .expect("lock path has a parent");
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(LOCK_PATH)
-        .map_err(|e| format!("open lock file {LOCK_PATH}: {e}"))?;
-    file.lock().map_err(|e| format!("lock {LOCK_PATH}: {e}"))?;
-    Ok(FsLock { _file: file })
+    FsLock::acquire(Path::new(LOCK_PATH))
 }
 
 pub fn marker_exists() -> bool {
@@ -95,6 +78,10 @@ struct Backup {
     services: Vec<ServiceDns>,
     #[serde(default)]
     fallback_servers: Vec<String>,
+    /// All addresses used since takeover. None means legacy history is unknown;
+    /// watchdog ticks must not promote a partial observation to complete history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    takeover_servers: Option<Vec<IpAddr>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -158,6 +145,7 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
     let backup = Backup {
         version: 2,
         services,
+        takeover_servers: Some(vec![server]),
         fallback_servers: filter_fallback_servers(fallback_servers, &[server])
             .into_iter()
             .map(serialize_dns_socket)
@@ -223,7 +211,8 @@ fn system_points_at_loopback() -> Result<bool, String> {
     if !current_loopback_dns()?.is_empty() {
         return Ok(true);
     }
-    for name in list_services()? {
+    // Disabled services can later be re-enabled; do not strand them either.
+    for name in list_all_services()? {
         let loopback = get_dns_servers(&name)?
             .iter()
             .any(|value| value.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()));
@@ -241,35 +230,88 @@ fn restore() -> Result<bool, String> {
     if !backup_exists() {
         return Ok(false);
     }
-    let backup = read_backup()?;
+    restore_at(
+        Path::new(BACKUP_PATH),
+        list_all_services,
+        get_dns_servers,
+        set_dns_servers,
+    )?;
+    flush_caches();
+    Ok(true)
+}
+
+/// Restore known names, then verify all services before discarding recovery data.
+/// The injected networksetup operations keep tests away from production OS state.
+fn restore_at(
+    backup_path: &Path,
+    mut list: impl FnMut() -> Result<Vec<String>, String>,
+    mut get: impl FnMut(&str) -> Result<Vec<String>, String>,
+    mut set: impl FnMut(&str, &[String]) -> Result<(), String>,
+) -> Result<(), String> {
+    let backup = read_backup_at(backup_path)?;
     if !matches!(backup.version, 1 | 2) {
         return Err(format!("unsupported DNS backup version {}", backup.version));
     }
 
-    let current_services = list_all_services()?;
+    let current_services = list()?;
     let mut errors = Vec::new();
     for service in &backup.services {
         if !current_services.contains(&service.name) {
             eprintln!(
-                "warning: network service {:?} no longer exists; skipping its DNS restore",
+                "warning: network service {:?} was removed or renamed; its original DNS settings remain in the backup until restoration is verified",
                 service.name
             );
             continue;
         }
-        if let Err(err) = set_dns_servers(&service.name, &service.servers) {
+        if let Err(err) = set(&service.name, &service.servers) {
             errors.push(err);
         }
     }
+
+    // Re-list after writes: a renamed or newly added service must not escape
+    // verification just because its old name was absent from the backup.
+    match list() {
+        Ok(names) => {
+            for name in names {
+                match get(&name) {
+                    Ok(servers) if dns_may_depend_on_takeover(&backup, &name, &servers) => {
+                        errors.push(format!(
+                            "network service {name:?} still lists DNS that may use DNSRivet: {}",
+                            servers.join(", ")
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(err) => errors.push(err),
+                }
+            }
+        }
+        Err(err) => errors.push(err),
+    }
     if !errors.is_empty() {
         return Err(format!(
-            "could not restore every network service: {} (backup retained at {BACKUP_PATH})",
-            errors.join("; ")
+            "refusing to stop DNSRivet: {} (backup retained at {}); restore the affected services' known correct DNS settings manually, or rename services back to their backed-up names, then retry `dnsrivet stop`. Original DNS for renamed services will not be guessed",
+            errors.join("; "),
+            backup_path.display()
         ));
     }
-    std::fs::remove_file(BACKUP_PATH)
-        .map_err(|e| format!("remove restored DNS backup {BACKUP_PATH}: {e}"))?;
-    flush_caches();
-    Ok(true)
+    std::fs::remove_file(backup_path)
+        .map_err(|e| format!("remove restored DNS backup {}: {e}", backup_path.display()))
+}
+
+fn dns_may_depend_on_takeover(backup: &Backup, name: &str, servers: &[String]) -> bool {
+    if let Some(takeovers) = &backup.takeover_servers {
+        return servers.iter().any(|value| {
+            parse_dns_socket(value).is_ok_and(|address| takeovers.contains(&address.ip()))
+        });
+    }
+    // Legacy backups do not identify the resolver. Only an exact original
+    // list on the same service proves that loopback DNS belonged to another tool.
+    let original = backup.services.iter().find(|service| service.name == name);
+    let restored_original = original.is_some_and(|service| service.servers == servers);
+    !restored_original
+        && servers
+            .iter()
+            .any(|value| parse_dns_socket(value).is_ok_and(|address| address.ip().is_loopback()))
 }
 
 /// Direct DNS servers that were effective before system takeover. The proxy
@@ -342,11 +384,7 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
         .filter(|name| !known_services.contains(name.as_str()))
         .map(|name| get_dns_servers(&name).map(|servers| (name, servers)))
         .collect::<Result<_, _>>()?;
-    if add_new_service_snapshots(&mut backup, new_services, &expected)? {
-        // Persist every original DNS list before changing any newly discovered
-        // service. A partial reassertion must remain recoverable by `stop`.
-        write_backup(&backup)?;
-    }
+    prepare_watchdog_backup(&mut backup, new_services, server, write_backup)?;
     let current = service_dns_snapshot()?;
     let drifted: Vec<String> = services_needing_reassert(&current, &expected)
         .into_iter()
@@ -405,6 +443,26 @@ fn service_dns_snapshot() -> Result<Vec<(String, Vec<String>)>, String> {
     Ok(snapshot)
 }
 
+/// Persist restore data and address history before the watchdog changes DNS.
+fn prepare_watchdog_backup(
+    backup: &mut Backup,
+    snapshots: Vec<(String, Vec<String>)>,
+    server: IpAddr,
+    persist: impl FnOnce(&Backup) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut changed = add_new_service_snapshots(backup, snapshots, &server.to_string())?;
+    if let Some(takeovers) = &mut backup.takeover_servers
+        && !takeovers.contains(&server)
+    {
+        takeovers.push(server);
+        changed = true;
+    }
+    if changed {
+        persist(backup)?;
+    }
+    Ok(())
+}
+
 fn add_new_service_snapshots(
     backup: &mut Backup,
     snapshots: Vec<(String, Vec<String>)>,
@@ -415,9 +473,11 @@ fn add_new_service_snapshots(
         if backup.services.iter().any(|service| service.name == name) {
             continue;
         }
-        if servers.iter().any(|server| server == expected) {
+        if servers.iter().any(|server| server == expected)
+            || dns_may_depend_on_takeover(backup, &name, &servers)
+        {
             return Err(format!(
-                "network service {name:?} already lists {expected} as a DNS server; \
+                "network service {name:?} already lists a DNSRivet takeover address as a DNS server; \
                  refusing to capture an unknown restore state"
             ));
         }
@@ -469,9 +529,13 @@ pub fn current_loopback_dns() -> Result<Vec<SocketAddr>, String> {
 }
 
 fn read_backup() -> Result<Backup, String> {
-    let text = std::fs::read_to_string(BACKUP_PATH)
-        .map_err(|e| format!("read DNS backup {BACKUP_PATH}: {e}"))?;
-    toml::from_str(&text).map_err(|e| format!("parse DNS backup {BACKUP_PATH}: {e}"))
+    read_backup_at(Path::new(BACKUP_PATH))
+}
+
+fn read_backup_at(path: &Path) -> Result<Backup, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read DNS backup {}: {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("parse DNS backup {}: {e}", path.display()))
 }
 
 fn effective_dns_servers() -> Result<Vec<SocketAddr>, String> {
@@ -616,13 +680,16 @@ fn rollback(backup: &Backup, changed: &[String]) -> bool {
 }
 
 fn write_backup(backup: &Backup) -> Result<(), String> {
-    let path = Path::new(BACKUP_PATH);
+    write_backup_at(Path::new(BACKUP_PATH), backup)
+}
+
+fn write_backup_at(path: &Path, backup: &Backup) -> Result<(), String> {
     let parent = path.parent().expect("backup path has a parent");
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("create support directory {}: {e}", parent.display()))?;
     let text = toml::to_string(backup).map_err(|e| format!("serialize DNS backup: {e}"))?;
     atomic_file::write(path, 0o600, |file, _| file.write_all(text.as_bytes()))
-        .map_err(|e| format!("install DNS backup {BACKUP_PATH}: {e}"))
+        .map_err(|e| format!("install DNS backup {}: {e}", path.display()))
 }
 
 fn run(program: &str, args: &[&str]) -> Result<Output, String> {
@@ -729,6 +796,7 @@ mod tests {
                 servers: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
             }],
             fallback_servers: vec!["192.0.2.53".into()],
+            takeover_servers: Some(vec!["127.0.0.1".parse().unwrap()]),
         };
         let text = toml::to_string(&backup).unwrap();
         let decoded: Backup = toml::from_str(&text).unwrap();
@@ -736,6 +804,10 @@ mod tests {
         assert_eq!(decoded.services[0].name, "USB & Wi-Fi");
         assert_eq!(decoded.services[0].servers.len(), 2);
         assert_eq!(decoded.fallback_servers, ["192.0.2.53"]);
+        assert_eq!(
+            decoded.takeover_servers,
+            Some(vec!["127.0.0.1".parse().unwrap()])
+        );
     }
 
     #[test]
@@ -851,6 +923,7 @@ resolver #1
                 servers: vec!["192.0.2.53".into()],
             }],
             fallback_servers: Vec::new(),
+            takeover_servers: None,
         };
         assert!(
             add_new_service_snapshots(
@@ -883,6 +956,7 @@ resolver #1
             version: 2,
             services: Vec::new(),
             fallback_servers: Vec::new(),
+            takeover_servers: None,
         };
         let error = add_new_service_snapshots(
             &mut backup,
@@ -892,6 +966,381 @@ resolver #1
         .unwrap_err();
         assert!(error.contains("iPhone USB"));
         assert!(backup.services.is_empty());
+    }
+
+    struct RestoreFixture {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+        dns: std::cell::RefCell<std::collections::BTreeMap<String, Vec<String>>>,
+    }
+
+    impl RestoreFixture {
+        fn new(backup: &Backup, current: &[(&str, &[&str])]) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dnsrivet-restore-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let path = root.join("dns-backup.toml");
+            std::fs::write(&path, toml::to_string(backup).unwrap()).unwrap();
+            let dns = std::cell::RefCell::new(
+                current
+                    .iter()
+                    .map(|(name, servers)| {
+                        (
+                            (*name).to_string(),
+                            servers.iter().map(|server| (*server).to_string()).collect(),
+                        )
+                    })
+                    .collect(),
+            );
+            Self { root, path, dns }
+        }
+
+        fn restore(&self, fail_read: Option<&str>, fail_write: Option<&str>) -> Result<(), String> {
+            restore_at(
+                &self.path,
+                || Ok(self.dns.borrow().keys().cloned().collect()),
+                |name| {
+                    if Some(name) == fail_read {
+                        Err(format!("read failed for {name}"))
+                    } else {
+                        Ok(self.dns.borrow()[name].clone())
+                    }
+                },
+                |name, servers| {
+                    if Some(name) == fail_write {
+                        Err(format!("write failed for {name}"))
+                    } else {
+                        self.dns.borrow_mut().insert(name.into(), servers.to_vec());
+                        Ok(())
+                    }
+                },
+            )
+        }
+    }
+
+    impl Drop for RestoreFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn restore_backup() -> Backup {
+        Backup {
+            version: 2,
+            services: vec![
+                ServiceDns {
+                    name: "Wi-Fi".into(),
+                    servers: vec!["192.0.2.53".into()],
+                },
+                ServiceDns {
+                    name: "USB LAN".into(),
+                    servers: Vec::new(),
+                },
+            ],
+            fallback_servers: Vec::new(),
+            takeover_servers: Some(vec!["127.0.0.1".parse().unwrap()]),
+        }
+    }
+
+    #[test]
+    fn renamed_service_blocks_restore_and_retains_original_backup() {
+        let fixture = RestoreFixture::new(
+            &restore_backup(),
+            &[
+                ("Renamed Wi-Fi", &["127.0.0.1"]),
+                ("USB LAN", &["127.0.0.1"]),
+            ],
+        );
+        let original = std::fs::read(&fixture.path).unwrap();
+        let error = fixture.restore(None, None).unwrap_err();
+        assert!(error.contains("Renamed Wi-Fi"));
+        assert!(error.contains("rename services back"));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(fixture.dns.borrow()["Renamed Wi-Fi"], ["127.0.0.1"]);
+        assert!(fixture.dns.borrow()["USB LAN"].is_empty());
+
+        // Restoring the old name is actionable recovery, not a guessed DNS list.
+        let servers = fixture.dns.borrow_mut().remove("Renamed Wi-Fi").unwrap();
+        fixture.dns.borrow_mut().insert("Wi-Fi".into(), servers);
+        fixture.restore(None, None).unwrap();
+        assert!(!fixture.path.exists());
+        assert_eq!(fixture.dns.borrow()["Wi-Fi"], ["192.0.2.53"]);
+    }
+
+    #[test]
+    fn changed_takeover_address_is_persisted_and_blocks_renamed_service_restore() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[("Wi-Fi", &["127.0.0.1"])]);
+        let mut backup = read_backup_at(&fixture.path).unwrap();
+        let next_server = "127.0.0.4".parse().unwrap();
+        prepare_watchdog_backup(&mut backup, Vec::new(), next_server, |updated| {
+            // DNS is still at A while the backup is made durable for B.
+            assert_eq!(fixture.dns.borrow()["Wi-Fi"], ["127.0.0.1"]);
+            write_backup_at(&fixture.path, updated)
+        })
+        .unwrap();
+        let persisted = read_backup_at(&fixture.path).unwrap();
+        assert_eq!(
+            persisted.takeover_servers,
+            Some(vec!["127.0.0.1".parse().unwrap(), next_server])
+        );
+        prepare_watchdog_backup(&mut backup, Vec::new(), next_server, |_| {
+            panic!("an unchanged address must not rewrite the backup")
+        })
+        .unwrap();
+
+        // Simulate reassertion at B, followed by a rename before the next tick.
+        fixture.dns.borrow_mut().remove("Wi-Fi");
+        fixture
+            .dns
+            .borrow_mut()
+            .insert("Renamed Wi-Fi".into(), vec![next_server.to_string()]);
+        let original = std::fs::read(&fixture.path).unwrap();
+        let error = fixture.restore(None, None).unwrap_err();
+        assert!(error.contains("Renamed Wi-Fi"));
+        assert!(error.contains("127.0.0.4"));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(fixture.dns.borrow()["Renamed Wi-Fi"], ["127.0.0.4"]);
+
+        // A must also remain guarded: disabled/failed services can retain it.
+        fixture
+            .dns
+            .borrow_mut()
+            .insert("Renamed Wi-Fi".into(), vec!["127.0.0.1".into()]);
+        assert!(
+            fixture
+                .restore(None, None)
+                .unwrap_err()
+                .contains("127.0.0.1")
+        );
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn watchdog_cannot_reassert_after_address_history_persistence_fails() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[("Wi-Fi", &["127.0.0.1"])]);
+        let original = std::fs::read(&fixture.path).unwrap();
+        let mut backup = read_backup_at(&fixture.path).unwrap();
+        let result = prepare_watchdog_backup(
+            &mut backup,
+            Vec::new(),
+            "127.0.0.4".parse().unwrap(),
+            |_| Err("backup write failed".into()),
+        )
+        .map(|()| {
+            fixture
+                .dns
+                .borrow_mut()
+                .insert("Wi-Fi".into(), vec!["127.0.0.4".into()]);
+        });
+        assert_eq!(result.unwrap_err(), "backup write failed");
+        assert_eq!(fixture.dns.borrow()["Wi-Fi"], ["127.0.0.1"]);
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn watchdog_keeps_legacy_history_unknown_and_rejects_old_untracked_loopback() {
+        for version in [1, 2] {
+            let mut backup = restore_backup();
+            backup.version = version;
+            backup.takeover_servers = None;
+            let fixture = RestoreFixture::new(&backup, &[("Renamed Wi-Fi", &["127.0.0.1"])]);
+            prepare_watchdog_backup(
+                &mut backup,
+                vec![("New service".into(), vec!["198.51.100.53".into()])],
+                "127.0.0.4".parse().unwrap(),
+                |updated| write_backup_at(&fixture.path, updated),
+            )
+            .unwrap();
+            assert!(
+                read_backup_at(&fixture.path)
+                    .unwrap()
+                    .takeover_servers
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .restore(None, None)
+                    .unwrap_err()
+                    .contains("Renamed Wi-Fi")
+            );
+            assert!(fixture.path.exists());
+            assert!(
+                prepare_watchdog_backup(
+                    &mut backup,
+                    vec![("Renamed Wi-Fi".into(), vec!["127.0.0.1".into()])],
+                    "127.0.0.4".parse().unwrap(),
+                    |_| panic!("must not capture an unknown previous takeover address"),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn watchdog_rejects_new_name_still_using_a_previous_takeover_address() {
+        let mut backup = restore_backup();
+        let error = prepare_watchdog_backup(
+            &mut backup,
+            vec![("Renamed Wi-Fi".into(), vec!["127.0.0.1".into()])],
+            "127.0.0.4".parse().unwrap(),
+            |_| panic!("must not capture the old takeover as original DNS"),
+        )
+        .unwrap_err();
+        assert!(error.contains("Renamed Wi-Fi"));
+        assert!(error.contains("unknown restore state"));
+        assert_eq!(backup.services.len(), 2);
+    }
+
+    #[test]
+    fn removed_service_is_safe_when_remaining_dns_is_restored() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[("USB LAN", &["127.0.0.1"])]);
+        fixture.restore(None, None).unwrap();
+        assert!(!fixture.path.exists());
+        assert!(fixture.dns.borrow()["USB LAN"].is_empty());
+    }
+
+    #[test]
+    fn renamed_service_with_changed_dns_is_left_untouched() {
+        let fixture = RestoreFixture::new(
+            &restore_backup(),
+            &[
+                ("Renamed Wi-Fi", &["198.51.100.53"]),
+                ("USB LAN", &["127.0.0.1"]),
+            ],
+        );
+        fixture.restore(None, None).unwrap();
+        assert!(!fixture.path.exists());
+        assert_eq!(fixture.dns.borrow()["Renamed Wi-Fi"], ["198.51.100.53"]);
+    }
+
+    #[test]
+    fn untracked_service_with_extra_resolver_still_blocks_stop() {
+        let fixture = RestoreFixture::new(
+            &restore_backup(),
+            &[
+                ("Wi-Fi", &["127.0.0.1"]),
+                ("New service", &["198.51.100.53", "127.0.0.1"]),
+            ],
+        );
+        let error = fixture.restore(None, None).unwrap_err();
+        assert!(error.contains("New service"));
+        assert!(fixture.path.exists());
+    }
+
+    #[test]
+    fn partial_write_and_verification_errors_retain_backup_for_retry() {
+        let fixture = RestoreFixture::new(
+            &restore_backup(),
+            &[("Wi-Fi", &["127.0.0.1"]), ("USB LAN", &["127.0.0.1"])],
+        );
+        let original = std::fs::read(&fixture.path).unwrap();
+        let error = fixture.restore(Some("USB LAN"), Some("Wi-Fi")).unwrap_err();
+        assert!(error.contains("write failed for Wi-Fi"));
+        assert!(error.contains("read failed for USB LAN"));
+        assert!(error.contains("Wi-Fi\" still lists DNS"));
+        assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+        assert!(fixture.dns.borrow()["USB LAN"].is_empty());
+        fixture.restore(None, None).unwrap();
+        assert!(!fixture.path.exists());
+    }
+
+    #[test]
+    fn normal_restore_preserves_other_loopback_dns() {
+        let mut backup = restore_backup();
+        backup.services[0].servers = vec!["127.0.0.2".into(), "::1".into()];
+        let fixture = RestoreFixture::new(
+            &backup,
+            &[
+                ("Wi-Fi", &["127.0.0.1"]),
+                ("USB LAN", &["127.0.0.1"]),
+                ("Other tool", &["127.0.0.3"]),
+            ],
+        );
+        fixture.restore(None, None).unwrap();
+        assert!(!fixture.path.exists());
+        assert_eq!(fixture.dns.borrow()["Wi-Fi"], ["127.0.0.2", "::1"]);
+        assert_eq!(fixture.dns.borrow()["Other tool"], ["127.0.0.3"]);
+        assert!(fixture.dns.borrow()["USB LAN"].is_empty());
+    }
+
+    #[test]
+    fn legacy_backups_preserve_proven_original_loopback_but_reject_unknown_loopback() {
+        for version in [1, 2] {
+            let text = format!(
+                "version = {version}\n[[services]]\nname = 'Wi-Fi'\nservers = ['127.0.0.2']\n"
+            );
+            let backup: Backup = toml::from_str(&text).unwrap();
+            assert!(backup.takeover_servers.is_none());
+            let fixture = RestoreFixture::new(
+                &backup,
+                &[("Wi-Fi", &["127.0.0.1"]), ("Unknown", &["127.0.0.1"])],
+            );
+            assert!(fixture.restore(None, None).unwrap_err().contains("Unknown"));
+            assert_eq!(fixture.dns.borrow()["Wi-Fi"], ["127.0.0.2"]);
+            assert!(fixture.path.exists());
+            fixture
+                .dns
+                .borrow_mut()
+                .insert("Unknown".into(), vec!["198.51.100.53".into()]);
+            fixture.restore(None, None).unwrap();
+            assert!(!fixture.path.exists());
+        }
+    }
+
+    #[test]
+    fn services_appearing_during_restore_are_verified() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[("Wi-Fi", &["127.0.0.1"])]);
+        let mut lists = 0;
+        let error = restore_at(
+            &fixture.path,
+            || {
+                lists += 1;
+                Ok(if lists == 1 {
+                    vec!["Wi-Fi".into()]
+                } else {
+                    vec!["Wi-Fi".into(), "New service".into()]
+                })
+            },
+            |name| {
+                Ok(if name == "Wi-Fi" {
+                    vec!["192.0.2.53".into()]
+                } else {
+                    vec!["127.0.0.1".into()]
+                })
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("New service"));
+        assert!(fixture.path.exists());
+    }
+
+    #[test]
+    fn verification_list_error_retains_backup() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[]);
+        let mut lists = 0;
+        let error = restore_at(
+            &fixture.path,
+            || {
+                lists += 1;
+                if lists == 1 {
+                    Ok(Vec::new())
+                } else {
+                    Err("list failed".into())
+                }
+            },
+            |_| panic!("no service DNS should be read"),
+            |_, _| panic!("no service DNS should be written"),
+        )
+        .unwrap_err();
+        assert!(error.contains("list failed"));
+        assert!(fixture.path.exists());
     }
 
     #[test]

@@ -189,8 +189,12 @@ backup is written atomically with mode `0600`; without that backup, DNSRivet
 will not guess how to rewrite existing DNS settings. Logs are written to
 `/var/log/dnsrivet.log`.
 
+`start`, `stop`, `restart`, and `uninstall` are serialized across processes.
 `stop` restores DNS and disables the job while preserving the installed binary,
-configuration, and property list. `uninstall` also removes the installed binary
+configuration, and property list. If a renamed or untracked network service
+still points at DNSRivet, it retains the backup and refuses to stop rather than
+leave a dead resolver. Restore that service's known DNS settings or its original
+name, then retry. `uninstall` also removes the installed binary
 and `/Library/LaunchDaemons/io.github.wenliangcao.dnsrivet.plist`. User
 configuration remains intact.
 
@@ -214,7 +218,8 @@ While the service runs, a takeover watchdog re-checks every two minutes
 points exactly at the takeover address. macOS updates are known to rewrite
 network preferences and silently drop the takeover; the watchdog detects
 that, captures the network's current DNS as a fresh runtime fallback, and
-re-applies the takeover. The restore backup itself is never rewritten. If an
+re-applies the takeover. Original per-service DNS settings are never replaced;
+new services and takeover-address history are saved before further DNS changes. If an
 external tool keeps rewriting DNS, the watchdog backs off to a 30-minute
 cadence and says so in the log instead of fighting it.
 
@@ -475,8 +480,10 @@ Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会�
 原子写入；没有备份时，DNSRivet 不会猜测性改写原有 DNS。日志位于
 `/var/log/dnsrivet.log`。
 
-`stop` 恢复 DNS 并禁用服务，但保留已安装的二进制、配置和 plist；`uninstall`
-还会删除已安装二进制与
+`start`、`stop`、`restart` 和 `uninstall` 使用跨进程锁串行执行。
+`stop` 恢复 DNS 并禁用服务，但保留已安装的二进制、配置和 plist。如果改名或未记录的
+网络服务仍指向 DNSRivet，会保留备份并拒绝停止；请先恢复该服务已知正确的 DNS
+或原名称后重试，避免留下失效的本地 resolver。`uninstall` 还会删除已安装二进制与
 `/Library/LaunchDaemons/io.github.wenliangcao.dnsrivet.plist`，用户配置仍保留。
 
 可以在一次命令中安装新配置并重启：
@@ -495,7 +502,8 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 服务运行期间，接管看门狗每两分钟（守护进程启动时立即执行一次）核对备份内每个
 网络服务是否仍严格指向接管地址。macOS 更新可能重写网络偏好、静默清除接管；
 看门狗检测到后，会先把当前网络的 DNS 捕获为新的运行时回退列表，再重新接管。
-恢复用的备份本身永不改写。若有外部工具持续改写 DNS，看门狗会退避到 30 分钟
+原有服务的恢复 DNS 不会被替换；新服务和接管地址历史会在修改 DNS 前保存。
+若有外部工具持续改写 DNS，看门狗会退避到 30 分钟
 周期并在日志中说明，而不是无限对抗。
 
 ## 配置与缓存

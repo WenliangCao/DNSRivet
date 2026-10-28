@@ -1,5 +1,6 @@
 mod launchd;
 
+use crate::osdns::lock::FsLock;
 use crate::{atomic_file, config, osdns};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
@@ -11,12 +12,16 @@ pub const SUPPORT_DIR: &str = "/Library/Application Support/DNSRivet";
 pub const CONFIG_PATH: &str = "/Library/Application Support/DNSRivet/config.toml";
 pub const BINARY_PATH: &str = "/Library/Application Support/DNSRivet/dnsrivet";
 pub const COMMAND_PATH: &str = "/usr/local/bin/dnsrivet";
+// Independent of the DNS/watchdog lock: restart waits for daemon reassertion
+// while holding this guard. Never remove the file, including during uninstall.
+const LIFECYCLE_LOCK_PATH: &str = "/Library/Application Support/DNSRivet/.lifecycle.lock";
 
 pub fn start(
     config_path: Option<PathBuf>,
     generated_config: Option<String>,
 ) -> Result<String, String> {
     require_root()?;
+    let _lifecycle = FsLock::acquire(Path::new(LIFECYCLE_LOCK_PATH))?;
     if launchd::is_loaded()? {
         return Err("service is already loaded; use `dnsrivet restart`".into());
     }
@@ -115,6 +120,7 @@ fn cleanup_failed_start(
 
 pub fn stop() -> Result<String, String> {
     require_root()?;
+    let _lifecycle = FsLock::acquire(Path::new(LIFECYCLE_LOCK_PATH))?;
     let restored = osdns::release()?;
     let managed = launchd::is_installed() || launchd::is_loaded()?;
     if managed {
@@ -136,6 +142,7 @@ pub fn restart(
     generated_config: Option<String>,
 ) -> Result<String, String> {
     require_root()?;
+    let _lifecycle = FsLock::acquire(Path::new(LIFECYCLE_LOCK_PATH))?;
     if !launchd::is_loaded()? {
         return Err("service is not loaded; use `dnsrivet start`".into());
     }
@@ -258,6 +265,7 @@ pub fn status() -> Result<String, String> {
 
 pub fn uninstall() -> Result<String, String> {
     require_root()?;
+    let _lifecycle = FsLock::acquire(Path::new(LIFECYCLE_LOCK_PATH))?;
     let restored = osdns::release()?;
     let managed = launchd::is_installed() || launchd::is_loaded()?;
     if managed {
@@ -606,6 +614,182 @@ fn dns_probe(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LockFixture {
+        root: PathBuf,
+    }
+
+    impl LockFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "dnsrivet-lifecycle-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self { root }
+        }
+
+        fn spawn(&self, action: &str) -> std::process::Child {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "service::tests::lifecycle_lock_child",
+                    "--nocapture",
+                ])
+                .env("DNSRIVET_TEST_LOCK_DIR", &self.root)
+                .env("DNSRIVET_TEST_LOCK_ACTION", action)
+                .spawn()
+                .unwrap()
+        }
+    }
+
+    impl Drop for LockFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    fn append_lock_event(root: &Path, event: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("events"))
+            .unwrap();
+        writeln!(file, "{event}").unwrap();
+    }
+
+    fn wait_for_lock_child(child: &mut std::process::Child, signal: Option<&Path>) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "lock child failed: {status}");
+                assert!(
+                    signal.is_none(),
+                    "lock child exited before contention barrier"
+                );
+                return;
+            }
+            if signal.is_some_and(Path::is_file) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("lock child did not reach its expected checkpoint");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Driven by the tests below in a separate process, with temporary paths only.
+    #[test]
+    fn lifecycle_lock_child() {
+        let Some(root) = std::env::var_os("DNSRIVET_TEST_LOCK_DIR") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let action = std::env::var("DNSRIVET_TEST_LOCK_ACTION").unwrap();
+        let path = root.join(if action == "watchdog" {
+            ".lock"
+        } else {
+            ".lifecycle.lock"
+        });
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        if action == "watchdog" {
+            // A watchdog must be able to run while restart holds the lifecycle lock.
+            file.try_lock().unwrap();
+            drop(file);
+            let _dns = FsLock::acquire(&path).unwrap();
+            append_lock_event(&root, "watchdog:reasserted");
+            return;
+        }
+        assert!(matches!(
+            file.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(file);
+        std::fs::write(root.join("contended"), b"ready").unwrap();
+        let _lifecycle = FsLock::acquire(&path).unwrap();
+        // Initial state checks must observe the previous operation's final state,
+        // including rollback, not its intermediate DNS/configuration transition.
+        assert_eq!(std::fs::read(root.join("state")).unwrap(), b"settled");
+        append_lock_event(&root, &format!("{action}:check"));
+        append_lock_event(&root, &format!("{action}:restore"));
+        append_lock_event(&root, &format!("{action}:bootout"));
+        append_lock_event(&root, &format!("{action}:complete"));
+    }
+
+    fn simulate_lifecycle(
+        fixture: &LockFixture,
+        operation: &str,
+        rollback: bool,
+        contender: &str,
+        child: &mut Option<std::process::Child>,
+    ) -> Result<(), String> {
+        let _lifecycle = FsLock::acquire(&fixture.root.join(".lifecycle.lock"))?;
+        append_lock_event(&fixture.root, &format!("{operation}:check"));
+        std::fs::write(fixture.root.join("state"), b"transitioning").unwrap();
+        append_lock_event(&fixture.root, &format!("{operation}:launch"));
+        *child = Some(fixture.spawn(contender));
+        wait_for_lock_child(
+            child.as_mut().unwrap(),
+            Some(&fixture.root.join("contended")),
+        );
+        {
+            let _dns = FsLock::acquire(&fixture.root.join(".lock"))?;
+            append_lock_event(&fixture.root, &format!("{operation}:dns"));
+        }
+        // Waiting for daemon reassertion must not keep the DNS lock held.
+        let mut watchdog = fixture.spawn("watchdog");
+        wait_for_lock_child(&mut watchdog, None);
+        assert_eq!(
+            std::fs::read(fixture.root.join("state")).unwrap(),
+            b"transitioning"
+        );
+        if rollback {
+            append_lock_event(&fixture.root, &format!("{operation}:rollback"));
+            std::fs::write(fixture.root.join("state"), b"settled").unwrap();
+            return Err("simulated failure after rollback".into());
+        }
+        append_lock_event(&fixture.root, &format!("{operation}:complete"));
+        std::fs::write(fixture.root.join("state"), b"settled").unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_file_lock_serializes_operations_through_completion_and_rollback() {
+        for (operation, rollback, contender) in [
+            ("start", false, "stop"),
+            ("restart", false, "uninstall"),
+            ("start", true, "stop"),
+            ("restart", true, "uninstall"),
+        ] {
+            let fixture = LockFixture::new();
+            let mut child = None;
+            let result = simulate_lifecycle(&fixture, operation, rollback, contender, &mut child);
+            assert_eq!(result.is_err(), rollback);
+            wait_for_lock_child(child.as_mut().unwrap(), None);
+            assert_eq!(
+                std::fs::read_to_string(fixture.root.join("events")).unwrap(),
+                format!(
+                    "{operation}:check\n{operation}:launch\n{operation}:dns\nwatchdog:reasserted\n{operation}:{}\n{contender}:check\n{contender}:restore\n{contender}:bootout\n{contender}:complete\n",
+                    if rollback { "rollback" } else { "complete" }
+                )
+            );
+            // Reusing the same persistent file must work after both success and error.
+            let _next = FsLock::acquire(&fixture.root.join(".lifecycle.lock")).unwrap();
+        }
+    }
 
     #[test]
     fn binary_install_streams_large_files_and_can_replace_its_source() {
