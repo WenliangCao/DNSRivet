@@ -46,6 +46,7 @@ enum Backend {
         ip: Option<IpAddr>,
         stack: IpStack,
         bootstrap: Arc<Bootstrap>,
+        deny: Arc<Vec<SocketAddr>>,
     },
     Encrypted(encrypted::Channel),
 }
@@ -65,9 +66,7 @@ impl Manager {
         for up in all {
             // Static-address self-loop is a config error, not a runtime skip.
             if let Some(ip) = up.bootstrap_ip {
-                let dialing_self = listeners.contains(&SocketAddr::new(ip, up.port))
-                    || (ip.is_loopback() && listeners.iter().any(|l| l.port() == up.port));
-                if dialing_self {
+                if is_self_address(SocketAddr::new(ip, up.port), listeners) {
                     return Err(format!(
                         "upstream {}: endpoint {}:{} points at our own listener",
                         up.name, ip, up.port
@@ -83,6 +82,7 @@ impl Manager {
                     ip: up.bootstrap_ip,
                     stack: up.ip_stack,
                     bootstrap: boot.clone(),
+                    deny: deny.clone(),
                 },
                 _ => Backend::Encrypted(encrypted::Channel::new(
                     up,
@@ -317,6 +317,7 @@ impl Entry {
                 ip,
                 stack,
                 bootstrap,
+                deny,
             } => {
                 if let Some(ip) = ip {
                     return legacy::query(SocketAddr::new(*ip, *port), query, client_tcp).await;
@@ -324,7 +325,12 @@ impl Entry {
                 let ips = bootstrap.resolve(host, *stack).await?;
                 let mut last_err = None;
                 for ip in ips {
-                    match legacy::query(SocketAddr::new(ip, *port), query, client_tcp).await {
+                    let addr = SocketAddr::new(ip, *port);
+                    if is_self_address(addr, deny) {
+                        last_err = Some(format!("{addr} points back at our own listener"));
+                        continue;
+                    }
+                    match legacy::query(addr, query, client_tcp).await {
                         Ok(response) => return Ok(response),
                         Err(err) => last_err = Some(err),
                     }
@@ -342,6 +348,15 @@ impl Entry {
             }
         }
     }
+}
+
+/// One self-dial rule for literal, bootstrap-resolved, and encrypted targets.
+fn is_self_address(addr: SocketAddr, listeners: &[SocketAddr]) -> bool {
+    let ip = addr.ip().to_canonical();
+    listeners.iter().any(|listener| {
+        listener.port() == addr.port()
+            && (listener.ip().to_canonical() == ip || ip.is_loopback() || ip.is_unspecified())
+    })
 }
 
 /// hickory-proto 0.25's transport API re-encodes requests. Bound that encoder
@@ -367,6 +382,29 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use tokio::net::UdpSocket;
+
+    #[test]
+    fn self_dial_checks_normalize_mapped_addresses_and_keep_remote_targets() {
+        let listeners = [
+            "127.0.0.1:53".parse().unwrap(),
+            "192.0.2.1:5354".parse().unwrap(),
+        ];
+        for addr in [
+            "127.0.0.2:53",
+            "[::1]:53",
+            "[::ffff:127.0.0.1]:53",
+            "0.0.0.0:53",
+            "192.0.2.1:5354",
+        ] {
+            assert!(is_self_address(addr.parse().unwrap(), &listeners), "{addr}");
+        }
+        for addr in ["127.0.0.1:853", "192.0.2.2:53", "[2001:db8::53]:53"] {
+            assert!(
+                !is_self_address(addr.parse().unwrap(), &listeners),
+                "{addr}"
+            );
+        }
+    }
 
     #[test]
     fn encrypted_encoder_accepts_only_single_question_queries() {

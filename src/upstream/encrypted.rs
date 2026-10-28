@@ -234,9 +234,7 @@ impl Channel {
         let mut last_err = String::from("no candidate addresses");
         for ip in ips {
             let addr = SocketAddr::new(ip, self.up.port);
-            if self.deny.contains(&addr)
-                || (ip.is_loopback() && self.deny.iter().any(|l| l.port() == self.up.port))
-            {
+            if super::is_self_address(addr, &self.deny) {
                 last_err = format!("{addr} points back at our own listener");
                 continue;
             }

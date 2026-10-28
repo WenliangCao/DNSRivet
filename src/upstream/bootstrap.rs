@@ -544,6 +544,49 @@ mod tests {
         assert!(err.contains("bootstrap failed for dns.example"), "{err}");
     }
 
+    #[tokio::test]
+    async fn legacy_resolution_rejects_self_addresses_before_sending() {
+        use crate::config::{Proto, Upstream};
+        use crate::upstream::{Backend, Manager};
+
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = target.local_addr().unwrap();
+        let self_ip: IpAddr = "192.0.2.53".parse().unwrap();
+        let up = Upstream {
+            name: "resolved legacy".into(),
+            proto: Proto::Legacy,
+            host: "dns.example".into(),
+            port: addr.port(),
+            path: String::new(),
+            bootstrap_ip: None,
+            timeout_ms: 1000,
+            ip_stack: IpStack::V4,
+        };
+        let manager =
+            Manager::new(vec![up], &[SocketAddr::new(self_ip, addr.port())], vec![]).unwrap();
+        let Backend::Legacy { bootstrap, .. } = &manager.entries[0].backend else {
+            unreachable!()
+        };
+        // Every loopback on this port is denied, including IPv4-mapped IPv6.
+        let ips = [self_ip, addr.ip(), "::ffff:127.0.0.1".parse().unwrap()];
+        insert_cached(bootstrap, &ips, Instant::now() + Duration::from_secs(60)).await;
+        let mut query = Message::new();
+        query.add_query(Query::query(
+            Name::from_ascii("review.invalid.").unwrap(),
+            RecordType::A,
+        ));
+        assert!(
+            manager
+                .forward(&query.to_vec().unwrap(), false)
+                .await
+                .is_none()
+        );
+        assert!(
+            target.try_recv_from(&mut [0; 512]).is_err(),
+            "must not send to a resolved self address"
+        );
+    }
+
     #[test]
     fn stale_entry_is_servable_for_one_day_after_expiry() {
         let expires = Instant::now();
