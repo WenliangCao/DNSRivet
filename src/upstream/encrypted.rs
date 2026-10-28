@@ -651,6 +651,43 @@ mod tests {
         background.abort();
     }
 
+    /// Measures local parsing/dispatch/transport work, not network or TLS latency.
+    /// Run with `mbx test --release benchmark_encrypted_dispatch -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "manual warm encrypted dispatch benchmark"]
+    async fn benchmark_encrypted_dispatch() {
+        use std::hint::black_box;
+
+        for upstreams in [1, 2] {
+            for padding in [0, 1024] {
+                let (mut manager, background) = test_manager(TestTransport::default()).await;
+                Arc::get_mut(&mut manager.entries[0]).unwrap().timeout_ms = 5000;
+                if upstreams == 2 {
+                    manager.entries.push(manager.entries[0].clone());
+                }
+                let query = encrypted_test_query(padding).to_vec().unwrap();
+                for _ in 0..1000 {
+                    black_box(manager.forward(&query, false).await.unwrap());
+                }
+                let mut samples = [0.0; 7];
+                for sample in &mut samples {
+                    let started = Instant::now();
+                    for _ in 0..20_000 {
+                        black_box(manager.forward(black_box(&query), false).await.unwrap());
+                    }
+                    *sample = started.elapsed().as_nanos() as f64 / 20_000.0;
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "upstreams={upstreams} padding={padding} median={:.1} ns/query min={:.1} max={:.1}",
+                    samples[3], samples[0], samples[6]
+                );
+                drop(manager);
+                background.await.unwrap().unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn encrypted_forward_preserves_question_id_and_edns() {
         let (manager, background) = test_manager(TestTransport::default()).await;
