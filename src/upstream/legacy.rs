@@ -9,8 +9,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 pub async fn query(addr: SocketAddr, query: &[u8], tcp_retry: bool) -> Result<Vec<u8>, String> {
     let response = query_udp(addr, query).await?;
-    let truncated = response.len() >= 12 && response[2] & 0x02 != 0;
-    if truncated
+    if is_truncated(&response)
         && tcp_retry
         && let Ok(full) = query_tcp(addr, query).await
     {
@@ -19,7 +18,12 @@ pub async fn query(addr: SocketAddr, query: &[u8], tcp_retry: bool) -> Result<Ve
     Ok(response)
 }
 
-async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
+/// Whether a response has the TC bit set (RFC 1035 §4.1.1).
+pub fn is_truncated(response: &[u8]) -> bool {
+    response.len() >= 12 && response[2] & 0x02 != 0
+}
+
+pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
     let bind = SocketAddr::new(
         if addr.is_ipv4() {
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
@@ -46,7 +50,7 @@ async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
+pub async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
     let len = u16::try_from(query.len()).map_err(|_| "query too large".to_string())?;
     let mut stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let mut framed = Vec::with_capacity(2 + query.len());
