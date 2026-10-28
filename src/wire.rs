@@ -628,6 +628,78 @@ mod tests {
         assert!(!is_multi_question_query(&status));
     }
 
+    fn named_question(name: &[u8]) -> Vec<u8> {
+        let mut message = vec![0, 1, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        message.extend_from_slice(name);
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        message
+    }
+
+    fn compressed_question(name: &[u8], prefix_len: usize) -> Vec<u8> {
+        let mut message = named_question(&name[..prefix_len]);
+        message.truncate(HEADER_LEN + prefix_len);
+        // Point beyond QTYPE/QCLASS to a suffix stored later in the message.
+        // walk_name has always permitted both forward and backward pointers.
+        let suffix = message.len() + 6;
+        let pointer = 0xc000 | u16::try_from(suffix).unwrap();
+        message.extend_from_slice(&pointer.to_be_bytes());
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        message.extend_from_slice(&name[prefix_len..]);
+        message
+    }
+
+    /// Run with `mbx test --release benchmark_wire_validation -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual wire validation hot-path benchmark"]
+    fn benchmark_wire_validation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 100_000;
+        const SAMPLES: usize = 7;
+        let short = b"\x07ExAmPlE\x03COM\0".to_vec();
+        let mut long = Vec::new();
+        for length in [63, 63, 63, 61] {
+            long.push(length);
+            long.resize(long.len() + usize::from(length), b'A');
+        }
+        long.push(0);
+        for (name_kind, name) in [("short", short), ("long", long)] {
+            let query = named_question(&name);
+            for (encoding, mut response) in [
+                ("uncompressed", query.clone()),
+                ("compressed", compressed_question(&name, 0)),
+                (
+                    "compressed-suffix",
+                    compressed_question(&name, usize::from(name[0]) + 1),
+                ),
+            ] {
+                response[2] |= 0x80;
+                assert_eq!(validate_response(&query, &response), Ok(()));
+                for _ in 0..10_000 {
+                    black_box(validate_response(black_box(&query), black_box(&response)).unwrap());
+                }
+                let mut samples = [0.0; SAMPLES];
+                for sample in &mut samples {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        black_box(
+                            validate_response(black_box(&query), black_box(&response)).unwrap(),
+                        );
+                    }
+                    *sample = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "validate {name_kind} {encoding}: median={:.1} ns/op min={:.1} max={:.1}",
+                    samples[SAMPLES / 2],
+                    samples[0],
+                    samples[SAMPLES - 1]
+                );
+            }
+        }
+    }
+
     #[test]
     fn walks_compressed_uncompressed_and_root_names() {
         let message = b"\x07ExAmPlE\x03COM\0\x03WWW\xc0\x00";
