@@ -350,20 +350,44 @@ fn restart_with_config(replacement: &[u8]) -> Result<String, String> {
     let destination = Path::new(CONFIG_PATH);
     let previous = std::fs::read(destination)
         .map_err(|e| format!("read installed config {}: {e}", destination.display()))?;
-    write_config(destination, replacement)?;
+    let verify_takeover = match osdns::takeover_state() {
+        osdns::TakeoverState::Active => true,
+        osdns::TakeoverState::NotTakenOver => false,
+        _ => return Err("takeover state is inconsistent; restore it with `dnsrivet stop` before replacing the configuration".into()),
+    };
+    restart_config_transaction(
+        &previous,
+        replacement,
+        |bytes| write_config(destination, bytes),
+        || {
+            launchd::restart()?;
+            wait_for_dns(installed_probe_address()?, Duration::from_secs(15))
+        },
+        || {
+            if verify_takeover
+                && !wait_for_reassertion(installed_probe_address()?.ip(), Duration::from_secs(15))
+            {
+                return Err("DNS probe passed but system DNS takeover was not verified".into());
+            }
+            Ok(())
+        },
+    )
+}
 
-    let result = launchd::restart().and_then(|()| {
-        let addr = installed_probe_address()?;
-        wait_for_dns(addr, Duration::from_secs(15))
-    });
+fn restart_config_transaction(
+    previous: &[u8],
+    replacement: &[u8],
+    mut install: impl FnMut(&[u8]) -> Result<(), String>,
+    mut reload: impl FnMut() -> Result<(), String>,
+    mut verify: impl FnMut() -> Result<(), String>,
+) -> Result<String, String> {
+    install(replacement)?;
+    let result = reload().and_then(|()| verify());
     match result {
-        Ok(()) => Ok("configuration installed; service restarted and DNS probe passed".into()),
+        Ok(()) => Ok("configuration installed; service restarted and DNS checks passed".into()),
         Err(err) => {
-            write_config(destination, &previous)?;
-            let rollback = launchd::restart().and_then(|()| {
-                let addr = installed_probe_address()?;
-                wait_for_dns(addr, Duration::from_secs(15))
-            });
+            install(previous)?;
+            let rollback = reload().and_then(|()| verify());
             match rollback {
                 Ok(()) => Err(format!(
                     "new configuration failed: {err}; previous configuration restored and restarted"
@@ -788,6 +812,86 @@ mod tests {
             );
             // Reusing the same persistent file must work after both success and error.
             let _next = FsLock::acquire(&fixture.root.join(".lifecycle.lock")).unwrap();
+        }
+    }
+
+    #[test]
+    fn config_restart_rolls_back_when_probe_succeeds_but_takeover_fails() {
+        use std::cell::RefCell;
+        // Model A -> B: the new listener works, but renamed-service/history
+        // guards prevent the watchdog from moving system DNS away from A.
+        let installed = RefCell::new(b"A".to_vec());
+        let running = RefCell::new(b"A".to_vec());
+        let mut loads = 0;
+        let error = restart_config_transaction(
+            b"A",
+            b"B",
+            |bytes| {
+                *installed.borrow_mut() = bytes.to_vec();
+                Ok(())
+            },
+            || {
+                *running.borrow_mut() = installed.borrow().clone();
+                loads += 1;
+                Ok(())
+            },
+            || {
+                if *running.borrow() == b"B" {
+                    Err("system DNS still points at A".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("system DNS still points at A"));
+        assert!(error.contains("previous configuration restored and restarted"));
+        assert_eq!(*installed.borrow(), b"A");
+        assert_eq!(*running.borrow(), b"A");
+        assert_eq!(loads, 2);
+    }
+
+    #[test]
+    fn verified_config_restart_keeps_replacement_and_reports_rollback_failures() {
+        use std::cell::RefCell;
+        for verify_ok in [true, false] {
+            let installed = RefCell::new(Vec::new());
+            let mut loads = 0;
+            let result = restart_config_transaction(
+                b"A",
+                b"B",
+                |bytes| {
+                    *installed.borrow_mut() = bytes.to_vec();
+                    Ok(())
+                },
+                || {
+                    loads += 1;
+                    if loads == 2 {
+                        Err("old listener failed".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    if verify_ok {
+                        Ok(())
+                    } else {
+                        Err("takeover failed".into())
+                    }
+                },
+            );
+            if verify_ok {
+                assert!(result.is_ok());
+                assert_eq!(*installed.borrow(), b"B");
+                assert_eq!(loads, 1);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("restart failed: old listener failed")
+                );
+                assert_eq!(*installed.borrow(), b"A");
+            }
         }
     }
 

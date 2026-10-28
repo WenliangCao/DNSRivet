@@ -204,8 +204,8 @@ Install a replacement TOML atomically with:
 sudo dnsrivet restart --config dnsrivet.toml
 ```
 
-If the new service fails its DNS probe, DNSRivet restores the previous config
-and restarts it.
+If the new service fails its DNS probe or cannot verify an active system DNS
+takeover, DNSRivet restores the previous config and restarts it.
 
 Before taking over macOS DNS, DNSRivet snapshots the effective system DNS
 servers. If every configured upstream fails, it queries those servers directly
@@ -219,8 +219,8 @@ points exactly at the takeover address. macOS updates are known to rewrite
 network preferences and silently drop the takeover; the watchdog detects
 that, captures the network's current DNS as a fresh runtime fallback, and
 re-applies the takeover. Original per-service DNS settings are never replaced;
-new services and takeover-address history are saved before further DNS changes. If an
-external tool keeps rewriting DNS, the watchdog backs off to a 30-minute
+new services and takeover-address history are saved before further DNS changes.
+If an external tool keeps rewriting DNS, the watchdog backs off to a 30-minute
 cadence and says so in the log instead of fighting it.
 
 If macOS reports an enabled network service that was not present at startup,
@@ -492,7 +492,8 @@ Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会�
 sudo dnsrivet restart --config dnsrivet.toml
 ```
 
-如果新服务未通过 DNS 探活，DNSRivet 会恢复旧配置并重新启动。
+如果新服务未通过 DNS 探活，或无法验证活动的系统 DNS 接管，DNSRivet 会恢复旧配置
+并重新启动。
 
 接管 macOS DNS 前，DNSRivet 会记录当时实际生效的系统 DNS。所有配置上游都失败时，
 它会绕过已经指向自身的系统 resolver，直接查询这些服务器，每台最多等待两秒。

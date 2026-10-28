@@ -425,8 +425,30 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
 /// Read-only variant for `restart`'s verification wait.
 pub fn takeover_intact(server: IpAddr) -> Result<bool, String> {
     let expected = server.to_string();
-    let current = service_dns_snapshot()?;
-    Ok(services_needing_reassert(&current, &expected).is_empty())
+    let backup = read_backup()?;
+    takeover_intact_with(&backup, &expected, list_all_services, get_dns_servers)
+}
+
+fn takeover_intact_with(
+    backup: &Backup,
+    expected: &str,
+    list: impl FnOnce() -> Result<Vec<String>, String>,
+    mut get: impl FnMut(&str) -> Result<Vec<String>, String>,
+) -> Result<bool, String> {
+    let mut checked = false;
+    for name in list()? {
+        let servers = get(&name)?;
+        let known = backup.services.iter().any(|service| service.name == name);
+        // Unknown names may have been renamed while retaining an old takeover
+        // address. Never declare a new listener verified while DNS still uses it.
+        if known || dns_may_depend_on_takeover(backup, &name, &servers) {
+            checked = true;
+            if servers.len() != 1 || servers[0] != expected {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(checked)
 }
 
 /// Current DNS list of every backed-up service that still exists.
@@ -1119,6 +1141,34 @@ resolver #1
                 .contains("127.0.0.1")
         );
         assert_eq!(std::fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
+    fn takeover_verification_observes_renamed_services_and_never_passes_vacuously() {
+        let backup = restore_backup();
+        let names = || Ok(vec!["Renamed Wi-Fi".into()]);
+        assert!(
+            !takeover_intact_with(&backup, "127.0.0.4", names, |_| Ok(vec![
+                "127.0.0.1".into()
+            ]))
+            .unwrap()
+        );
+        assert!(
+            takeover_intact_with(&backup, "127.0.0.1", names, |_| Ok(vec![
+                "127.0.0.1".into()
+            ]))
+            .unwrap()
+        );
+        assert!(
+            !takeover_intact_with(&backup, "127.0.0.1", || Ok(Vec::new()), |_| unreachable!())
+                .unwrap()
+        );
+        assert!(
+            takeover_intact_with(&backup, "127.0.0.1", names, |_| Err(
+                "cannot read DNS".into()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
