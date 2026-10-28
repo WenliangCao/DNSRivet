@@ -669,24 +669,27 @@ mod tests {
                 if upstreams == 2 {
                     manager.entries.push(manager.entries[0].clone());
                 }
-                let query = encrypted_test_query(padding).to_vec().unwrap();
-                for _ in 0..1000 {
-                    black_box(manager.forward(&query, false).await.unwrap());
-                }
-                let mut samples = [0.0; 7];
-                for sample in &mut samples {
-                    let started = Instant::now();
-                    for _ in 0..20_000 {
-                        black_box(manager.forward(black_box(&query), false).await.unwrap());
+                // Production queries run in spawned tasks, not in block_on's
+                // root future. The latter adds an artificial reactor poll per reply.
+                tokio::spawn(async move {
+                    let query = encrypted_test_query(padding).to_vec().unwrap();
+                    for _ in 0..1000 {
+                        black_box(manager.forward(&query, false).await.unwrap());
                     }
-                    *sample = started.elapsed().as_nanos() as f64 / 20_000.0;
-                }
-                samples.sort_by(f64::total_cmp);
-                println!(
-                    "upstreams={upstreams} padding={padding} median={:.1} ns/query min={:.1} max={:.1}",
-                    samples[3], samples[0], samples[6]
-                );
-                drop(manager);
+                    let mut samples = [0.0; 7];
+                    for sample in &mut samples {
+                        let started = Instant::now();
+                        for _ in 0..20_000 {
+                            black_box(manager.forward(black_box(&query), false).await.unwrap());
+                        }
+                        *sample = started.elapsed().as_nanos() as f64 / 20_000.0;
+                    }
+                    samples.sort_by(f64::total_cmp);
+                    println!(
+                        "upstreams={upstreams} padding={padding} median={:.1} ns/query min={:.1} max={:.1}",
+                        samples[3], samples[0], samples[6]
+                    );
+                }).await.unwrap();
                 background.await.unwrap().unwrap();
             }
         }
