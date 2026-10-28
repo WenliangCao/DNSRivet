@@ -426,12 +426,19 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
 pub fn takeover_intact(server: IpAddr) -> Result<bool, String> {
     let expected = server.to_string();
     let backup = read_backup()?;
-    takeover_intact_with(&backup, &expected, list_all_services, get_dns_servers)
+    takeover_intact_with(
+        &backup,
+        &expected,
+        &list_services()?,
+        list_all_services,
+        get_dns_servers,
+    )
 }
 
 fn takeover_intact_with(
     backup: &Backup,
     expected: &str,
+    enabled: &[String],
     list: impl FnOnce() -> Result<Vec<String>, String>,
     mut get: impl FnMut(&str) -> Result<Vec<String>, String>,
 ) -> Result<bool, String> {
@@ -441,7 +448,7 @@ fn takeover_intact_with(
         let known = backup.services.iter().any(|service| service.name == name);
         // Unknown names may have been renamed while retaining an old takeover
         // address. Never declare a new listener verified while DNS still uses it.
-        if known || dns_may_depend_on_takeover(backup, &name, &servers) {
+        if known || enabled.contains(&name) || dns_may_depend_on_takeover(backup, &name, &servers) {
             checked = true;
             if servers.len() != 1 || servers[0] != expected {
                 return Ok(false);
@@ -1148,27 +1155,54 @@ resolver #1
         let backup = restore_backup();
         let names = || Ok(vec!["Renamed Wi-Fi".into()]);
         assert!(
-            !takeover_intact_with(&backup, "127.0.0.4", names, |_| Ok(vec![
+            !takeover_intact_with(&backup, "127.0.0.4", &[], names, |_| Ok(vec![
                 "127.0.0.1".into()
             ]))
             .unwrap()
         );
         assert!(
-            takeover_intact_with(&backup, "127.0.0.1", names, |_| Ok(vec![
+            takeover_intact_with(&backup, "127.0.0.1", &[], names, |_| Ok(vec![
                 "127.0.0.1".into()
             ]))
             .unwrap()
         );
         assert!(
-            !takeover_intact_with(&backup, "127.0.0.1", || Ok(Vec::new()), |_| unreachable!())
-                .unwrap()
+            !takeover_intact_with(
+                &backup,
+                "127.0.0.1",
+                &[],
+                || Ok(Vec::new()),
+                |_| unreachable!()
+            )
+            .unwrap()
         );
         assert!(
-            takeover_intact_with(&backup, "127.0.0.1", names, |_| Err(
+            takeover_intact_with(&backup, "127.0.0.1", &[], names, |_| Err(
                 "cannot read DNS".into()
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn takeover_verification_includes_new_enabled_services_but_not_unrelated_disabled_ones() {
+        let backup = restore_backup();
+        let names = || Ok(vec!["Wi-Fi".into(), "New adapter".into()]);
+        let dns = |name: &str| {
+            Ok(vec![
+                if name == "Wi-Fi" {
+                    "127.0.0.1"
+                } else {
+                    "192.0.2.53"
+                }
+                .into(),
+            ])
+        };
+        assert!(
+            !takeover_intact_with(&backup, "127.0.0.1", &["New adapter".into()], names, dns)
+                .unwrap()
+        );
+        assert!(takeover_intact_with(&backup, "127.0.0.1", &[], names, dns).unwrap());
     }
 
     #[test]
