@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# Defend this entry point too, before touching paths or the live launchd job.
+if [ "${3:-/}" != / ]; then
+    echo "DNSRivet can only be installed on the current startup volume (/)." >&2
+    exit 1
+fi
+
 binary="/Library/Application Support/DNSRivet/dnsrivet"
 command_path="/usr/local/bin/dnsrivet"
 label="system/io.github.wenliangcao.dnsrivet"

@@ -1,11 +1,16 @@
 #!/bin/sh
 set -eu
 
-target_volume="${3:-/}"
-target_volume="${target_volume%/}"
-command_path="${target_volume}/usr/local/bin/dnsrivet"
+# This package manages the running system's launchd service. Never accept a
+# different volume and then let postinstall modify the live host instead.
+if [ "${3:-/}" != / ]; then
+    echo "DNSRivet can only be installed on the current startup volume (/)." >&2
+    exit 1
+fi
+
+command_path="/usr/local/bin/dnsrivet"
 managed_binary="/Library/Application Support/DNSRivet/dnsrivet"
-homebrew_arm="${target_volume}/opt/homebrew/bin/dnsrivet"
+homebrew_arm="/opt/homebrew/bin/dnsrivet"
 
 if [ -e "$homebrew_arm" ] || [ -L "$homebrew_arm" ]; then
     echo "DNSRivet is already installed by Homebrew. Run 'brew uninstall dnsrivet' before installing the PKG." >&2
