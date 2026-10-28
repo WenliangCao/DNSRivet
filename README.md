@@ -256,9 +256,10 @@ is exhausted and further UDP queries are dropped. Use it only when the first
 upstream's reachability is fully trusted.
 
 Failover is hedged: when an upstream has not answered within 300 ms, the next
-upstream is queried in parallel and the first valid answer wins; the slow
-attempt keeps running to its own timeout, so a stalled encrypted connection
-still backs off and later queries go straight to the next upstream. Upstreams
+upstream is queried in parallel and the first valid non-SERVFAIL answer wins.
+Losing legacy attempts are cancelled; encrypted attempts keep running to their
+own timeout so stalled connections still back off. All attempts, including
+background losers and system fallback, share a 512-attempt budget. Upstreams
 with `timeout = 0` are never raced. Hedging means a later upstream can see a
 query the first one would have answered slowly, so order upstreams you are
 equally willing to send queries to. Listing the same resolver as `doh3` and
@@ -506,8 +507,9 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 仅在完全信任首上游可达性时使用。
 
 故障转移带对冲：某个上游 300 毫秒内未应答时，会并发查询下一个上游，取先到的
-合法应答；慢的那次请求会继续跑到它自己的超时，所以卡住的加密连接仍会断开并
-退避，之后的查询直接走下一个上游。`timeout = 0` 的上游不参与对冲。对冲意味着
+合法且非 `SERVFAIL` 的应答。落败的 legacy 请求会取消；加密请求继续运行至自身
+超时，让卡住的连接仍能断开并退避。包括后台落败请求和系统回退在内的所有尝试
+共用 512 项预算。`timeout = 0` 的上游不参与对冲。对冲意味着
 后续上游可能收到首上游本可以慢速应答的查询，因此只把同样愿意发送查询的上游
 排在后面。把同一解析服务依次配置为 `doh3` 和 `doh`，可以在网络丢弃 UDP/443
 时继续通过 TCP 应答。

@@ -9,7 +9,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+
+/// Includes hedged attempts still running after their client has been answered.
+const MAX_ATTEMPTS: usize = 512;
 
 /// How long an upstream may stay silent before the next one is queried in
 /// parallel. Well above a warm DoH/DoH3 round trip, so healthy upstreams
@@ -21,6 +25,7 @@ const HEDGE_DELAY: Duration = Duration::from_millis(300);
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
     entries: Vec<Arc<Entry>>,
+    attempts: Arc<Semaphore>,
     /// Runtime-refreshable: the watchdog swaps in the current network's DNS
     /// when it recovers a lost takeover. Never persisted to the backup.
     system_fallback: std::sync::RwLock<Vec<SocketAddr>>,
@@ -95,6 +100,7 @@ impl Manager {
         }
         Ok(Self {
             entries,
+            attempts: Arc::new(Semaphore::new(MAX_ATTEMPTS)),
             system_fallback: std::sync::RwLock::new(system_fallback),
             fallback_active: AtomicBool::new(false),
             fallback_failed: AtomicBool::new(false),
@@ -114,6 +120,7 @@ impl Manager {
     pub async fn forward(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
         let shared: Arc<[u8]> = Arc::from(query);
         let mut attempts = JoinSet::new();
+        let mut legacy_attempts = Vec::new();
         let mut next = 0;
         // When to start the next upstream while earlier ones are pending.
         let mut hedge_at = None;
@@ -130,6 +137,10 @@ impl Manager {
                 };
                 let index = next;
                 next += 1;
+                let Ok(permit) = self.attempts.clone().try_acquire_owned() else {
+                    // Never queue unbudgeted work behind detached attempts.
+                    continue;
+                };
                 log::debug!(
                     "trying upstream {} (timeout {}ms)",
                     entry.name,
@@ -142,8 +153,15 @@ impl Manager {
                 if entry.timeout_ms > 0 && racer.is_some_and(|racer| racer.timeout_ms > 0) {
                     hedge_at = Some(Instant::now() + HEDGE_DELAY);
                 }
+                let is_legacy = matches!(entry.backend, Backend::Legacy { .. });
                 let (entry, query) = (entry.clone(), shared.clone());
-                attempts.spawn(async move { (index, entry.run(&query, client_tcp).await) });
+                let abort = attempts.spawn(async move {
+                    let _permit = permit;
+                    (index, entry.run(&query, client_tcp).await)
+                });
+                if is_legacy {
+                    legacy_attempts.push(abort);
+                }
                 continue;
             }
 
@@ -182,8 +200,16 @@ impl Manager {
                 log::debug!("upstream {name}: rejected response: {err}");
                 continue;
             }
-            // Losing attempts run on to their own deadline, so a stalled
-            // encrypted channel still invalidates and backs off.
+            if response[3] & 0x0f == 2 {
+                log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
+                continue;
+            }
+            // Legacy attempts have no connection health to maintain. Encrypted
+            // losers keep their budget until their own deadline so stalled
+            // channels still invalidate and back off without unbounded work.
+            for attempt in legacy_attempts {
+                attempt.abort();
+            }
             attempts.detach_all();
             let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
             let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
@@ -203,6 +229,7 @@ impl Manager {
     }
 
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
+        let _permit = self.attempts.try_acquire().ok()?;
         // Snapshot and drop the guard before any await: the read guard is not
         // Send, and holding it would also block the watchdog's refresh.
         let system_fallback: Vec<SocketAddr> = self.system_fallback.read().unwrap().clone();
@@ -225,6 +252,10 @@ impl Manager {
                     // returns directly and must validate for itself.
                     if let Err(err) = crate::wire::validate_response(query, &response) {
                         log::debug!("system DNS fallback {server}: rejected response: {err}");
+                        continue;
+                    }
+                    if response[3] & 0x0f == 2 {
+                        log::debug!("system DNS fallback {server}: SERVFAIL");
                         continue;
                     }
                     if self.fallback_failed.swap(false, Ordering::Relaxed) {
@@ -567,6 +598,98 @@ mod tests {
 
         let mut buf = [0u8; 512];
         assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn servfail_racer_does_not_discard_a_successful_primary() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let backup = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backup_addr = backup.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut primary_query = [0u8; 512];
+            let (n, peer) = primary.recv_from(&mut primary_query).await.unwrap();
+            let mut backup_query = [0u8; 512];
+            let (m, backup_peer) = backup.recv_from(&mut backup_query).await.unwrap();
+            backup_query[2] |= 0x80;
+            backup_query[3] = 0x82;
+            backup
+                .send_to(&backup_query[..m], backup_peer)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            primary_query[2] |= 0x80;
+            primary.send_to(&primary_query[..n], peer).await.unwrap();
+        });
+        let manager = Manager::new(
+            vec![
+                test_upstream("slow success", primary_addr, 1000),
+                test_upstream("fast SERVFAIL", backup_addr, 1000),
+            ],
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        let response = manager.forward(&TEST_QUERY, false).await.unwrap();
+        assert_eq!(response[3] & 0x0f, 0);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn negative_answers_are_not_treated_as_server_failure() {
+        for rcode in [0, 3, 5] {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = server.local_addr().unwrap();
+            let responder = tokio::spawn(async move {
+                let mut query = [0u8; 512];
+                let (n, peer) = server.recv_from(&mut query).await.unwrap();
+                query[2] |= 0x80;
+                query[3] = 0x80 | rcode;
+                server.send_to(&query[..n], peer).await.unwrap();
+            });
+            let manager =
+                Manager::new(vec![test_upstream("answer", addr, 1000)], &[], Vec::new()).unwrap();
+            let response = manager.forward(&TEST_QUERY, false).await.unwrap();
+            assert_eq!(response[3] & 0x0f, rcode);
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn losing_legacy_attempts_release_their_budget_before_the_timeout() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (healthy_addr, healthy) = udp_responder(false).await;
+        let manager = Manager::new(
+            vec![
+                test_upstream("blackhole", blackhole.local_addr().unwrap(), 5000),
+                test_upstream("healthy", healthy_addr, 5000),
+            ],
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        manager.forward(&TEST_QUERY, false).await.unwrap();
+        healthy.await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(manager.attempts.available_permits(), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn exhausted_attempt_budget_never_opens_an_upstream_socket() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(
+            vec![test_upstream("blocked", server.local_addr().unwrap(), 1000)],
+            &[],
+            vec![server.local_addr().unwrap()],
+        )
+        .unwrap();
+        let _reserved = manager
+            .attempts
+            .acquire_many(MAX_ATTEMPTS as u32)
+            .await
+            .unwrap();
+        assert!(manager.forward(&TEST_QUERY, false).await.is_none());
+        assert!(server.try_recv_from(&mut [0; 512]).is_err());
     }
 
     #[tokio::test]

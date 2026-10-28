@@ -549,8 +549,12 @@ mod tests {
         crate::wire::validate_response(&query, &response).unwrap();
         responder.await.unwrap();
         assert!(channel.state.lock().await.exchange.is_some());
+        assert_eq!(
+            manager.attempts.available_permits(),
+            super::super::MAX_ATTEMPTS - 1
+        );
 
-        // The raced-out attempt keeps running and hits its own deadline.
+        // The raced-out attempt keeps its budget and hits its own deadline.
         tokio::time::sleep(Duration::from_millis(800)).await;
         let state = channel.state.lock().await;
         assert!(
@@ -562,6 +566,10 @@ mod tests {
             "silent upstream must back off"
         );
         drop(state);
+        assert_eq!(
+            manager.attempts.available_permits(),
+            super::super::MAX_ATTEMPTS
+        );
         background.abort();
     }
 
