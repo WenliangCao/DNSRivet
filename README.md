@@ -18,7 +18,7 @@ One binary. One runtime thread. No telemetry. No control plane.
 
 - DoH, DoH3, DoT, DoQ, and conventional UDP/TCP upstreams
 - Persistent multiplexed encrypted connections
-- Ordered failover, per-upstream timeouts, and exponential reconnect backoff
+- Ordered failover with hedging, per-upstream timeouts, and exponential reconnect backoff
 - Direct fallback to the pre-takeover system DNS after all configured upstreams fail
 - Bootstrap resolution that bypasses the system resolver to prevent loops
 - Local UDP and TCP listeners with bounded concurrency
@@ -253,6 +253,15 @@ and sustained load hangs queries one by one until the in-flight budget of 512
 is exhausted and further UDP queries are dropped. Use it only when the first
 upstream's reachability is fully trusted.
 
+Failover is hedged: when an upstream has not answered within 300 ms, the next
+upstream is queried in parallel and the first valid answer wins; the slow
+attempt keeps running to its own timeout, so a stalled encrypted connection
+still backs off and later queries go straight to the next upstream. Upstreams
+with `timeout = 0` are never raced. Hedging means a later upstream can see a
+query the first one would have answered slowly, so order upstreams you are
+equally willing to send queries to. Listing the same resolver as `doh3` and
+then `doh` keeps queries answered over TCP when a network drops UDP/443.
+
 See [`example.config.toml`](example.config.toml) for the complete annotated
 example. DoH and DoH3 default to port 443; DoT and DoQ default to 853;
 conventional DNS defaults to 53.
@@ -312,7 +321,7 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 
 - 支持 DoH、DoH3、DoT、DoQ 和传统 UDP/TCP 上游
 - 加密连接持久化并复用
-- 顺序故障转移、独立超时和指数退避重连
+- 带对冲的顺序故障转移、独立超时和指数退避重连
 - 所有配置上游失败后，直接回退到接管前的系统 DNS
 - bootstrap 解析绕过系统 resolver，避免 DNS 自环
 - UDP/TCP 本地监听与有界并发
@@ -494,6 +503,13 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 危险的高级选项：第一上游黑洞（丢包不拒绝）时，该查询不会进入后续上游或系统
 回退，持续请求会逐个挂起并最终耗尽 512 项并发额度，导致后续 UDP 查询被丢弃。
 仅在完全信任首上游可达性时使用。
+
+故障转移带对冲：某个上游 300 毫秒内未应答时，会并发查询下一个上游，取先到的
+合法应答；慢的那次请求会继续跑到它自己的超时，所以卡住的加密连接仍会断开并
+退避，之后的查询直接走下一个上游。`timeout = 0` 的上游不参与对冲。对冲意味着
+后续上游可能收到首上游本可以慢速应答的查询，因此只把同样愿意发送查询的上游
+排在后面。把同一解析服务依次配置为 `doh3` 和 `doh`，可以在网络丢弃 UDP/443
+时继续通过 TCP 应答。
 
 缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本或
 `RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别和

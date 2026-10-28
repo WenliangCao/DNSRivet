@@ -16,7 +16,8 @@ port = 53
 #       tls:// -> dot, bare IP -> legacy)
 # endpoint: URL for doh/doh3; host[:port] or IP[:port] for dot/doq/legacy
 #           (default ports: doh/doh3 443, dot/doq 853, legacy 53)
-# timeout: milliseconds before failing over to the next upstream.
+# timeout: milliseconds before failing over to the next upstream. An upstream
+#          silent for 300ms is additionally raced against the next one.
 #          omitted = 5000. An explicit 0 disables the timeout entirely and is
 #          a dangerous advanced option: if the first upstream black-holes
 #          traffic, queries hang there and never reach later upstreams.

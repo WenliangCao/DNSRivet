@@ -403,6 +403,8 @@ mod tests {
     struct TestTransport {
         closed: bool,
         failures: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
+        /// Accept requests and never answer, like a path dropping UDP/443.
+        silent: bool,
     }
 
     impl Stream for TestTransport {
@@ -419,6 +421,9 @@ mod tests {
 
     impl DnsRequestSender for TestTransport {
         fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
+            if self.silent {
+                return Box::pin(std::future::pending()).into();
+            }
             if let Some(failures) = &self.failures {
                 let (release, pending) = oneshot::channel();
                 failures.send(release).unwrap();
@@ -495,6 +500,69 @@ mod tests {
             };
             channel.query(&encrypted_test_query(0), deadline).await
         })
+    }
+
+    #[tokio::test]
+    async fn raced_out_encrypted_upstream_still_backs_off_at_its_deadline() {
+        let standby = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let standby_addr = standby.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut message = [0u8; 512];
+            let (n, peer) = standby.recv_from(&mut message).await.unwrap();
+            message[2] |= 0x80;
+            standby.send_to(&message[..n], peer).await.unwrap();
+        });
+        let primary = Upstream {
+            name: "silent DoH3".into(),
+            proto: Proto::Doh3,
+            host: "resolver.test".into(),
+            port: 443,
+            path: "/dns-query".into(),
+            bootstrap_ip: Some("192.0.2.53".parse().unwrap()),
+            timeout_ms: 600,
+            ip_stack: IpStack::V4,
+        };
+        let standby = Upstream {
+            name: "standby".into(),
+            proto: Proto::Legacy,
+            host: standby_addr.ip().to_string(),
+            port: standby_addr.port(),
+            path: String::new(),
+            bootstrap_ip: Some(standby_addr.ip()),
+            timeout_ms: 600,
+            ip_stack: IpStack::V4,
+        };
+        let manager = Manager::new(vec![primary, standby], &[], Vec::new()).unwrap();
+        let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+            unreachable!();
+        };
+        let transport = TestTransport {
+            silent: true,
+            ..TestTransport::default()
+        };
+        let (exchange, background) = DnsExchange::from_stream::<_, TokioTime>(transport);
+        let background = tokio::spawn(background);
+        channel.state.lock().await.store(exchange);
+
+        let query = encrypted_test_query(0).to_vec().unwrap();
+        let response = manager.forward(&query, false).await.unwrap();
+        crate::wire::validate_response(&query, &response).unwrap();
+        responder.await.unwrap();
+        assert!(channel.state.lock().await.exchange.is_some());
+
+        // The raced-out attempt keeps running and hits its own deadline.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let state = channel.state.lock().await;
+        assert!(
+            state.exchange.is_none(),
+            "silent connection must be dropped"
+        );
+        assert!(
+            state.cooldown_until.is_some(),
+            "silent upstream must back off"
+        );
+        drop(state);
+        background.abort();
     }
 
     #[tokio::test]

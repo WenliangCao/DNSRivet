@@ -9,10 +9,18 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
+
+/// How long an upstream may stay silent before the next one is queried in
+/// parallel. Well above a warm DoH/DoH3 round trip, so healthy upstreams
+/// rarely trigger it, yet far below the default 5s timeout that would
+/// otherwise stall every query while a transport is silently dropped (e.g.
+/// UDP/443 loss breaking DoH3 while DoH still works).
+const HEDGE_DELAY: Duration = Duration::from_millis(300);
 
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
-    entries: Vec<Entry>,
+    entries: Vec<Arc<Entry>>,
     /// Runtime-refreshable: the watchdog swaps in the current network's DNS
     /// when it recovers a lost takeover. Never persisted to the backup.
     system_fallback: std::sync::RwLock<Vec<SocketAddr>>,
@@ -79,11 +87,11 @@ impl Manager {
                     deny.clone(),
                 )),
             };
-            entries.push(Entry {
+            entries.push(Arc::new(Entry {
                 name,
                 timeout_ms,
                 backend,
-            });
+            }));
         }
         Ok(Self {
             entries,
@@ -100,56 +108,94 @@ impl Manager {
     }
 
     /// Try each upstream in config order; None when all of them failed.
-    /// `client_tcp` enables the TC-triggered TCP retry on legacy upstreams.
+    /// An upstream silent for [`HEDGE_DELAY`] is raced against the next one
+    /// rather than waited out. `client_tcp` enables the TC-triggered TCP
+    /// retry on legacy upstreams.
     pub async fn forward(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
-        // Encrypted transports need the parsed message (they re-serialize with
-        // their own IDs); parse once, lazily, and reuse across attempts.
-        let mut parsed: Option<Message> = None;
+        let shared: Arc<[u8]> = Arc::from(query);
+        let mut attempts = JoinSet::new();
+        let mut next = 0;
+        // When to start the next upstream while earlier ones are pending.
+        let mut hedge_at = None;
 
-        for entry in &self.entries {
-            log::debug!(
-                "trying upstream {} (timeout {}ms)",
-                entry.name,
-                entry.timeout_ms
-            );
-            // Encrypted channels enforce this deadline themselves so their
-            // invalidation stays generation-precise; the outer timeout below
-            // is a pure scheduling backstop with no channel side effects.
-            let deadline = (entry.timeout_ms > 0)
-                .then(|| Instant::now() + Duration::from_millis(entry.timeout_ms));
-            let attempt = entry.attempt(query, client_tcp, &mut parsed, deadline);
-            let result = match entry.outer_timeout() {
-                Some(limit) => match tokio::time::timeout(limit, attempt).await {
-                    Ok(result) => result,
-                    Err(_) => Err(format!("timeout after {}ms", entry.timeout_ms)),
-                },
-                None => attempt.await,
+        loop {
+            let due = hedge_at.is_some_and(|at| Instant::now() >= at);
+            if attempts.is_empty() || due {
+                hedge_at = None;
+                let Some(entry) = self.entries.get(next) else {
+                    if attempts.is_empty() {
+                        break;
+                    }
+                    continue;
+                };
+                let index = next;
+                next += 1;
+                log::debug!(
+                    "trying upstream {} (timeout {}ms)",
+                    entry.name,
+                    entry.timeout_ms
+                );
+                // With `timeout = 0` an upstream is waited on forever by
+                // contract, so it is never raced either.
+                if entry.timeout_ms > 0 && next < self.entries.len() {
+                    hedge_at = Some(Instant::now() + HEDGE_DELAY);
+                }
+                let (entry, query) = (entry.clone(), shared.clone());
+                attempts.spawn(async move { (index, entry.run(&query, client_tcp).await) });
+                continue;
+            }
+
+            let hedge = async {
+                match hedge_at {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
             };
-            match result {
-                Ok(mut response) => {
-                    // Reject before touching recovery flags, the ID, or the
-                    // cache: an answer to the wrong question is an upstream
-                    // failure, not a recovery (RFC 5452).
-                    if let Err(err) = crate::wire::validate_response(query, &response) {
-                        log::debug!("upstream {}: rejected response: {err}", entry.name);
+            let (index, result) = tokio::select! {
+                Some(joined) = attempts.join_next() => match joined {
+                    Ok(finished) => finished,
+                    Err(err) => {
+                        log::debug!("upstream attempt aborted: {err}");
                         continue;
                     }
-                    let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
-                    let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
-                    if fallback_was_active {
-                        log::info!("configured DNS upstreams recovered; system fallback inactive");
-                    } else if fallback_had_failed {
-                        log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
-                    }
-                    if response.len() >= 2 {
-                        // Transports may rewrite the DNS ID (DoQ pins it to 0);
-                        // hand the client back its own.
-                        response[..2].copy_from_slice(&query[..2]);
-                    }
-                    return Some(response);
+                },
+                () = hedge => {
+                    let slow = &self.entries[next - 1].name;
+                    log::debug!("upstream {slow} slow; racing the next upstream");
+                    continue;
                 }
-                Err(err) => log::debug!("upstream {}: {err}", entry.name),
+            };
+            let name = &self.entries[index].name;
+            let mut response = match result {
+                Ok(response) => response,
+                Err(err) => {
+                    log::debug!("upstream {name}: {err}");
+                    continue;
+                }
+            };
+            // Reject before touching recovery flags, the ID, or the cache: an
+            // answer to the wrong question is an upstream failure, not a
+            // recovery (RFC 5452).
+            if let Err(err) = crate::wire::validate_response(query, &response) {
+                log::debug!("upstream {name}: rejected response: {err}");
+                continue;
             }
+            // Losing attempts run on to their own deadline, so a stalled
+            // encrypted channel still invalidates and backs off.
+            attempts.detach_all();
+            let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
+            let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
+            if fallback_was_active {
+                log::info!("configured DNS upstreams recovered; system fallback inactive");
+            } else if fallback_had_failed {
+                log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
+            }
+            if response.len() >= 2 {
+                // Transports may rewrite the DNS ID (DoQ pins it to 0);
+                // hand the client back its own.
+                response[..2].copy_from_slice(&query[..2]);
+            }
+            return Some(response);
         }
         self.forward_to_system(query, client_tcp).await
     }
@@ -210,11 +256,25 @@ impl Entry {
         })
     }
 
+    async fn run(&self, query: &[u8], client_tcp: bool) -> Result<Vec<u8>, String> {
+        // Encrypted channels enforce this deadline themselves so their
+        // invalidation stays generation-precise; the outer timeout below is a
+        // pure scheduling backstop with no channel side effects.
+        let deadline =
+            (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
+        let attempt = self.attempt(query, client_tcp, deadline);
+        match self.outer_timeout() {
+            Some(limit) => tokio::time::timeout(limit, attempt)
+                .await
+                .unwrap_or_else(|_| Err(format!("timeout after {}ms", self.timeout_ms))),
+            None => attempt.await,
+        }
+    }
+
     async fn attempt(
         &self,
         query: &[u8],
         client_tcp: bool,
-        parsed: &mut Option<Message>,
         deadline: Option<Instant>,
     ) -> Result<Vec<u8>, String> {
         match &self.backend {
@@ -239,18 +299,13 @@ impl Entry {
                 Err(last_err.unwrap_or_else(|| "no addresses".into()))
             }
             Backend::Encrypted(channel) => {
-                let message = match parsed {
-                    Some(message) => message,
-                    None => {
-                        let message = Message::from_vec(query)
-                            .map_err(|e| format!("unparseable query: {e}"))?;
-                        if !safe_encrypted_query(&message) {
-                            return Err("unsupported query shape for encrypted forwarding".into());
-                        }
-                        parsed.insert(message)
-                    }
-                };
-                channel.query(message, deadline).await
+                // Encrypted transports re-serialize with their own IDs.
+                let message =
+                    Message::from_vec(query).map_err(|e| format!("unparseable query: {e}"))?;
+                if !safe_encrypted_query(&message) {
+                    return Err("unsupported query shape for encrypted forwarding".into());
+                }
+                channel.query(&message, deadline).await
             }
         }
     }
@@ -484,6 +539,56 @@ mod tests {
 
         let mut buf = [0u8; 512];
         assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn silent_upstream_is_raced_well_before_its_timeout() {
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (healthy_addr, healthy) = udp_responder(false).await;
+        let manager = Manager::new(
+            vec![
+                test_upstream("blackhole", blackhole.local_addr().unwrap(), 5000),
+                test_upstream("healthy", healthy_addr, 5000),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let response = manager.forward(&TEST_QUERY, false).await.unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(&response[..2], &TEST_QUERY[..2]);
+        assert!(elapsed >= HEDGE_DELAY, "raced too early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "waited out: {elapsed:?}");
+        healthy.await.unwrap();
+
+        let mut buf = [0u8; 512];
+        assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn answering_upstream_is_not_raced() {
+        let (primary_addr, primary) = udp_responder(false).await;
+        let standby = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(
+            vec![
+                test_upstream("primary", primary_addr, 5000),
+                test_upstream("standby", standby.local_addr().unwrap(), 5000),
+            ],
+            &["127.0.0.1:5354".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        manager.forward(&TEST_QUERY, false).await.unwrap();
+        primary.await.unwrap();
+        tokio::time::sleep(HEDGE_DELAY + Duration::from_millis(100)).await;
+        let mut buf = [0u8; 512];
+        assert!(
+            standby.try_recv_from(&mut buf).is_err(),
+            "standby must not see queries the primary answered"
+        );
     }
 
     #[tokio::test]
