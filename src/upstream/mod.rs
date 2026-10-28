@@ -816,6 +816,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promoting_a_slow_attempt_to_a_task_never_resends_it() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (backup_addr, backup) = udp_responder(false).await;
+        let manager = Manager::new(
+            vec![
+                test_upstream("slow", primary.local_addr().unwrap(), 5000),
+                test_upstream("backup", backup_addr, 5000),
+            ],
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        manager.forward(&TEST_QUERY, false).await.unwrap();
+        backup.await.unwrap();
+        tokio::task::yield_now().await;
+        let mut packet = [0; 512];
+        assert!(primary.try_recv_from(&mut packet).is_ok());
+        assert!(
+            primary.try_recv_from(&mut packet).is_err(),
+            "moving the future must not restart the request"
+        );
+        assert_eq!(manager.attempts.available_permits(), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_inline_multi_upstream_attempt_releases_its_budget() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backup = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(
+            vec![
+                test_upstream("slow", primary.local_addr().unwrap(), 5000),
+                test_upstream("backup", backup.local_addr().unwrap(), 5000),
+            ],
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                manager.forward(&TEST_QUERY, false)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(manager.attempts.available_permits(), MAX_ATTEMPTS);
+        assert!(backup.try_recv_from(&mut [0; 512]).is_err());
+    }
+
+    #[tokio::test]
     async fn budget_blocked_hedge_still_tries_the_backup_after_primary_timeout() {
         let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (healthy_addr, healthy) = udp_responder(false).await;
