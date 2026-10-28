@@ -200,6 +200,61 @@ mod tests {
     }
 
     #[test]
+    fn edns_and_non_edns_clients_never_share_wire_responses() {
+        let plain = wire::parse_query_meta(&query(1)).unwrap();
+        let edns = wire::parse_query_meta(&edns_query(2, 1232)).unwrap();
+        let mut with_opt = response(2, 60);
+        with_opt[11] = 1;
+        with_opt.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+
+        for edns_first in [false, true] {
+            let cache = Cache::new(true, 2);
+            if edns_first {
+                cache.insert(&edns, &with_opt);
+                assert!(cache.get(&plain, [0, 3]).is_none());
+            } else {
+                cache.insert(&plain, &response(1, 60));
+                assert!(cache.get(&edns, [0, 3]).is_none());
+            }
+            cache.insert(&plain, &response(1, 60));
+            cache.insert(&edns, &with_opt);
+            assert_eq!(cache.get(&plain, [0, 4]).unwrap()[11], 0);
+            assert_eq!(cache.get(&edns, [0, 5]).unwrap()[11], 1);
+        }
+    }
+
+    #[test]
+    fn short_negative_answers_expire_and_zero_ttl_never_enters_cache() {
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        for ttl in [0u32, 1] {
+            let mut negative = query(1);
+            negative[2] = 0x81;
+            negative[3] = 0x83;
+            negative[9] = 1;
+            negative.extend_from_slice(&[0xc0, 0x0c, 0, 6, 0, 1]);
+            negative.extend_from_slice(&ttl.to_be_bytes());
+            negative.extend_from_slice(&[0, 24, 0xc0, 0x0c, 0xc0, 0x0c]);
+            negative.extend_from_slice(&[0; 16]);
+            negative.extend_from_slice(&ttl.to_be_bytes());
+            let cache = Cache::new(true, 1);
+            cache.insert(&meta, &negative);
+            if ttl > 0 {
+                assert!(cache.get(&meta, [0, 2]).is_some());
+                cache
+                    .entries
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .get_mut(&meta.key)
+                    .unwrap()
+                    .stored_at = Instant::now() - Duration::from_secs(1);
+            }
+            assert!(cache.get(&meta, [0, 3]).is_none());
+        }
+    }
+
+    #[test]
     fn keeps_cached_id_and_ttls_unchanged_between_clients() {
         let meta = wire::parse_query_meta(&query(1)).unwrap();
         let mut original = response(1, 120);

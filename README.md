@@ -272,7 +272,9 @@ conventional DNS defaults to 53.
 The cache accepts standard single-question recursive queries. Queries with
 EDNS options, TSIG, a non-zero EDNS version, or `RD=0` bypass the cache and
 are still forwarded normally. Cache keys include the canonical name, record
-type, class, and DNSSEC request bit.
+type, class, EDNS presence, and DNSSEC request bits. Negative answers expire at
+the shorter of SOA TTL and SOA.MINIMUM, capped at 600 seconds without extending
+short TTLs; a zero TTL is not cached.
 
 A QUERY carrying more than one question is answered locally with a
 header-only FORMERR and never forwarded (RFC 9619). Question-less queries
@@ -515,8 +517,9 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 时继续通过 TCP 应答。
 
 缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本或
-`RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别和
-DNSSEC 请求位。
+`RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别、
+是否使用 EDNS 和 DNSSEC 请求位。负缓存使用 SOA TTL 与 SOA.MINIMUM 中较小的值，
+最多缓存 600 秒，不延长短 TTL；TTL 为零时不缓存。
 
 携带多个 question 的查询会在本地直接返回仅含报文头的 FORMERR，不会被转发
 （RFC 9619）。不含 question 的查询（如 RFC 7873 Cookie 探询）只会转发给

@@ -15,6 +15,8 @@ pub struct QueryKey {
     pub qtype: u16,
     pub qclass: u16,
     pub do_bit: bool,
+    /// OPT negotiation is per client; non-EDNS clients must not receive OPT.
+    pub edns: bool,
     /// AD/CD request bits. They can change DNSSEC-aware upstream responses.
     pub dnssec_header_bits: u8,
 }
@@ -81,6 +83,7 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
             qtype,
             qclass,
             do_bit,
+            edns: saw_opt,
             dnssec_header_bits: message[3] & 0x30,
         },
         udp_size,
@@ -154,8 +157,8 @@ pub fn adjust_ttls(message: &mut [u8], elapsed_secs: u64) -> bool {
 /// Determine how long a successful response is safe to cache.
 ///
 /// Positive answers use the minimum answer/authority TTL, capped at one day.
-/// NXDOMAIN/NODATA uses RFC 2308's min(SOA TTL, SOA.MINIMUM), clamped to the
-/// project's 60–600 second negative-cache window.
+/// NXDOMAIN/NODATA uses RFC 2308's min(SOA TTL, SOA.MINIMUM), capped at
+/// 600 seconds. A zero TTL is never cached, and short TTLs are not extended.
 pub fn cache_ttl(message: &[u8], query_type: u16) -> Option<u32> {
     if message.len() < HEADER_LEN || message[2] & 0x80 == 0 || message[2] & 0x02 != 0 {
         return None;
@@ -203,7 +206,7 @@ pub fn cache_ttl(message: &[u8], query_type: u16) -> Option<u32> {
         if has_cname {
             ttl = ttl.min(positive_min?);
         }
-        return Some(ttl.clamp(60, 600));
+        return (ttl > 0).then_some(ttl.min(600));
     }
 
     let ttl = positive_min?;
@@ -524,9 +527,20 @@ mod tests {
     }
 
     #[test]
-    fn clamps_rfc2308_negative_ttl() {
-        assert_eq!(cache_ttl(&negative_response(30, 15), 1), Some(60));
-        assert_eq!(cache_ttl(&negative_response(1200, 900), 1), Some(600));
+    fn respects_negative_ttl_expiry_and_only_caps_the_upper_bound() {
+        for (soa_ttl, minimum, expected) in [
+            (0, 60, None),
+            (60, 0, None),
+            (1, 60, Some(1)),
+            (30, 15, Some(15)),
+            (1200, 900, Some(600)),
+        ] {
+            for rcode in [0, 3] {
+                let mut response = negative_response(soa_ttl, minimum);
+                response[3] = 0x80 | rcode;
+                assert_eq!(cache_ttl(&response, 1), expected);
+            }
+        }
     }
 
     #[test]
