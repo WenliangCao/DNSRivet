@@ -483,6 +483,7 @@ mod tests {
         failures: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
         /// Accept requests and never answer, like a path dropping UDP/443.
         silent: bool,
+        wrong_question: bool,
     }
 
     impl Stream for TestTransport {
@@ -512,6 +513,9 @@ mod tests {
                 .into();
             }
             let (mut message, _) = request.into_parts();
+            if self.wrong_question {
+                message.queries_mut()[0].set_name(Name::from_ascii("wrong.invalid.").unwrap());
+            }
             // Model DoQ's zero ID so the manager must restore the client's ID.
             message.set_message_type(MessageType::Response).set_id(0);
             Box::pin(async move { DnsResponse::from_message(message) }).into()
@@ -685,6 +689,24 @@ mod tests {
                 drop(manager);
                 background.await.unwrap().unwrap();
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn encrypted_mismatched_questions_are_rejected_on_both_dispatch_paths() {
+        for upstreams in [1, 2] {
+            let (mut manager, background) = test_manager(TestTransport {
+                wrong_question: true,
+                ..TestTransport::default()
+            })
+            .await;
+            if upstreams == 2 {
+                manager.entries.push(manager.entries[0].clone());
+            }
+            let query = encrypted_test_query(0).to_vec().unwrap();
+            assert!(manager.forward(&query, false).await.is_none());
+            drop(manager);
+            background.await.unwrap().unwrap();
         }
     }
 

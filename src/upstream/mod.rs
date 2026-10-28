@@ -162,7 +162,8 @@ impl Manager {
             let _permit = self.attempts.try_acquire().ok()?;
             self.configured_answer(&entry.name, query, entry.run(&request, client_tcp).await)
         } else {
-            Box::pin(self.forward_hedged(Arc::new(request.into_owned()), client_tcp)).await
+            self.forward_hedged(Arc::new(request.into_owned()), client_tcp)
+                .await
         };
         match response {
             Some(response) => Some(response),
@@ -216,22 +217,37 @@ impl Manager {
                 }
                 let is_legacy = matches!(entry.backend, Backend::Legacy { .. });
                 let (entry, query) = (entry.clone(), shared.clone());
-                let abort = attempts.spawn(async move {
+                let mut attempt = Box::pin(async move {
                     let _permit = permit;
                     (index, entry.run(&query, client_tcp).await)
                 });
+                if attempts.is_empty() {
+                    // Poll in the caller until we actually need a race. The
+                    // owned, pinned future can then move unchanged into a task;
+                    // no query is restarted and its original deadline is kept.
+                    let completed = tokio::select! {
+                        biased;
+                        finished = &mut attempt => Some(finished),
+                        () = wait_for_hedge(hedge_at) => None,
+                    };
+                    if let Some((_, result)) = completed {
+                        if let Some(response) = self.configured_answer(
+                            &self.entries[index].name,
+                            shared.bytes.as_ref(),
+                            result,
+                        ) {
+                            return Some(response);
+                        }
+                        continue;
+                    }
+                }
+                let abort = attempts.spawn(attempt);
                 if is_legacy {
                     legacy_attempts.push(abort);
                 }
                 continue;
             }
 
-            let hedge = async {
-                match hedge_at {
-                    Some(at) => tokio::time::sleep_until(at.into()).await,
-                    None => std::future::pending().await,
-                }
-            };
             let (index, result) = tokio::select! {
                 Some(joined) = attempts.join_next() => match joined {
                     Ok(finished) => finished,
@@ -240,7 +256,7 @@ impl Manager {
                         continue;
                     }
                 },
-                () = hedge => {
+                () = wait_for_hedge(hedge_at) => {
                     let slow = &self.entries[next - 1].name;
                     log::debug!("upstream {slow} slow; racing the next upstream");
                     continue;
@@ -275,11 +291,8 @@ impl Manager {
                 return None;
             }
         };
-        // Reject before touching recovery flags, the ID, or the cache.
-        if let Err(err) = crate::wire::validate_response(query, &response) {
-            log::debug!("upstream {name}: rejected response: {err}");
-            return None;
-        }
+        // Every backend validates before returning from Entry::attempt. Do not
+        // parse the same question again here; this layer only selects answers.
         if response[3] & 0x0f == 2 {
             log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
             return None;
@@ -316,12 +329,7 @@ impl Manager {
             let attempt = legacy::query(*server, query, client_tcp);
             match tokio::time::timeout(Duration::from_secs(2), attempt).await {
                 Ok(Ok(response)) => {
-                    // Same gate as the configured-upstream path: this loop
-                    // returns directly and must validate for itself.
-                    if let Err(err) = crate::wire::validate_response(query, &response) {
-                        log::debug!("system DNS fallback {server}: rejected response: {err}");
-                        continue;
-                    }
+                    // legacy::query already checks the ID and question, including TCP retries.
                     if response[3] & 0x0f == 2 {
                         log::debug!("system DNS fallback {server}: SERVFAIL");
                         continue;
@@ -339,6 +347,13 @@ impl Manager {
             log::warn!("system DNS fallback also failed; returning SERVFAIL");
         }
         None
+    }
+}
+
+async fn wait_for_hedge(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -406,7 +421,12 @@ impl Entry {
                 }
                 Err(last_err.unwrap_or_else(|| "no addresses".into()))
             }
-            Backend::Encrypted(channel) => channel.query(request.message()?, deadline).await,
+            Backend::Encrypted(channel) => {
+                let response = channel.query(request.message()?, deadline).await?;
+                crate::wire::validate_response(query, &response)
+                    .map_err(|err| format!("rejected response: {err}"))?;
+                Ok(response)
+            }
         }
     }
 }
