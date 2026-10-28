@@ -28,20 +28,26 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
-## 0.3.6 changes
+## 0.4.0 changes
 
-- Hedged failover: when an upstream has not answered within 300 ms, the next
-  upstream is queried in parallel and the first valid answer wins. A DoH3
-  upstream on a network that drops UDP/443 no longer stalls queries for the
-  full timeout when a DoH upstream follows it
-- Bootstrap resolution retries over TCP when UDP is lost or truncated and
-  queries A and AAAA in parallel, bounding a failed lookup at 12 s instead
-  of 24 s
-- When every bootstrap server fails, the last known upstream addresses are
-  reused for up to 24 hours instead of failing outright; lookups per host are
-  coalesced and paused for 30 s after a failure
-- Bootstrap answers received over TCP must match the question asked
-- Update tokio to 1.53.3 for RUSTSEC-2026-0386
+- Move encrypted transports to `hickory-net` 0.26.3 and remove every RustSec
+  audit exception
+- Hedged failover ignores `SERVFAIL` racers, cancels losing legacy attempts,
+  and bounds all attempts with a shared 512-attempt budget; a hedge blocked by
+  the budget is deferred instead of skipping failover
+- Detect clipped UDP replies and retry over TCP for the full answer
+- Negative answers follow the SOA TTL and SOA.MINIMUM (capped at 600 s), zero
+  TTLs are not cached, and EDNS queries get separate cache entries
+- `start`, `stop`, `restart`, and `uninstall` are serialized across processes;
+  `stop` refuses to leave a network service pointing at a dead resolver
+- `restart --config` rolls back unless the system DNS takeover is verified,
+  including newly enabled network services
+- Reject legacy upstreams that resolve to DNSRivet itself, let channel
+  deadlines govern DoT timeouts, and install the PKG only on the startup volume
+- Fewer allocations per query, reused response buffers, and cached TTLs aged
+  once per second; repeatable local benchmarks in `scripts/benchmark-local.py`
+
+0.3.6 added hedged failover and bootstrap resolution that survives UDP loss.
 
 ## Runtime profile
 
@@ -372,17 +378,23 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
 
-## 0.3.6 更新
+## 0.4.0 更新
 
-- 故障转移支持对冲：某个上游 300 毫秒内未应答时，并发查询下一个上游，取先到的
-  合法应答。在丢弃 UDP/443 的网络上，DoH3 上游后面配有 DoH 上游时，查询不再
-  卡满整个超时
-- Bootstrap 解析在 UDP 丢包或截断时改用 TCP 重试，A 与 AAAA 并发查询，失败的
-  解析最长耗时从 24 秒降至 12 秒
-- 所有 bootstrap 服务器都失败时，最多沿用 24 小时内的上游旧地址，不再直接报错；
-  同一主机的解析会合并，失败后暂停 30 秒再重试
-- 通过 TCP 收到的 bootstrap 应答必须与所问问题一致
-- 将 tokio 更新至 1.53.3，修复 RUSTSEC-2026-0386
+- 加密传输迁移到 `hickory-net` 0.26.3，移除全部 RustSec 审计例外
+- 对冲故障转移忽略 `SERVFAIL` 应答，取消落败的 legacy 请求，所有尝试共用 512 项
+  预算；预算不足时推迟对冲，而不是跳过故障转移
+- 识别被截断的 UDP 应答，并通过 TCP 重试获取完整应答
+- 负缓存遵循 SOA TTL 与 SOA.MINIMUM（最长 600 秒），TTL 为零不缓存，带 EDNS 的
+  查询单独缓存
+- `start`、`stop`、`restart` 和 `uninstall` 跨进程串行执行；`stop` 不会让网络
+  服务继续指向已停止的 resolver
+- `restart --config` 必须验证系统 DNS 接管成功（包括新启用的网络服务），否则回滚
+- 拒绝解析到 DNSRivet 自身的 legacy 上游，DoT 超时改由通道截止时间控制，PKG
+  只允许安装到当前启动卷
+- 减少每次查询的内存分配，复用应答缓冲区，缓存 TTL 每秒只老化一次；新增
+  `scripts/benchmark-local.py` 可重复的本地性能测试
+
+0.3.6 已加入对冲故障转移，以及能承受 UDP 丢包的 bootstrap 解析。
 
 ## 运行开销
 
