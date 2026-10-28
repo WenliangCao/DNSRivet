@@ -233,6 +233,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clipping_rejects_a_question_pointing_into_removed_bytes() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let request = query_bytes(0x1234);
+        let sent = request.clone();
+        let responder = tokio::spawn(async move {
+            let mut received = [0; 512];
+            let (_, peer) = socket.recv_from(&mut received).await.unwrap();
+            let mut response = sent[..12].to_vec();
+            response[2] |= 0x80;
+            response[7] = 1;
+            // The question is valid before clipping but references NULL RDATA.
+            response.extend_from_slice(&[0xc0, 29, 0, 1, 0, 1]);
+            response.extend_from_slice(&[0, 0, 10, 0, 1, 0, 0, 0, 60, 0x0f, 0xe4, 1, b'a', 0]);
+            response.resize(4097, 0);
+            crate::wire::validate_response(&sent, &response).unwrap();
+            socket.send_to(&response, peer).await.unwrap();
+        });
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), query_udp(addr, &request))
+                .await
+                .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .contains("truncated udp response rejected")
+        );
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn failed_tcp_retry_is_an_upstream_failure_not_a_truncated_tcp_answer() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();

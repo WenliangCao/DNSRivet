@@ -61,6 +61,36 @@ Measured on Apple Silicon with macOS 27.0 using 200 cached queries and 40
 unique queries against a public DoH3 endpoint. These numbers describe one
 development machine and network path; they are not universal guarantees.
 
+### Repeatable local performance checks
+
+Compare two release binaries without changing system DNS or using public resolvers:
+
+```bash
+python3 scripts/benchmark-local.py \
+  --binary before=/path/to/before/dnsrivet \
+  --binary after=target/release/dnsrivet \
+  --queries 30000 --samples 3 --concurrency 1 32 \
+  --json target/benchmark.json
+```
+
+This measures cached UDP and one-/two-upstream legacy forwarding, alternating
+binary order. It reports p50/p95, throughput, daemon CPU time per query, and RSS.
+The Python load generator and OS scheduling can limit throughput; compare repeated
+runs on the same machine rather than treating these as maximum-capacity results.
+CPU time includes startup and shutdown, amortized over the query count.
+
+Focused in-process checks (prefix Cargo commands with `mbx` when using its cache):
+
+```bash
+mbx test --release benchmark_cache_hits -- --ignored --nocapture
+mbx test --release benchmark_wire_validation -- --ignored --nocapture
+mbx test --release benchmark_encrypted_dispatch -- --ignored --nocapture
+```
+
+The encrypted benchmark measures warm local dispatch, not TLS or network latency.
+The cache benchmark measures repeated hits; TTL aging happens once per elapsed
+whole second per entry, retaining its original expiration deadline.
+
 ## Build
 
 Requirements: macOS 11 or later and stable Rust.

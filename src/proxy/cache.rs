@@ -168,6 +168,37 @@ mod tests {
     }
 
     #[test]
+    fn repeated_aging_never_extends_the_original_expiry() {
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        let cache = Cache::new(true, 1);
+        cache.insert(&meta, &response(1, 2));
+        let initial = Instant::now() - Duration::from_millis(1500);
+        cache
+            .entries
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .get_mut(&meta.key)
+            .unwrap()
+            .aged_at = initial;
+        assert_eq!(
+            wire::cache_ttl(&cache.get(&meta, [0, 1]).unwrap(), 1),
+            Some(1)
+        );
+        {
+            let mut entries = cache.entries.as_ref().unwrap().lock().unwrap();
+            let entry = entries.get_mut(&meta.key).unwrap();
+            assert_eq!(
+                entry.aged_at + Duration::from_secs(u64::from(entry.ttl)),
+                initial + Duration::from_secs(2)
+            );
+            entry.aged_at -= Duration::from_millis(600);
+        }
+        assert!(cache.get(&meta, [0, 2]).is_none());
+    }
+
+    #[test]
     fn disabled_cache_is_a_noop() {
         let cache = Cache::new(false, 2);
         let query = query(1);
