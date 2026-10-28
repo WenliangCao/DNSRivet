@@ -9,11 +9,8 @@ use tokio::net::{TcpStream, UdpSocket};
 
 pub async fn query(addr: SocketAddr, query: &[u8], tcp_retry: bool) -> Result<Vec<u8>, String> {
     let response = query_udp(addr, query).await?;
-    if is_truncated(&response)
-        && tcp_retry
-        && let Ok(full) = query_tcp(addr, query).await
-    {
-        return Ok(full);
+    if is_truncated(&response) && tcp_retry {
+        return query_tcp(addr, query).await;
     }
     Ok(response)
 }
@@ -35,7 +32,10 @@ pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
     let sock = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
     sock.connect(addr).await.map_err(|e| e.to_string())?;
     sock.send(query).await.map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 4096];
+    // One extra byte detects OS-level truncation without a 64 KiB allocation
+    // per query. Never forward a clipped datagram with TC left clear.
+    const MAX_UDP_RESPONSE: usize = 4096;
+    let mut buf = vec![0u8; MAX_UDP_RESPONSE + 1];
     loop {
         let n = sock.recv(&mut buf).await.map_err(|e| e.to_string())?;
         // Accept only a datagram matching our ID and our question (RFC 5452);
@@ -45,6 +45,7 @@ pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
             && crate::wire::validate_response(query, &buf[..n]).is_ok()
         {
             buf.truncate(n);
+            crate::wire::truncate_to(&mut buf, MAX_UDP_RESPONSE);
             return Ok(buf);
         }
     }
@@ -165,6 +166,83 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(received, response);
+        responder.await.unwrap();
+    }
+
+    fn response_of_size(request: &[u8], size: usize) -> Vec<u8> {
+        let mut response = request.to_vec();
+        response[2] |= 0x80;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        // A NULL RR can carry arbitrary octets, including an exact 4096-byte packet.
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 10, 0, 1, 0, 0, 0, 60]);
+        let data_len = u16::try_from(size - response.len() - 2).unwrap();
+        response.extend_from_slice(&data_len.to_be_bytes());
+        response.resize(size, 0);
+        response
+    }
+
+    #[tokio::test]
+    async fn oversized_udp_responses_are_marked_truncated_and_tcp_gets_the_full_answer() {
+        for size in [4096, 4097, 6344] {
+            for tcp_retry in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let socket = UdpSocket::bind(addr).await.unwrap();
+                let request = query_bytes(0x1234);
+                let full = response_of_size(&request, size);
+                let sent = full.clone();
+                let responder = tokio::spawn(async move {
+                    let mut received = [0; 512];
+                    let (_, peer) = socket.recv_from(&mut received).await.unwrap();
+                    socket.send_to(&sent, peer).await.unwrap();
+                    if size > 4096 && tcp_retry {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        let len = stream.read_u16().await.unwrap();
+                        stream
+                            .read_exact(&mut received[..usize::from(len)])
+                            .await
+                            .unwrap();
+                        stream.write_u16(sent.len() as u16).await.unwrap();
+                        stream.write_all(&sent).await.unwrap();
+                    }
+                });
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    query(addr, &request, tcp_retry),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if size <= 4096 || tcp_retry {
+                    assert_eq!(response, full);
+                } else {
+                    assert!(is_truncated(&response));
+                    assert_eq!(response.len(), request.len());
+                    assert_eq!(&response[6..12], &[0; 6]);
+                    crate::wire::validate_response(&request, &response).unwrap();
+                }
+                responder.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tcp_retry_is_an_upstream_failure_not_a_truncated_tcp_answer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut received = [0; 512];
+            let (n, peer) = socket.recv_from(&mut received).await.unwrap();
+            received[2] |= 0x82;
+            socket.send_to(&received[..n], peer).await.unwrap();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            query(addr, &query_bytes(1), true),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
         responder.await.unwrap();
     }
 

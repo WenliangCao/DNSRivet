@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 /// Bound on concurrently in-flight queries (memory backstop).
 const MAX_INFLIGHT: usize = 512;
 const MAX_TCP_CONNECTIONS: usize = 256;
-const MAX_TCP_QUERY_SIZE: usize = 4096;
+const MAX_QUERY_SIZE: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(120);
@@ -195,7 +195,9 @@ async fn udp_loop(
     cache: Arc<Cache>,
     inflight: Arc<Semaphore>,
 ) {
-    let mut buf = vec![0u8; 4096];
+    // The extra byte detects datagrams clipped by recv_from. Oversized input
+    // must not be forwarded as if it were a complete, valid 4 KiB query.
+    let mut buf = vec![0u8; MAX_QUERY_SIZE + 1];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(received) => received,
@@ -204,7 +206,7 @@ async fn udp_loop(
                 continue;
             }
         };
-        if n < 12 {
+        if !(12..=MAX_QUERY_SIZE).contains(&n) {
             continue;
         }
         let Ok(permit) = inflight.clone().try_acquire_owned() else {
@@ -270,7 +272,7 @@ async fn tcp_conn(
             Ok(Ok(_)) => {}
         }
         let n = u16::from_be_bytes(lenbuf) as usize;
-        if !(12..=MAX_TCP_QUERY_SIZE).contains(&n) {
+        if !(12..=MAX_QUERY_SIZE).contains(&n) {
             return Ok(());
         }
         let mut query = vec![0u8; n];
