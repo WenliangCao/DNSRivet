@@ -627,6 +627,7 @@ mod tests {
         channel.state.lock().await.store(exchange);
 
         let query = encrypted_test_query(0).to_vec().unwrap();
+        let started = tokio::time::Instant::now();
         let response = manager.forward(&query, false).await.unwrap();
         crate::wire::validate_response(&query, &response).unwrap();
         responder.await.unwrap();
@@ -636,8 +637,9 @@ mod tests {
             super::super::MAX_ATTEMPTS - 1
         );
 
-        // The raced-out attempt keeps its budget and hits its own deadline.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        // The original deadline is 600ms. Restarting the future at the 300ms
+        // hedge would extend it to 900ms; check in between to catch that regression.
+        tokio::time::sleep_until(started + Duration::from_millis(750)).await;
         let state = channel.state.lock().await;
         assert!(
             state.exchange.is_none(),

@@ -104,14 +104,31 @@ async def run_case(binary, mode, concurrency, queries, responder, client, direct
     # The second responder shares the same endpoint; a healthy primary must
     # receive exactly one forwarded copy, never speculative background traffic.
     upstreams = [upstream] * (2 if mode == "legacy2" else 1)
-    cached = mode == "cached"
+    cached = mode in ("cached", "tcp-cached")
     before = responder.queries
     async with daemon(binary, upstreams, cached, directory) as (pid, port, metrics):
         await asyncio.wait_for(client.exchange(port, 0), 5)
         async def load(worker):
             samples = []
-            for _ in range(worker, queries, concurrency):
-                samples.append(await client.exchange(port, worker + 1))
+            if mode == "tcp-cached":
+                reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                packet = (worker + 1).to_bytes(2, "big") + QUERY[2:]
+                framed = len(packet).to_bytes(2, "big") + packet
+                try:
+                    for _ in range(worker, queries, concurrency):
+                        started = time.perf_counter_ns()
+                        writer.write(framed)
+                        await writer.drain()
+                        size = int.from_bytes(await reader.readexactly(2), "big")
+                        response = await reader.readexactly(size)
+                        assert response[:2] == packet[:2] and response[-4:] == ANSWER[-4:]
+                        samples.append(time.perf_counter_ns() - started)
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+            else:
+                for _ in range(worker, queries, concurrency):
+                    samples.append(await client.exchange(port, worker + 1))
             return samples
         started = time.perf_counter_ns()
         batches = await asyncio.wait_for(
@@ -166,7 +183,7 @@ async def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", action="append", required=True, help="LABEL=PATH; repeat to compare")
-    parser.add_argument("--mode", nargs="+", choices=["cached", "legacy1", "legacy2"], default=["cached", "legacy1", "legacy2"])
+    parser.add_argument("--mode", nargs="+", choices=["cached", "tcp-cached", "legacy1", "legacy2"], default=["cached", "legacy1", "legacy2"])
     parser.add_argument("--concurrency", nargs="+", type=int, default=[1, 32])
     parser.add_argument("--queries", type=int, default=20000)
     parser.add_argument("--samples", type=int, default=3)

@@ -74,7 +74,8 @@ python3 scripts/benchmark-local.py \
 ```
 
 This measures cached UDP and one-/two-upstream legacy forwarding, alternating
-binary order. It reports p50/p95, throughput, daemon CPU time per query, and RSS.
+binary order. Add `--mode tcp-cached` to measure persistent TCP cache hits.
+It reports p50/p95, throughput, daemon CPU time per query, and RSS.
 The Python load generator and OS scheduling can limit throughput; compare repeated
 runs on the same machine rather than treating these as maximum-capacity results.
 CPU time includes startup and shutdown, amortized over the query count.
