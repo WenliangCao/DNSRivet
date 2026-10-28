@@ -143,11 +143,8 @@ pub fn adjust_ttls(message: &mut [u8], elapsed_secs: u64) -> bool {
             return false;
         };
         if rr.kind != TYPE_OPT {
-            let Some(ttl) = read_u32(message, rr.ttl_offset) else {
-                return false;
-            };
             message[rr.ttl_offset..rr.ttl_offset + 4]
-                .copy_from_slice(&ttl.saturating_sub(elapsed).to_be_bytes());
+                .copy_from_slice(&rr.ttl.saturating_sub(elapsed).to_be_bytes());
         }
         offset = rr.end;
     }
@@ -279,16 +276,34 @@ pub fn validate_response(query: &[u8], response: &[u8]) -> Result<(), Validation
     if qd_query != 1 {
         return Ok(());
     }
-    match (parse_question(query), parse_question(response)) {
-        (Some(sent), Some(echoed)) if sent == echoed => Ok(()),
+    match questions_match(query, response) {
+        Some(true) => Ok(()),
         _ => Err(ValidationError::QuestionMismatch),
     }
 }
 
-/// (canonical lowercase QNAME, QTYPE, QCLASS) of the first question.
-fn parse_question(message: &[u8]) -> Option<(Vec<u8>, u16, u16)> {
-    let (name, end) = read_name(message, HEADER_LEN)?;
-    Some((name, read_u16(message, end)?, read_u16(message, end + 2)?))
+/// Compare expanded QNAME/QTYPE/QCLASS without allocating canonical names.
+fn questions_match(query: &[u8], response: &[u8]) -> Option<bool> {
+    // walk_name bounds the expanded wire name, including the root, to 255 bytes.
+    // Keep the query on the stack and compare response labels as they are walked.
+    let mut name = [0u8; 255];
+    let mut name_len = 0;
+    let query_end = walk_name(query, HEADER_LEN, |label| {
+        name[name_len..name_len + label.len()].copy_from_slice(label);
+        name_len += label.len();
+    })?;
+    let sent_fields = query.get(query_end..query_end + 4)?;
+
+    let mut echoed_len = 0;
+    let mut matches = true;
+    let response_end = walk_name(response, HEADER_LEN, |label| {
+        matches &= name[..name_len]
+            .get(echoed_len..echoed_len + label.len())
+            .is_some_and(|sent| sent.eq_ignore_ascii_case(label));
+        echoed_len += label.len();
+    })?;
+    let echoed_fields = response.get(response_end..response_end + 4)?;
+    Some(matches && name_len == echoed_len && sent_fields == echoed_fields)
 }
 
 /// True for a client QUERY carrying more than one question. RFC 9619 requires
@@ -365,18 +380,23 @@ fn soa_minimum(message: &[u8], rr: &ResourceRecord) -> Option<u32> {
 }
 
 fn skip_name(message: &[u8], offset: usize) -> Option<usize> {
-    walk_name(message, offset, None)
+    walk_name(message, offset, |_| {})
 }
 
 /// Decode a possibly-compressed name into canonical lowercase wire form.
 fn read_name(message: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
-    let mut name = Vec::new();
-    let end = walk_name(message, start, Some(&mut name))?;
-    Some((name, end))
+    let mut name = [0u8; 255];
+    let mut name_len = 0;
+    let end = walk_name(message, start, |label| {
+        name[name_len..name_len + label.len()].copy_from_slice(label);
+        name_len += label.len();
+    })?;
+    name[..name_len].make_ascii_lowercase();
+    Some((name[..name_len].to_vec(), end))
 }
 
-/// Validate the full expanded name, optionally collecting its canonical form.
-fn walk_name(message: &[u8], start: usize, mut output: Option<&mut Vec<u8>>) -> Option<usize> {
+/// Validate the full expanded name, visiting each wire label (length included).
+fn walk_name(message: &[u8], start: usize, mut visit: impl FnMut(&[u8])) -> Option<usize> {
     let mut cursor = start;
     let mut end = None;
     let mut jumps = 0usize;
@@ -399,22 +419,17 @@ fn walk_name(message: &[u8], start: usize, mut output: Option<&mut Vec<u8>>) -> 
         }
         cursor += 1;
         if len == 0 {
-            if let Some(name) = &mut output {
-                name.push(0);
-            }
+            visit(&message[cursor - 1..cursor]);
             return Some(end.unwrap_or(cursor));
         }
         let label_end = cursor.checked_add(usize::from(len))?;
-        let label = message.get(cursor..label_end)?;
+        let label = message.get(cursor - 1..label_end)?;
         name_len += 1 + usize::from(len);
         // The expanded name must leave one byte for its terminating root label.
         if name_len >= 255 {
             return None;
         }
-        if let Some(name) = &mut output {
-            name.push(len);
-            name.extend(label.iter().map(u8::to_ascii_lowercase));
-        }
+        visit(label);
         cursor = label_end;
     }
 }
@@ -548,7 +563,8 @@ mod tests {
         // The test fixtures use mixed-case names; canonicalization must make
         // the comparison case-insensitive.
         let query = question(7, false);
-        let response = positive_response(7, 60, false);
+        let mut response = positive_response(7, 60, false);
+        response[HEADER_LEN..25].make_ascii_lowercase();
         assert_eq!(validate_response(&query, &response), Ok(()));
     }
 
@@ -582,6 +598,13 @@ mod tests {
         wrong_type[26] = 28; // A -> AAAA in the echoed question
         assert_eq!(
             validate_response(&query, &wrong_type),
+            Err(ValidationError::QuestionMismatch)
+        );
+
+        let mut wrong_class = good.clone();
+        wrong_class[28] = 3; // IN -> CH in the echoed question
+        assert_eq!(
+            validate_response(&query, &wrong_class),
             Err(ValidationError::QuestionMismatch)
         );
 
@@ -626,6 +649,262 @@ mod tests {
         let mut status = multi;
         status[2] |= 0x10; // non-QUERY opcode
         assert!(!is_multi_question_query(&status));
+    }
+
+    fn named_question(name: &[u8]) -> Vec<u8> {
+        let mut message = vec![0, 1, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        message.extend_from_slice(name);
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        message
+    }
+
+    fn compressed_question(name: &[u8], prefix_len: usize) -> Vec<u8> {
+        let mut message = named_question(&name[..prefix_len]);
+        message.truncate(HEADER_LEN + prefix_len);
+        // Point beyond QTYPE/QCLASS to a suffix stored later in the message.
+        // walk_name has always permitted both forward and backward pointers.
+        let suffix = message.len() + 6;
+        let pointer = 0xc000 | u16::try_from(suffix).unwrap();
+        message.extend_from_slice(&pointer.to_be_bytes());
+        message.extend_from_slice(&[0, 1, 0, 1]);
+        message.extend_from_slice(&name[prefix_len..]);
+        message
+    }
+
+    #[test]
+    fn validates_questions_across_compression_encodings() {
+        for name in [
+            b"\0".as_slice(),
+            b"\x07ExAmPlE\x03COM\0",
+            b"\x03www\x07ExAmPlE\x03COM\0",
+            b"\x03A\xffZ\0", // Only ASCII octets are folded.
+        ] {
+            let encodings = [
+                named_question(name),
+                compressed_question(name, 0),
+                compressed_question(name, usize::from(name[0]) + usize::from(name[0] != 0)),
+            ];
+            for query in &encodings {
+                for encoded in &encodings {
+                    let mut response = encoded.clone();
+                    response[2] |= 0x80;
+                    // Fold only label payloads, not compression pointer bytes.
+                    let mut offset = HEADER_LEN;
+                    while response[offset] & 0xc0 == 0 {
+                        let len = usize::from(response[offset]);
+                        response[offset + 1..offset + 1 + len].make_ascii_lowercase();
+                        if len == 0 {
+                            break;
+                        }
+                        offset += 1 + len;
+                    }
+                    assert_eq!(validate_response(query, &response), Ok(()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinguishes_names_lengths_label_boundaries_and_non_ascii_octets() {
+        for (sent, echoed) in [
+            (b"\x02ab\x01c\0".as_slice(), b"\x01a\x02bc\0".as_slice()),
+            (b"\x01a\0", b"\x01a\x01b\0"),
+            (b"\0", b"\x01a\0"),
+            (b"\x01\xc0\0", b"\x01\xe0\0"),
+        ] {
+            let query = named_question(sent);
+            let mut response = named_question(echoed);
+            response[2] |= 0x80;
+            assert_eq!(
+                validate_response(&query, &response),
+                Err(ValidationError::QuestionMismatch)
+            );
+            let query = named_question(echoed);
+            let mut response = named_question(sent);
+            response[2] |= 0x80;
+            assert_eq!(
+                validate_response(&query, &response),
+                Err(ValidationError::QuestionMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_questions_on_either_side() {
+        let query = question(7, false);
+        let response = positive_response(7, 60, false);
+        for payload in [
+            b"".as_slice(),
+            b"\x03ab",
+            b"\x01a",
+            b"\xc0",
+            b"\xc0\xff",         // Out of bounds.
+            b"\xc0\x0c",         // Self pointer.
+            b"\xc0\x0e\xc0\x0c", // Two-pointer cycle.
+            b"\x01a\xc0\x0c",    // Cycle containing a label.
+            b"\x40\0",
+            b"\x80\0",
+        ] {
+            let mut malformed = query[..HEADER_LEN].to_vec();
+            malformed.extend_from_slice(payload);
+            assert_eq!(
+                validate_response(&malformed, &response),
+                Err(ValidationError::QuestionMismatch)
+            );
+            malformed[2] |= 0x80;
+            assert_eq!(
+                validate_response(&query, &malformed),
+                Err(ValidationError::QuestionMismatch)
+            );
+        }
+        // Every truncation within the name or QTYPE/QCLASS must be rejected.
+        for end in HEADER_LEN..query.len() {
+            assert_eq!(
+                validate_response(&query[..end], &response),
+                Err(ValidationError::QuestionMismatch)
+            );
+            let mut truncated = query[..end].to_vec();
+            truncated[2] |= 0x80;
+            assert_eq!(
+                validate_response(&query, &truncated),
+                Err(ValidationError::QuestionMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn validates_expanded_question_length_boundary() {
+        for (last_label_len, valid) in [(61, true), (62, false)] {
+            let mut name = Vec::new();
+            for length in [63, 63, 63, last_label_len] {
+                name.push(length);
+                name.resize(name.len() + usize::from(length), b'A');
+            }
+            name.push(0);
+            let expected = if valid {
+                Ok(())
+            } else {
+                Err(ValidationError::QuestionMismatch)
+            };
+            for query in [named_question(&name), compressed_question(&name, 0)] {
+                for mut response in [named_question(&name), compressed_question(&name, 64)] {
+                    response[2] |= 0x80;
+                    assert_eq!(validate_response(&query, &response), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validates_question_compression_jump_boundary() {
+        let query = named_question(b"\0");
+        for (jumps, expected) in [(128, Ok(())), (129, Err(ValidationError::QuestionMismatch))] {
+            let mut compressed = compressed_question(b"\0", 0);
+            compressed.pop(); // Replace the suffix root with a forward pointer chain.
+            for _ in 1..jumps {
+                let pointer = 0xc000 | u16::try_from(compressed.len() + 2).unwrap();
+                compressed.extend_from_slice(&pointer.to_be_bytes());
+            }
+            compressed.push(0);
+            let mut response = query.clone();
+            response[2] |= 0x80;
+            assert_eq!(validate_response(&compressed, &response), expected);
+            compressed[2] |= 0x80;
+            assert_eq!(validate_response(&query, &compressed), expected);
+        }
+    }
+
+    #[test]
+    fn response_validation_keeps_non_single_question_and_rcode_policy() {
+        for count in [0u16, 2] {
+            let mut query = vec![0; HEADER_LEN];
+            query[4..6].copy_from_slice(&count.to_be_bytes());
+            let mut response = query.clone();
+            response[2] |= 0x80;
+            assert_eq!(validate_response(&query, &response), Ok(()));
+        }
+        let query = question(7, true);
+        for rcode in 0..16 {
+            let mut response = positive_response(0, 0, true);
+            response[3] = 0x80 | rcode;
+            assert_eq!(validate_response(&query, &response), Ok(()));
+        }
+    }
+
+    #[test]
+    fn accepts_question_pointer_to_an_earlier_root_label() {
+        let query = named_question(b"\0");
+        let mut response = query[..HEADER_LEN].to_vec();
+        response[0] = 0; // The first ID octet doubles as the root label target.
+        response[2] |= 0x80;
+        response.extend_from_slice(&[0xc0, 0, 0, 1, 0, 1]);
+        assert_eq!(validate_response(&query, &response), Ok(()));
+    }
+
+    /// Run with `mbx test --release benchmark_wire_validation -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual wire validation hot-path benchmark"]
+    fn benchmark_wire_validation() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: usize = 1_000_000;
+        const SAMPLES: usize = 7;
+        let short = b"\x07ExAmPlE\x03COM\0".to_vec();
+        let mut long = Vec::new();
+        for length in [63, 63, 63, 61] {
+            long.push(length);
+            long.resize(long.len() + usize::from(length), b'A');
+        }
+        long.push(0);
+        for (name_kind, name) in [("short", short), ("long", long)] {
+            let query = named_question(&name);
+            for (encoding, mut response) in [
+                ("uncompressed", query.clone()),
+                ("compressed", compressed_question(&name, 0)),
+                (
+                    "compressed-suffix",
+                    compressed_question(&name, usize::from(name[0]) + 1),
+                ),
+            ] {
+                response[2] |= 0x80;
+                assert_eq!(validate_response(&query, &response), Ok(()));
+                for _ in 0..100_000 {
+                    black_box(validate_response(black_box(&query), black_box(&response))).unwrap();
+                }
+                let mut samples = [0.0; SAMPLES];
+                for sample in &mut samples {
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        black_box(validate_response(black_box(&query), black_box(&response)))
+                            .unwrap();
+                    }
+                    *sample = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "validate {name_kind} {encoding}: median={:.1} ns/op min={:.1} max={:.1}",
+                    samples[SAMPLES / 2],
+                    samples[0],
+                    samples[SAMPLES - 1]
+                );
+            }
+            let mut samples = [0.0; SAMPLES];
+            for sample in &mut samples {
+                let start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    black_box(parse_query_meta(black_box(&query))).unwrap();
+                }
+                *sample = start.elapsed().as_nanos() as f64 / ITERATIONS as f64;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "query meta {name_kind}: median={:.1} ns/op min={:.1} max={:.1}",
+                samples[SAMPLES / 2],
+                samples[0],
+                samples[SAMPLES - 1]
+            );
+        }
     }
 
     #[test]
