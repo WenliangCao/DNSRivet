@@ -198,7 +198,6 @@ async fn udp_loop(
     // The extra byte detects datagrams clipped by recv_from. Oversized input
     // must not be forwarded as if it were a complete, valid 4 KiB query.
     let mut buf = vec![0u8; MAX_QUERY_SIZE + 1];
-    let mut cached_response = Vec::new();
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(received) => received,
@@ -214,29 +213,16 @@ async fn udp_loop(
             log::warn!("dropping query: {MAX_INFLIGHT} already in flight");
             continue;
         };
-        let query = &buf[..n];
-        let meta = cache.query_meta(query);
-        if local_response(&cache, query, meta.as_ref(), &mut cached_response) {
-            wire::truncate_to(
-                &mut cached_response,
-                meta.as_ref().map_or(512, |meta| meta.udp_size),
-            );
-            // The socket is normally writable. Avoid registering an I/O waiter
-            // for a cached reply; recv_from above still enforces Tokio's budget.
-            if let Err(err) = sock.try_send_to(&cached_response, peer)
-                && err.kind() == std::io::ErrorKind::WouldBlock
-            {
-                let _ = sock.send_to(&cached_response, peer).await;
-            }
-            drop(permit);
-            continue;
-        }
-        let query = query.to_vec();
+        let query = buf[..n].to_vec();
         let sock = sock.clone();
         let manager = manager.clone();
         let cache = cache.clone();
         tokio::spawn(async move {
-            let mut response = forward(&manager, &cache, &query, false, meta.as_ref()).await;
+            let meta = cache.query_meta(&query);
+            let mut response = Vec::new();
+            if !local_response(&cache, &query, meta.as_ref(), &mut response) {
+                response = forward(&manager, &cache, &query, false, meta.as_ref()).await;
+            }
             wire::truncate_to(
                 &mut response,
                 meta.as_ref()
@@ -319,7 +305,7 @@ async fn tcp_conn(
     }
 }
 
-/// Try local answers before copying/spawning an upstream request.
+/// Share the same local-answer gate between UDP and TCP clients.
 fn local_response(
     cache: &Cache,
     query: &[u8],
@@ -412,7 +398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn udp_cache_fast_path_preserves_ids_truncation_and_inflight_budget() {
+    async fn cached_udp_answers_preserve_ids_truncation_and_inflight_budget() {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = upstream.local_addr().unwrap();
         let manager = Arc::new(

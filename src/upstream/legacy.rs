@@ -45,7 +45,13 @@ pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
             && crate::wire::validate_response(query, &buf[..n]).is_ok()
         {
             buf.truncate(n);
-            crate::wire::truncate_to(&mut buf, MAX_UDP_RESPONSE);
+            if n > MAX_UDP_RESPONSE {
+                crate::wire::truncate_to(&mut buf, MAX_UDP_RESPONSE);
+                // A compressed question can refer into bytes truncation removes
+                // or rewrites. Keep the post-mutation guarantee at this boundary.
+                crate::wire::validate_response(query, &buf)
+                    .map_err(|err| format!("truncated udp response rejected: {err}"))?;
+            }
             return Ok(buf);
         }
     }
