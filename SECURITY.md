@@ -15,7 +15,8 @@ or enable local DNSSEC validation. `.cargo/audit.toml` has no advisory exception
 The two former exceptions were removed by upgrading the affected dependencies:
 
 - [RUSTSEC-2026-0118](https://rustsec.org/advisories/RUSTSEC-2026-0118.html): the NSEC3
-  implementation moved out of `hickory-proto` in 0.26. Its corresponding `hickory-net` issue,
+  closest-encloser validator (`DnssecDnsHandle`) moved out of `hickory-proto` in 0.26.
+  Its corresponding `hickory-net` issue,
   [RUSTSEC-2026-0120](https://rustsec.org/advisories/RUSTSEC-2026-0120.html), was fixed in 0.26.1.
 - [RUSTSEC-2026-0119](https://rustsec.org/advisories/RUSTSEC-2026-0119.html): quadratic name
   compression in the encoder was fixed in `hickory-proto 0.26.1`.
@@ -31,6 +32,8 @@ forwarding, `safe_encrypted_query` in `src/upstream/mod.rs` requires exactly one
 rejects answer, authority, additional records, and signatures; an optional EDNS record is allowed.
 TCP and UDP queries remain capped at 4 KiB. Client requests and upstream attempts each have a
 512-permit global budget, including encrypted attempts still running after a hedge wins.
+Transport-local queues may impose lower limits; DoT retains Hickory's default of 32 active
+requests per connection rather than expanding its internal pipeline during the security upgrade.
 
 Upstream responses are returned through `DnsResponse::into_buffer()` as their original bytes,
 not re-encoded. Client IDs are restored and responses are validated against the query. Channel

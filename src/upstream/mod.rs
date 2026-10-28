@@ -509,17 +509,70 @@ mod tests {
 
     #[test]
     fn encrypted_encoder_accepts_only_single_question_queries() {
+        use hickory_net::proto::op::Edns;
+        use hickory_net::proto::rr::{
+            DNSClass,
+            rdata::{TSIG, tsig::TsigAlgorithm},
+        };
+
         let name = Name::from_str("example.com.").unwrap();
         let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(name.clone(), RecordType::A));
-        assert!(safe_encrypted_query(&query));
+        for edns in [None, Some(Edns::new())] {
+            query.edns = edns;
+            assert!(Request::new(&query.to_vec().unwrap()).message().is_ok());
+        }
 
-        query.add_answer(Record::from_rdata(
+        // Exercise the encoder and parser boundary, not only the in-memory guard:
+        // the new Message API separates authorities, EDNS, and TSIG fields.
+        let record = Record::from_rdata(name.clone(), 60, RData::A(A(Ipv4Addr::new(192, 0, 2, 1))));
+        let mut invalid = Vec::new();
+        let mut message = query.clone();
+        message.answers.push(record.clone());
+        invalid.push(message);
+        let mut message = query.clone();
+        message.authorities.push(record.clone());
+        invalid.push(message);
+        let mut message = query.clone();
+        message.additionals.push(record);
+        invalid.push(message);
+        let mut message = query.clone();
+        message.queries.clear();
+        invalid.push(message);
+        let mut message = query.clone();
+        message.queries.push(message.queries[0].clone());
+        invalid.push(message);
+        let mut message = query.clone();
+        message.metadata.message_type = MessageType::Response;
+        invalid.push(message);
+        let mut message = query.clone();
+        message.metadata.op_code = OpCode::Update;
+        invalid.push(message);
+        let mut message = query;
+        let mut signature = Record::from_rdata(
             name,
-            60,
-            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
-        ));
-        assert!(!safe_encrypted_query(&query));
+            0,
+            TSIG::new(
+                TsigAlgorithm::HmacSha256,
+                0,
+                300,
+                Vec::new(),
+                0,
+                None,
+                Vec::new(),
+            ),
+        );
+        signature.dns_class = DNSClass::ANY;
+        message.signature = Some(Box::new(signature));
+        invalid.push(message);
+
+        for message in invalid {
+            let bytes = message.to_vec().unwrap();
+            let parsed =
+                Message::from_vec(&bytes).expect("fixture must be a decodable DNS message");
+            assert!(!safe_encrypted_query(&parsed), "{parsed:?}");
+            assert!(Request::new(&bytes).message().is_err());
+        }
     }
 
     #[tokio::test]

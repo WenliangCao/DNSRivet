@@ -347,11 +347,9 @@ where
 {
     finish(
         async move {
-            // Keep the deadline in Channel and use the manager's global budget,
-            // not Hickory's independent default limit of 32 active requests.
-            Ok(DnsMultiplexer::new(conn.await?, handle)
-                .with_timeout(Duration::MAX)
-                .with_max_active_requests(super::MAX_ATTEMPTS))
+            // Hickory requires a duration; Tokio saturates MAX to its far-future
+            // timer. Cancellation and positive deadlines remain owned by Channel.
+            Ok(DnsMultiplexer::new(conn.await?, handle).with_timeout(Duration::MAX))
         },
         deadline,
     )
@@ -439,6 +437,116 @@ mod tests {
             }
             responder.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn dot_reuses_a_backpressured_connection_without_reencoding_answers() {
+        use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
+        use hickory_net::tcp::{TcpClientStream, TcpStream};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Deliberately leave the answer owner uncompressed and mixed-case.
+        // Re-encoding through Message would change these bytes.
+        fn answer(query: &[u8]) -> Vec<u8> {
+            const QUESTION_END: usize = 29; // example.com. A IN
+            let mut response = query[..QUESTION_END].to_vec();
+            response[2] |= 0x80;
+            response[3] |= 0x80;
+            response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(
+                b"\x07ExAmPlE\x03CoM\0\0\x01\0\x01\0\0\0\x2a\0\x04\xc0\0\x02\x01",
+            );
+            response.extend_from_slice(&query[QUESTION_END..]);
+            response
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (manager, unused_background) = test_manager(TestTransport::default()).await;
+            // Smaller than one padded query: writes must wait for the reader.
+            let (client, mut server) = tokio::io::duplex(64);
+            let (stream, handle) =
+                TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
+            let exchange = connect_dot(
+                std::future::ready(Ok(TcpClientStream::from_stream(stream))),
+                handle,
+                None,
+            )
+            .await
+            .unwrap();
+            let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                unreachable!();
+            };
+            let generation = channel.state.lock().await.store(exchange);
+            unused_background.await.unwrap();
+            let manager = Arc::new(manager);
+            let mut query = encrypted_test_query(128);
+            query.queries[0].set_name(Name::from_ascii("ExAmPlE.CoM.").unwrap());
+            query.metadata.checking_disabled = true;
+            query.metadata.authentic_data = true;
+            let wire_query = query.to_vec().unwrap();
+            let expected = answer(&wire_query);
+            assert_ne!(
+                Message::from_vec(&expected).unwrap().to_vec().unwrap(),
+                expected
+            );
+
+            let (allow_reads, mut begin) = mpsc::channel(1);
+            let sent = wire_query.clone();
+            let responder = tokio::spawn(async move {
+                for _ in 0..3 {
+                    begin.recv().await.unwrap();
+                    let mut responses = Vec::new();
+                    for _ in 0..32 {
+                        let n = server.read_u16().await.unwrap();
+                        let mut query = vec![0; usize::from(n)];
+                        server.read_exact(&mut query).await.unwrap();
+                        // DoT may rewrite the ID, but not flags, question, or EDNS.
+                        assert_eq!(&query[2..], &sent[2..]);
+                        responses.push(answer(&query));
+                    }
+                    // Responses arrive out of order on the same connection.
+                    for response in responses.into_iter().rev() {
+                        server.write_u16(response.len() as u16).await.unwrap();
+                        server.write_all(&response).await.unwrap();
+                    }
+                }
+            });
+            for round in 0..3 {
+                let mut pending = tokio::task::JoinSet::new();
+                for id in (round * 32)..((round + 1) * 32) {
+                    let manager = manager.clone();
+                    let mut query = wire_query.clone();
+                    query[..2].copy_from_slice(&(id as u16).to_be_bytes());
+                    pending.spawn(async move {
+                        let expected = answer(&query);
+                        assert_eq!(manager.forward(&query, false).await.unwrap(), expected);
+                    });
+                }
+                // No answers can arrive yet. Fill the existing bounded pipeline
+                // before allowing the peer to consume its first query.
+                while manager.attempts.available_permits() > super::super::MAX_ATTEMPTS - 32 {
+                    tokio::task::yield_now().await;
+                }
+                allow_reads.send(()).await.unwrap();
+                while let Some(result) = pending.join_next().await {
+                    result.unwrap();
+                }
+                assert_eq!(
+                    manager.attempts.available_permits(),
+                    super::super::MAX_ATTEMPTS
+                );
+                let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+                    unreachable!();
+                };
+                let state = channel.state.lock().await;
+                assert_eq!(state.generation, generation);
+                assert_eq!(state.connect_failures, 0);
+                assert!(state.cooldown_until.is_none());
+            }
+            responder.await.unwrap();
+        })
+        .await
+        .expect("bounded DoT requests must survive write backpressure");
     }
 
     #[test]
