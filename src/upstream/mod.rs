@@ -5,9 +5,10 @@ pub mod legacy;
 use crate::config::{IpStack, Proto, Upstream};
 use bootstrap::Bootstrap;
 use hickory_proto::op::{Message, MessageType, OpCode};
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -37,6 +38,43 @@ struct Entry {
     name: String,
     timeout_ms: u64,
     backend: Backend,
+}
+
+/// Borrow on the single-upstream path; own only when tasks can outlive forward.
+/// Encrypted attempts share one lazy parse, including failed parses.
+struct Request<'a> {
+    bytes: Cow<'a, [u8]>,
+    parsed: OnceLock<Result<Message, String>>,
+}
+
+impl<'a> Request<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes: Cow::Borrowed(bytes),
+            parsed: OnceLock::new(),
+        }
+    }
+
+    fn into_owned(self) -> Request<'static> {
+        Request {
+            bytes: Cow::Owned(self.bytes.into_owned()),
+            parsed: self.parsed,
+        }
+    }
+
+    fn message(&self) -> Result<&Message, String> {
+        self.parsed
+            .get_or_init(|| {
+                let message = Message::from_vec(&self.bytes)
+                    .map_err(|e| format!("unparseable query: {e}"))?;
+                if !safe_encrypted_query(&message) {
+                    return Err("unsupported query shape for encrypted forwarding".into());
+                }
+                Ok(message)
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 enum Backend {
@@ -118,7 +156,26 @@ impl Manager {
     /// rather than waited out. `client_tcp` enables the TC-triggered TCP
     /// retry on legacy upstreams.
     pub async fn forward(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
-        let shared: Arc<[u8]> = Arc::from(query);
+        let request = Request::new(query);
+        let response = if let [entry] = self.entries.as_slice() {
+            // No task, owned query copy, or JoinSet for the common single-upstream case.
+            let _permit = self.attempts.try_acquire().ok()?;
+            self.configured_answer(&entry.name, query, entry.run(&request, client_tcp).await)
+        } else {
+            Box::pin(self.forward_hedged(Arc::new(request.into_owned()), client_tcp)).await
+        };
+        match response {
+            Some(response) => Some(response),
+            None => self.forward_to_system(query, client_tcp).await,
+        }
+    }
+
+    async fn forward_hedged(
+        &self,
+        shared: Arc<Request<'static>>,
+        client_tcp: bool,
+    ) -> Option<Vec<u8>> {
+        let query = shared.bytes.as_ref();
         let mut attempts = JoinSet::new();
         let mut legacy_attempts = Vec::new();
         let mut next = 0;
@@ -185,25 +242,10 @@ impl Manager {
                     continue;
                 }
             };
-            let name = &self.entries[index].name;
-            let mut response = match result {
-                Ok(response) => response,
-                Err(err) => {
-                    log::debug!("upstream {name}: {err}");
-                    continue;
-                }
+            let Some(response) = self.configured_answer(&self.entries[index].name, query, result)
+            else {
+                continue;
             };
-            // Reject before touching recovery flags, the ID, or the cache: an
-            // answer to the wrong question is an upstream failure, not a
-            // recovery (RFC 5452).
-            if let Err(err) = crate::wire::validate_response(query, &response) {
-                log::debug!("upstream {name}: rejected response: {err}");
-                continue;
-            }
-            if response[3] & 0x0f == 2 {
-                log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
-                continue;
-            }
             // Legacy attempts have no connection health to maintain. Encrypted
             // losers keep their budget until their own deadline so stalled
             // channels still invalidate and back off without unbounded work.
@@ -211,21 +253,43 @@ impl Manager {
                 attempt.abort();
             }
             attempts.detach_all();
-            let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
-            let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
-            if fallback_was_active {
-                log::info!("configured DNS upstreams recovered; system fallback inactive");
-            } else if fallback_had_failed {
-                log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
-            }
-            if response.len() >= 2 {
-                // Transports may rewrite the DNS ID (DoQ pins it to 0);
-                // hand the client back its own.
-                response[..2].copy_from_slice(&query[..2]);
-            }
             return Some(response);
         }
-        self.forward_to_system(query, client_tcp).await
+        None
+    }
+
+    fn configured_answer(
+        &self,
+        name: &str,
+        query: &[u8],
+        result: Result<Vec<u8>, String>,
+    ) -> Option<Vec<u8>> {
+        let mut response = match result {
+            Ok(response) => response,
+            Err(err) => {
+                log::debug!("upstream {name}: {err}");
+                return None;
+            }
+        };
+        // Reject before touching recovery flags, the ID, or the cache.
+        if let Err(err) = crate::wire::validate_response(query, &response) {
+            log::debug!("upstream {name}: rejected response: {err}");
+            return None;
+        }
+        if response[3] & 0x0f == 2 {
+            log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
+            return None;
+        }
+        let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
+        let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
+        if fallback_was_active {
+            log::info!("configured DNS upstreams recovered; system fallback inactive");
+        } else if fallback_had_failed {
+            log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
+        }
+        // Transports may rewrite the DNS ID (DoQ pins it to 0).
+        response[..2].copy_from_slice(&query[..2]);
+        Some(response)
     }
 
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
@@ -289,13 +353,13 @@ impl Entry {
         })
     }
 
-    async fn run(&self, query: &[u8], client_tcp: bool) -> Result<Vec<u8>, String> {
+    async fn run(&self, request: &Request<'_>, client_tcp: bool) -> Result<Vec<u8>, String> {
         // Encrypted channels enforce this deadline themselves so their
         // invalidation stays generation-precise; the outer timeout below is a
         // pure scheduling backstop with no channel side effects.
         let deadline =
             (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
-        let attempt = self.attempt(query, client_tcp, deadline);
+        let attempt = self.attempt(request, client_tcp, deadline);
         match self.outer_timeout() {
             Some(limit) => tokio::time::timeout(limit, attempt)
                 .await
@@ -306,10 +370,11 @@ impl Entry {
 
     async fn attempt(
         &self,
-        query: &[u8],
+        request: &Request<'_>,
         client_tcp: bool,
         deadline: Option<Instant>,
     ) -> Result<Vec<u8>, String> {
+        let query = request.bytes.as_ref();
         match &self.backend {
             Backend::Legacy {
                 host,
@@ -337,15 +402,7 @@ impl Entry {
                 }
                 Err(last_err.unwrap_or_else(|| "no addresses".into()))
             }
-            Backend::Encrypted(channel) => {
-                // Encrypted transports re-serialize with their own IDs.
-                let message =
-                    Message::from_vec(query).map_err(|e| format!("unparseable query: {e}"))?;
-                if !safe_encrypted_query(&message) {
-                    return Err("unsupported query shape for encrypted forwarding".into());
-                }
-                channel.query(&message, deadline).await
-            }
+            Backend::Encrypted(channel) => channel.query(request.message()?, deadline).await,
         }
     }
 }
@@ -382,6 +439,28 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::str::FromStr;
     use tokio::net::UdpSocket;
+
+    #[test]
+    fn requests_borrow_until_shared_and_parse_encrypted_queries_only_once() {
+        let query = labeled_query(1);
+        let request = Request::new(&query);
+        assert!(matches!(request.bytes, Cow::Borrowed(_)));
+        assert!(
+            request.parsed.get().is_none(),
+            "legacy forwarding must not parse"
+        );
+        let shared = Arc::new(request.into_owned());
+        let next_attempt = shared.clone();
+        assert!(std::ptr::eq(
+            shared.message().unwrap(),
+            next_attempt.message().unwrap()
+        ));
+        assert_eq!(shared.bytes.as_ref(), query);
+
+        let invalid = Request::new(&[0; 12]);
+        assert!(invalid.message().is_err());
+        assert!(invalid.parsed.get().unwrap().is_err());
+    }
 
     #[test]
     fn self_dial_checks_normalize_mapped_addresses_and_keep_remote_targets() {

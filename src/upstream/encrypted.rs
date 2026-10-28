@@ -460,10 +460,21 @@ mod tests {
         let manager = Manager::new(vec![upstream], &[], Vec::new()).unwrap();
         let message = encrypted_test_query(0);
         let query = message.to_vec().unwrap();
-        let size = std::mem::size_of_val(&manager.forward(&query, false));
-        // Leave room for compiler/layout differences while detecting inline
-        // connection futures being carried by every concurrent request.
-        assert!(size < 3072, "forwarding future grew to {size} bytes");
+        let request = crate::upstream::Request::new(&query);
+        // The task body must be measured too: moving work into a spawned task
+        // must not make this guard pass while the actual attempt grows.
+        for (name, size) in [
+            (
+                "forward",
+                std::mem::size_of_val(&manager.forward(&query, false)),
+            ),
+            (
+                "attempt",
+                std::mem::size_of_val(&manager.entries[0].run(&request, false)),
+            ),
+        ] {
+            assert!(size < 3072, "{name} future grew to {size} bytes");
+        }
     }
 
     #[derive(Default)]
