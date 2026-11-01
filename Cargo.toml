@@ -20,7 +20,7 @@ hickory-net = { version = "0.26.3", default-features = false, features = [
     "tls-ring",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "net",
@@ -33,7 +33,7 @@ tokio = { version = "1", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1", default-features = false, features = ["std", "serde", "parse", "display"] }
 log = { version = "0.4", features = ["std"] }
-lru = "0.18"
+lru = "0.19"
 lexopt = "0.3"
 nix = { version = "0.31.3", default-features = false, features = ["user", "net"] }
 
