@@ -14,7 +14,11 @@
 //! - deadline expiry: invalidate + backoff, no retry (a wedged-but-accepting
 //!   upstream must not tax every query with its full timeout);
 //! - errors from a superseded generation: no state change; retry once on
-//!   the successor while budget remains if the failed lease was reused.
+//!   the successor while budget remains if the failed lease was reused;
+//! - host slept since the last query: drop the connection before sending,
+//!   no backoff, and re-resolve the bootstrap address (the peer has likely
+//!   forgotten it, and a black-holed send would burn the whole deadline and
+//!   push the query to the plaintext system fallback).
 
 use crate::config::{Proto, Upstream};
 use crate::upstream::bootstrap::Bootstrap;
@@ -32,13 +36,15 @@ use hickory_net::xfer::{
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BACKOFF_SHIFT: u32 = 5; // 2^5 = 32s cap
 /// A redial is only worth it while at least this much budget remains.
 const MIN_REDIAL_BUDGET: Duration = Duration::from_millis(250);
+/// Sleep longer than this renews connections before the next query.
+const RENEW_AFTER_SLEEP: Duration = Duration::from_secs(5);
 
 /// rustls config shared by every encrypted upstream: ring provider,
 /// webpki (Mozilla) trust anchors, session resumption on by default.
@@ -53,6 +59,30 @@ pub fn base_tls_config() -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
+/// Paired clock readings. `Instant` stops while macOS sleeps (it reads
+/// CLOCK_UPTIME_RAW) and the wall clock does not, so their drift between two
+/// stamps is the time the host spent asleep. A forward wall-clock step reads
+/// as sleep too; that only costs one early redial.
+#[derive(Clone, Copy)]
+struct Stamp {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl Stamp {
+    fn now() -> Self {
+        Self {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    fn slept_since(self, earlier: Stamp) -> Duration {
+        let wall = self.wall.duration_since(earlier.wall).unwrap_or_default();
+        wall.saturating_sub(self.mono.saturating_duration_since(earlier.mono))
+    }
+}
+
 /// Generation-tracked connection slot. Generic over the handle type so the
 /// invalidation rules are unit-testable without real connections.
 struct Slot<E> {
@@ -60,6 +90,8 @@ struct Slot<E> {
     generation: u64,
     connect_failures: u32,
     cooldown_until: Option<Instant>,
+    /// When the slot was last leased or stored, for sleep detection.
+    last_used: Option<Stamp>,
 }
 
 impl<E> Default for Slot<E> {
@@ -69,6 +101,7 @@ impl<E> Default for Slot<E> {
             generation: 0,
             connect_failures: 0,
             cooldown_until: None,
+            last_used: None,
         }
     }
 }
@@ -83,7 +116,15 @@ impl<E: Clone> Slot<E> {
         self.exchange = Some(exchange);
         self.connect_failures = 0;
         self.cooldown_until = None;
+        self.last_used = Some(Stamp::now());
         self.generation
+    }
+
+    /// Drop the connection if the host slept since the slot was last used,
+    /// returning how long it slept. No backoff: the connection did not fail.
+    fn drop_if_slept(&mut self, now: Stamp) -> Option<Duration> {
+        let slept = now.slept_since(self.last_used.replace(now)?);
+        (slept > RENEW_AFTER_SLEEP && self.exchange.take().is_some()).then_some(slept)
     }
 
     /// Clear the slot only if `generation` is still the current one; a
@@ -194,6 +235,16 @@ impl Channel {
         // Holding the async lock across connect serializes dial attempts,
         // so a burst of queries cannot stampede-connect.
         let mut state = self.state.lock().await;
+        if let Some(slept) = state.drop_if_slept(Stamp::now()) {
+            log::info!(
+                "upstream {}: host slept {:.0}s; renewing connection",
+                self.up.name,
+                slept.as_secs_f32()
+            );
+            if self.up.bootstrap_ip.is_none() {
+                self.bootstrap.invalidate(&self.up.host).await;
+            }
+        }
         if let Some((exchange, generation)) = state.lease() {
             return Ok(Lease {
                 exchange,
@@ -1059,6 +1110,42 @@ mod tests {
         assert!(slot.invalidate(new));
         assert!(slot.lease().is_none());
         assert!(!slot.invalidate(new), "second invalidation is a no-op");
+    }
+
+    #[test]
+    fn sleep_drops_the_connection_without_backoff() {
+        let mut slot: Slot<u8> = Slot::default();
+        let generation = slot.store(1);
+        let last = slot.last_used.unwrap();
+        let awake = Stamp {
+            mono: last.mono + Duration::from_secs(60),
+            wall: last.wall + Duration::from_secs(61),
+        };
+        assert_eq!(slot.drop_if_slept(awake), None, "1s drift is not sleep");
+        assert_eq!(slot.lease(), Some((1, generation)));
+
+        let woke = Stamp {
+            mono: awake.mono + Duration::from_secs(1),
+            wall: awake.wall + Duration::from_secs(3600),
+        };
+        assert_eq!(slot.drop_if_slept(woke), Some(Duration::from_secs(3599)));
+        assert!(slot.lease().is_none());
+        assert_eq!(slot.connect_failures, 0);
+        assert!(slot.cooldown_until.is_none());
+        assert_eq!(slot.drop_if_slept(woke), None, "nothing left to drop");
+    }
+
+    #[test]
+    fn wall_clock_stepping_back_is_not_sleep() {
+        let mut slot: Slot<u8> = Slot::default();
+        slot.store(1);
+        let last = slot.last_used.unwrap();
+        let stepped = Stamp {
+            mono: last.mono + Duration::from_secs(10),
+            wall: last.wall - Duration::from_secs(3600),
+        };
+        assert_eq!(slot.drop_if_slept(stepped), None);
+        assert!(slot.lease().is_some());
     }
 
     #[test]

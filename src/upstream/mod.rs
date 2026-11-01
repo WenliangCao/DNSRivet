@@ -86,7 +86,8 @@ enum Backend {
         bootstrap: Arc<Bootstrap>,
         deny: Arc<Vec<SocketAddr>>,
     },
-    Encrypted(encrypted::Channel),
+    // Boxed: the connection slot dwarfs the legacy variant.
+    Encrypted(Box<encrypted::Channel>),
 }
 
 impl Manager {
@@ -122,13 +123,13 @@ impl Manager {
                     bootstrap: boot.clone(),
                     deny: deny.clone(),
                 },
-                _ => Backend::Encrypted(encrypted::Channel::new(
+                _ => Backend::Encrypted(Box::new(encrypted::Channel::new(
                     up,
                     tls.clone()
                         .expect("tls config built when encrypted upstreams exist"),
                     boot.clone(),
                     deny.clone(),
-                )),
+                ))),
             };
             entries.push(Arc::new(Entry {
                 name,
