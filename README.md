@@ -28,26 +28,18 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
-## 0.4.0 changes
+## 0.4.1 changes
 
-- Move encrypted transports to `hickory-net` 0.26.3 and remove every RustSec
-  audit exception
-- Hedged failover ignores `SERVFAIL` racers, cancels losing legacy attempts,
-  and bounds all attempts with a shared 512-attempt budget; a hedge blocked by
-  the budget is deferred instead of skipping failover
-- Detect clipped UDP replies and retry over TCP for the full answer
-- Negative answers follow the SOA TTL and SOA.MINIMUM (capped at 600 s), zero
-  TTLs are not cached, and EDNS queries get separate cache entries
-- `start`, `stop`, `restart`, and `uninstall` are serialized across processes;
-  `stop` refuses to leave a network service pointing at a dead resolver
-- `restart --config` rolls back unless the system DNS takeover is verified,
-  including newly enabled network services
-- Reject legacy upstreams that resolve to DNSRivet itself, let channel
-  deadlines govern DoT timeouts, and install the PKG only on the startup volume
-- Fewer allocations per query, reused response buffers, and cached TTLs aged
-  once per second; repeatable local benchmarks in `scripts/benchmark-local.py`
+- After macOS sleeps, encrypted upstreams drop their connection and re-resolve
+  the bootstrap address before the next query, instead of sending into a stale
+  connection until the deadline and falling back to plaintext system DNS
+- Update `webpki-roots` to 1.0.11, which removes the emSign Root CA - C1 and
+  emSign ECC Root CA - C3 trust anchors
+- Refresh dependencies, including tokio 1.54.1, quinn 0.11.12, h2 0.4.20, and
+  lru 0.19
 
-0.3.6 added hedged failover and bootstrap resolution that survives UDP loss.
+0.4.0 moved encrypted transports to patched Hickory releases and hardened
+failover, caching, and service lifecycle handling.
 
 ## Runtime profile
 
@@ -378,23 +370,16 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
 
-## 0.4.0 更新
+## 0.4.1 更新
 
-- 加密传输迁移到 `hickory-net` 0.26.3，移除全部 RustSec 审计例外
-- 对冲故障转移忽略 `SERVFAIL` 应答，取消落败的 legacy 请求，所有尝试共用 512 项
-  预算；预算不足时推迟对冲，而不是跳过故障转移
-- 识别被截断的 UDP 应答，并通过 TCP 重试获取完整应答
-- 负缓存遵循 SOA TTL 与 SOA.MINIMUM（最长 600 秒），TTL 为零不缓存，带 EDNS 的
-  查询单独缓存
-- `start`、`stop`、`restart` 和 `uninstall` 跨进程串行执行；`stop` 不会让网络
-  服务继续指向已停止的 resolver
-- `restart --config` 必须验证系统 DNS 接管成功（包括新启用的网络服务），否则回滚
-- 拒绝解析到 DNSRivet 自身的 legacy 上游，DoT 超时改由通道截止时间控制，PKG
-  只允许安装到当前启动卷
-- 减少每次查询的内存分配，复用应答缓冲区，缓存 TTL 每秒只老化一次；新增
-  `scripts/benchmark-local.py` 可重复的本地性能测试
+- macOS 睡眠唤醒后，加密上游会先丢弃旧连接并重新解析 bootstrap 地址再发送下一个
+  查询，不再把查询发进已失效的连接直到超时、再回退到明文系统 DNS
+- 将 `webpki-roots` 更新至 1.0.11，移除 emSign Root CA - C1 与 emSign ECC Root
+  CA - C3 两个根证书
+- 更新依赖，包括 tokio 1.54.1、quinn 0.11.12、h2 0.4.20 与 lru 0.19
 
-0.3.6 已加入对冲故障转移，以及能承受 UDP 丢包的 bootstrap 解析。
+0.4.0 已将加密传输迁移到修复后的 Hickory 版本，并加固了故障转移、缓存与服务生命
+周期处理。
 
 ## 运行开销
 
