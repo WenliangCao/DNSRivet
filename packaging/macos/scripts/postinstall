@@ -20,7 +20,11 @@ fi
 # remains an explicit user choice. During an upgrade, restart an already loaded
 # service so the newly installed binary takes effect immediately.
 if /bin/launchctl print "$label" >/dev/null 2>&1; then
-    "$binary" restart
+    if ! "$binary" restart; then
+        echo "DNSRivet was installed, but the service restart or DNS probe failed (the network may be offline)." >&2
+        echo "When connectivity returns, run: sudo dnsrivet restart" >&2
+        echo "If DNS is unavailable, restore it with: sudo dnsrivet stop" >&2
+    fi
 fi
 
 exit 0

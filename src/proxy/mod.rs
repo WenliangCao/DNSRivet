@@ -146,6 +146,7 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
         interval.tick().await;
         let stamp = crate::osdns::watchdog_stamp();
         if stamp.is_some() && stamp == last_stamp {
+            record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes);
             continue;
         }
         // networksetup/scutil are blocking subprocess calls; keep them off
@@ -183,12 +184,8 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     interval.reset();
                     log::info!("DNS settings stable again; watchdog back to normal cadence");
-                } else if let Some(ticks) = &mut ticks_since_reassert {
-                    *ticks += 1;
-                    if *ticks >= FLAP_WINDOW_TICKS {
-                        ticks_since_reassert = None;
-                        flap_strikes = 0;
-                    }
+                } else {
+                    record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes);
                 }
             }
             Ok(crate::osdns::TickOutcome::Reasserted {
@@ -228,6 +225,16 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                 }
             }
             Err(err) => log::warn!("takeover watchdog: {err}"),
+        }
+    }
+}
+
+fn record_stable_tick(ticks_since_reassert: &mut Option<u32>, flap_strikes: &mut u32) {
+    if let Some(ticks) = ticks_since_reassert {
+        *ticks += 1;
+        if *ticks >= FLAP_WINDOW_TICKS {
+            *ticks_since_reassert = None;
+            *flap_strikes = 0;
         }
     }
 }

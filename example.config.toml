@@ -5,7 +5,7 @@
 log_level = "info"   # debug | info | warn | error
 log_path = ""        # empty = stderr (launchd redirects it to a file)
 cache_enable = true
-cache_size = 4096
+cache_size = 4096 # Maximum 16384 entries; responses larger than 4096 bytes are not cached.
 
 [listener.0]
 ip = "127.0.0.1"

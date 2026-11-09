@@ -32,8 +32,15 @@ forwarding, `safe_encrypted_query` in `src/upstream/mod.rs` requires exactly one
 rejects answer, authority, additional records, and signatures; an optional EDNS record is allowed.
 TCP and UDP queries remain capped at 4 KiB. Client requests and upstream attempts each have a
 512-permit global budget, including encrypted attempts still running after a hedge wins.
-Transport-local queues may impose lower limits; DoT retains Hickory's default of 32 active
-requests per connection rather than expanding its internal pipeline during the security upgrade.
+DoT permits up to 512 active requests per connection. Transport-local send queues may impose
+lower limits; a full queue or an HTTP status error fails the request without discarding the
+connection. Client TCP connections are capped at 64 and the launchd file descriptor soft limit
+is 4096. Cache responses are limited to 4096 bytes and capacity to 16384 entries.
+
+A configured DNS response, including SERVFAIL, never triggers plaintext system fallback.
+Unsupported encrypted query shapes are answered locally with NOTIMP or FORMERR. System
+fallback responses are not cached. Legacy UDP/TCP and bootstrap queries use cryptographically
+random IDs, with the client's original ID restored on return.
 
 Upstream responses are returned through `DnsResponse::into_buffer()` as their original bytes,
 not re-encoded. Client IDs are restored and responses are validated against the query. Channel

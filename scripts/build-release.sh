@@ -6,8 +6,7 @@ dist_dir="$project_root/dist"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/dnsrivet-release.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-toolchain_bin="${DNSRIVET_RUST_BIN:-$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin}"
-cargo="${CARGO:-$toolchain_bin/cargo}"
+mbx="${MBX:-$HOME/.cargo/bin/mbx}"
 if [ -n "${RUSTUP:-}" ]; then
     rustup=$RUSTUP
 elif [ -x "$HOME/.cargo/bin/rustup" ]; then
@@ -22,8 +21,8 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo "release packages can only be built on macOS" >&2
     exit 1
 fi
-if [ ! -x "$cargo" ]; then
-    echo "cargo not found: $cargo" >&2
+if [ ! -x "$mbx" ]; then
+    echo "mbx not found: $mbx" >&2
     exit 1
 fi
 if [ ! -x "$rustup" ]; then
@@ -56,18 +55,28 @@ if [ -z "$installer_identity" ]; then
     exit 1
 fi
 
-export PATH="$toolchain_bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-"$rustup" target add aarch64-apple-darwin x86_64-apple-darwin
+"$rustup" target add --toolchain stable aarch64-apple-darwin x86_64-apple-darwin
 
 cd "$project_root"
-"$cargo" test --all-targets --all-features --locked
-"$cargo" build --release --locked --target aarch64-apple-darwin
-"$cargo" build --release --locked --target x86_64-apple-darwin
+"$mbx" +stable test --all-targets --all-features --locked
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+    "$mbx" +stable build --release --locked --target "$target"
+    # Work on copies: mbx may share the target artifact with other checkouts.
+    slice="$work_dir/dnsrivet-$target"
+    /bin/cp "$project_root/target/$target/release/dnsrivet" "$slice"
+    /usr/bin/strip "$slice"
+    /usr/bin/nm -U "$slice" > "$work_dir/symbols"
+    symbols=$(/usr/bin/awk 'NF { n++ } END { print n+0 }' "$work_dir/symbols")
+    if [ "$symbols" -gt 64 ]; then
+        echo "unstripped release slice: $target ($symbols defined symbols)" >&2
+        exit 1
+    fi
+done
 
 universal="$work_dir/dnsrivet"
 /usr/bin/lipo -create \
-    "$project_root/target/aarch64-apple-darwin/release/dnsrivet" \
-    "$project_root/target/x86_64-apple-darwin/release/dnsrivet" \
+    "$work_dir/dnsrivet-aarch64-apple-darwin" \
+    "$work_dir/dnsrivet-x86_64-apple-darwin" \
     -output "$universal"
 /bin/chmod 0755 "$universal"
 /usr/bin/codesign --force \

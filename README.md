@@ -19,9 +19,9 @@ One binary. One runtime thread. No telemetry. No control plane.
 - DoH, DoH3, DoT, DoQ, and conventional UDP/TCP upstreams
 - Persistent multiplexed encrypted connections
 - Ordered failover with hedging, per-upstream timeouts, and exponential reconnect backoff
-- Direct fallback to the pre-takeover system DNS after all configured upstreams fail
+- Direct fallback to system DNS only when every configured upstream fails to return a DNS response
 - Bootstrap resolution that bypasses the system resolver to prevent loops
-- Local UDP and TCP listeners with bounded concurrency
+- Local UDP and pipelined TCP listeners with bounded concurrency
 - 4,096-entry LRU cache by default, with wire-level TTL aging
 - RFC 2308 negative caching and EDNS-aware UDP truncation
 - Transactional system DNS takeover and restoration
@@ -48,14 +48,16 @@ symbol stripping, and abort-on-panic behavior.
 
 | Measurement | Observed value |
 | --- | ---: |
-| Release binary | 2,523,120 bytes (2.41 MiB) |
+| Stripped arm64 binary | 2,606,376 bytes (2.49 MiB) |
+| Stripped x86_64 binary | 3,042,976 bytes (2.90 MiB) |
 | RSS after a fresh DoH3 connection | 4,656 KiB |
 | RSS after load and about four minutes | 4,912 KiB |
 | Tokio runtime threads | 1 |
 | Cached UDP latency, p50 / p95 | 0.087 / 0.112 ms |
 | Unique DoH3 latency, p50 / p95 | 8.72 / 9.92 ms |
 
-Measured on Apple Silicon with macOS 27.0 using 200 cached queries and 40
+Binary sizes were measured on 2026-11-09 before Developer ID signing. Other
+measurements were taken on Apple Silicon with macOS 27.0 using 200 cached queries and 40
 unique queries against a public DoH3 endpoint. These numbers describe one
 development machine and network path; they are not universal guarantees.
 
@@ -97,8 +99,8 @@ Requirements: macOS 11 or later and stable Rust.
 ```bash
 git clone https://github.com/WenliangCao/DNSRivet.git
 cd DNSRivet
-cargo test --all-targets --all-features
-cargo build --release
+mbx test --all-targets --all-features
+mbx build --release
 ./target/release/dnsrivet version
 ```
 
@@ -121,7 +123,8 @@ sudo dnsrivet start \
 ```
 
 Installing a newer PKG restarts an already running DNSRivet service while
-preserving its configuration and DNS backup.
+preserving its configuration and DNS backup. If the restart or DNS probe fails
+(for example while offline), installation succeeds and prints recovery commands.
 
 ### Homebrew
 
@@ -215,8 +218,37 @@ the link only if DNSRivet owns it.
 
 Installed state lives under `/Library/Application Support/DNSRivet/`. The DNS
 backup is written atomically with mode `0600`; without that backup, DNSRivet
-will not guess how to rewrite existing DNS settings. Logs are written to
-`/var/log/dnsrivet.log`.
+will not guess how to rewrite existing DNS settings. Service commands use the
+installed configuration, explicit `--config`, or CLI options; they never import
+`./dnsrivet.toml` implicitly. Logs are written to `/var/log/dnsrivet.log` with mode
+`0640`. Connection messages are debug-only; dependency logs are limited to errors.
+The service permits 4,096 file descriptors and at most 64 client TCP connections.
+
+When upgrading an older installation, run `sudo dnsrivet stop` followed by
+`sudo dnsrivet start` once to load the new launchd resource limits, startup
+recovery environment, and network-location backup metadata.
+
+Logs are not automatically rotated. To rotate without leaving a running process
+writing into a renamed file, stop the service, archive its log, then start it:
+
+```bash
+sudo dnsrivet stop
+sudo mv /var/log/dnsrivet.log /var/log/dnsrivet.log.previous
+sudo dnsrivet start
+```
+
+For a service startup error (invalid configuration, logger or listener failure),
+the managed daemon attempts to restore the original DNS before exiting. This
+cannot run if the binary is missing or blocked, or if macOS Safe Mode does not
+launch it. First try `sudo dnsrivet stop`. If the binary cannot run, list services
+with `networksetup -listallnetworkservices`; for a service that normally uses
+DHCP DNS, restore automatic DNS with `sudo networksetup -setdnsservers "Wi-Fi" Empty`.
+For static DNS, restore the known addresses from the backup instead.
+
+A backup records its macOS network location. Stop DNSRivet before switching
+locations. If already switched, return to the backed-up location and stop there;
+the watchdog and restoration refuse to apply that location's settings elsewhere.
+Older backups remain readable, but lack this location check until recreated.
 
 `start`, `stop`, `restart`, and `uninstall` are serialized across processes.
 `stop` restores DNS and disables the job while preserving the installed binary,
@@ -237,8 +269,10 @@ If the new service fails its DNS probe or cannot verify an active system DNS
 takeover, DNSRivet restores the previous config and restarts it.
 
 Before taking over macOS DNS, DNSRivet snapshots the effective system DNS
-servers. If every configured upstream fails, it queries those servers directly
-with a two-second bound per server. Loopback and self-listener addresses are
+servers. If every configured upstream fails to return a DNS response, it queries those
+servers directly with a two-second bound per server. A configured SERVFAIL is
+returned if no other configured upstream succeeds; it never triggers system
+fallback. Answers from system fallback are not cached. Loopback and self-listener addresses are
 discarded, so the fallback cannot recurse through DNSRivet. If no usable
 pre-takeover server exists, exhaustion still returns `SERVFAIL`.
 
@@ -255,10 +289,19 @@ cadence and says so in the log instead of fighting it.
 If macOS reports an enabled network service that was not present at startup,
 the watchdog records that service's original DNS settings before pointing it
 at DNSRivet. `stop` restores those settings together with the original
-services. On every watchdog cycle DNSRivet also tries to refresh the runtime
-fallback from non-loopback global resolvers. When macOS exposes only the local
-takeover resolver, or cannot read the current DNS configuration, DNSRivet keeps
-the previous fallback list and records the reason in the log.
+services. The watchdog skips subprocess checks when network preferences and the takeover
+marker have not changed. A new service already using a takeover address is
+skipped with a warning, allowing other services to be repaired without inventing
+its original DNS settings.
+
+A lightweight route-source check runs once per second. After a source change,
+DNSRivet reads DHCP DNS from the selected interface with `ipconfig`, even while
+`scutil` exposes only the takeover resolver. Watchdog checks also refresh from
+non-loopback global resolvers when available. If neither source exposes usable
+servers, the previous list is retained. A network change that keeps the same
+source address, DHCPv6-only DNS, or VPN-scoped DNS may not be detected by the DHCP
+refresh; captive portal access is not guaranteed. Use `sudo dnsrivet stop` to
+restore the network's resolver when necessary.
 
 ## Configuration
 
@@ -282,6 +325,11 @@ timeout = 5000 # milliseconds; omitted = 5000
 ip_stack = "both" # both | v4 | v6
 ```
 
+For foreground listeners reachable from other hosts, bind a specific interface
+address instead of `0.0.0.0` or `::`; wildcard UDP listeners may reply from a
+different source address on machines with multiple interfaces. Configuration
+validation warns about non-loopback listeners.
+
 An explicit `timeout = 0` disables the timeout and is a dangerous advanced
 option: when the first upstream black-holes traffic (drops packets without
 refusing), that query never reaches later upstreams or the system fallback,
@@ -296,24 +344,30 @@ own timeout so stalled connections still back off. All attempts, including
 background losers and system fallback, share a 512-attempt budget. Upstreams
 with `timeout = 0` are never raced. Hedging means a later upstream can see a
 query the first one would have answered slowly, so order upstreams you are
-equally willing to send queries to. Listing the same resolver as `doh3` and
-then `doh` keeps queries answered over TCP when a network drops UDP/443.
+equally willing to send queries to. Prefer `doh` before `doh3` for steadier first
+queries after idle periods; DoH3 peers may close idle QUIC connections after
+30 seconds. QUIC keep-alive and 0-RTT are not enabled.
 
 See [`example.config.toml`](example.config.toml) for the complete annotated
 example. DoH and DoH3 default to port 443; DoT and DoQ default to 853;
 conventional DNS defaults to 53.
 
-The cache accepts standard single-question recursive queries. Queries with
-EDNS options, TSIG, a non-zero EDNS version, or `RD=0` bypass the cache and
-are still forwarded normally. Cache keys include the canonical name, record
+The cache accepts standard single-question recursive queries, preserves each
+client's question casing, and stores responses up to 4,096 bytes. `cache_size`
+is limited to 16,384 entries. Queries with EDNS options, a non-zero EDNS version,
+`RD=0`, or answer/authority records bypass the cache. Unsupported encrypted
+query shapes are rejected locally as described below. Cache keys include the canonical name, record
 type, class, EDNS presence, and DNSSEC request bits. Negative answers expire at
 the shorter of SOA TTL and SOA.MINIMUM, capped at 600 seconds without extending
 short TTLs; a zero TTL is not cached.
 
 A QUERY carrying more than one question is answered locally with a
 header-only FORMERR and never forwarded (RFC 9619). Question-less queries
-such as RFC 7873 cookie probes are forwarded to `legacy` upstreams only;
-encrypted transports require exactly one question. Every upstream and
+such as RFC 7873 cookie probes can be forwarded when only `legacy` upstreams are
+configured. With encrypted upstreams configured, malformed queries receive
+FORMERR and unsupported shapes (including zero questions, non-QUERY opcodes,
+and non-OPT resource records/signatures) receive NOTIMP locally. Packets with
+QR=1 are discarded. Every upstream and
 fallback response must echo the query's question before it is returned or
 cached (RFC 5452).
 
@@ -328,9 +382,13 @@ cached (RFC 5452).
   leaves queries on the system's own DNS.
 - VPN and Network Extension scoped resolvers are outside the takeover and are
   never used as fallback servers.
-- When macOS cannot expose the post-change network DNS while the takeover is
-  intact, the fallback list stays unchanged and the log explains why it was
-  not refreshed.
+- DHCP fallback refresh depends on a change in route source address and an
+  interface exposing DHCP DNS; otherwise the prior fallback may remain in use.
+- Local names (including unicast `.local` and `.lan` queries) are forwarded to
+  configured upstreams. There is no split DNS routing for private names; a public
+  upstream may receive them and fail to resolve them. Configure an appropriate
+  resolver if local names are required.
+- The daemon runs as root for port 53 and system DNS management.
 - Debug logs can contain queried domain names and complete upstream URLs.
 - Service commands modify system-wide `launchd` and network DNS state and
   therefore require `sudo`.
@@ -361,9 +419,9 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 支持 DoH、DoH3、DoT、DoQ 和传统 UDP/TCP 上游
 - 加密连接持久化并复用
 - 带对冲的顺序故障转移、独立超时和指数退避重连
-- 所有配置上游失败后，直接回退到接管前的系统 DNS
+- 所有配置上游均未返回 DNS 应答时，才直接回退到系统 DNS
 - bootstrap 解析绕过系统 resolver，避免 DNS 自环
-- UDP/TCP 本地监听与有界并发
+- UDP/TCP 本地监听、有界并发及 TCP 查询流水线
 - 默认 4,096 项 LRU 缓存，直接在 DNS wire 层递减 TTL
 - RFC 2308 负缓存和 EDNS 感知的 UDP 截断
 - 事务式接管和恢复系统 DNS
@@ -387,14 +445,16 @@ release 配置启用 LTO、单 codegen unit、符号剥离和 panic abort，以�
 
 | 测量项 | 实测值 |
 | --- | ---: |
-| release 二进制 | 2,523,120 bytes（2.41 MiB） |
+| 剥离后的 arm64 二进制 | 2,606,376 bytes（2.49 MiB） |
+| 剥离后的 x86_64 二进制 | 3,042,976 bytes（2.90 MiB） |
 | 新建 DoH3 连接后的 RSS | 4,656 KiB |
 | 负载结束约四分钟后的 RSS | 4,912 KiB |
 | Tokio 运行时线程 | 1 |
 | UDP 缓存命中延迟 p50 / p95 | 0.087 / 0.112 ms |
 | 唯一 DoH3 查询延迟 p50 / p95 | 8.72 / 9.92 ms |
 
-数据来自 Apple Silicon、macOS 27.0 开发机，测试包含 200 次缓存查询和 40 次
+二进制体积于 2026-11-09 在 Developer ID 签名前测量。其他数据来自 Apple Silicon、
+macOS 27.0 开发机，测试包含 200 次缓存查询和 40 次
 经公共 DoH3 端点的唯一查询。具体数值会随机器与网络路径变化。
 
 ## 构建与前台运行
@@ -402,8 +462,8 @@ release 配置启用 LTO、单 codegen unit、符号剥离和 panic abort，以�
 需要 macOS 11 或更高版本以及稳定版 Rust：
 
 ```bash
-cargo test --all-targets --all-features
-cargo build --release
+mbx test --all-targets --all-features
+mbx build --release
 cp example.config.toml dnsrivet.toml
 ./target/release/dnsrivet run --config dnsrivet.toml
 ```
@@ -449,7 +509,7 @@ sudo dnsrivet start \
 ```
 
 以后安装新版 PKG 时，如果 DNSRivet 已在运行，安装器会保留配置和 DNS 备份并
-自动重启服务。
+自动重启服务。重启或 DNS 探测失败（例如离线升级）时，安装仍成功，并提示恢复命令。
 
 ### Homebrew
 
@@ -496,17 +556,37 @@ DNS。中途失败会回滚已修改的服务。
 
 如果 macOS 报告了启动后新出现的启用网络服务，看门狗会先记录该服务原有的 DNS，
 再将它指向 DNSRivet；执行 `stop` 时会连同原有服务一起恢复。每次看门狗检查时，
-DNSRivet 还会尝试从非 loopback 的全局 resolver 刷新运行时回退列表。如果 macOS
-只暴露本机接管 resolver，或无法读取当前 DNS 配置，DNSRivet 会保留旧回退列表，
-并在日志中说明原因。
+DNSRivet 还会尝试从非 loopback 全局 resolver 刷新运行时回退列表。另有每秒一次的
+轻量路由源地址检查；地址变化时，通过 `ipconfig` 读取对应接口的 DHCP DNS，因此
+接管仍完好时也能刷新。读取不到可用地址则保留旧列表。同源地址换网、仅 DHCPv6
+或 VPN scoped DNS 不保证能刷新，强制门户也不保证可用；必要时执行
+`sudo dnsrivet stop` 恢复网络原解析器。
 
 首次成功启动后会安装稳定入口 `/usr/local/bin/dnsrivet`；如果当前命令本身由
 Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会覆盖无关路径，卸载时
 也只删除仍由自己持有的链接。
 
 安装状态位于 `/Library/Application Support/DNSRivet/`。DNS 备份以 `0600` 权限
-原子写入；没有备份时，DNSRivet 不会猜测性改写原有 DNS。日志位于
-`/var/log/dnsrivet.log`。
+原子写入；没有备份时，DNSRivet 不会猜测性改写原有 DNS。服务命令只使用已安装配置、
+显式 `--config` 或命令行选项，不再隐式导入当前目录的 `dnsrivet.toml`。日志位于
+`/var/log/dnsrivet.log`，权限为 `0640`；连接成功日志仅在 debug 级别输出，依赖库仅
+输出 error。服务文件描述符软上限为 4096，客户端 TCP 连接上限为 64。
+
+旧安装升级后，执行一次 `sudo dnsrivet stop` 再 `sudo dnsrivet start`，加载新的
+launchd 限制、启动恢复环境及带网络位置信息的备份。日志不自动轮转；需要归档时，
+先 stop，再把日志移动为 `/var/log/dnsrivet.log.previous`，最后 start，避免进程
+继续向已改名的文件写入。
+
+服务因配置、日志初始化或绑定失败而无法启动时，会尝试恢复原系统 DNS 后再退出。
+二进制被删除、无法执行，或安全模式未加载服务时，这个恢复逻辑无法运行。优先执行
+`sudo dnsrivet stop`；若程序无法执行，先用 `networksetup -listallnetworkservices`
+列出服务。原本使用 DHCP DNS 的服务可用
+`sudo networksetup -setdnsservers "Wi-Fi" Empty` 恢复自动 DNS；静态 DNS 则按备份
+恢复原地址。
+
+切换 macOS 网络位置前应先 stop。已经切换时，先回到备份所属位置再 stop；看门狗
+和恢复操作会拒绝把原位置的 DNS 设置写到别的位置。旧备份仍可读取，但需重新接管
+后才具备位置校验。
 
 `start`、`stop`、`restart` 和 `uninstall` 使用跨进程锁串行执行。
 `stop` 恢复 DNS 并禁用服务，但保留已安装的二进制、配置和 plist。如果改名或未记录的
@@ -523,8 +603,9 @@ sudo dnsrivet restart --config dnsrivet.toml
 如果新服务未通过 DNS 探活，或无法验证活动的系统 DNS 接管，DNSRivet 会恢复旧配置
 并重新启动。
 
-接管 macOS DNS 前，DNSRivet 会记录当时实际生效的系统 DNS。所有配置上游都失败时，
-它会绕过已经指向自身的系统 resolver，直接查询这些服务器，每台最多等待两秒。
+接管 macOS DNS 前，DNSRivet 会记录当时实际生效的系统 DNS。所有配置上游均未返回
+DNS 应答时，才直接查询这些服务器，每台最多等待两秒。配置上游的 SERVFAIL 会在
+其他配置上游均未成功时返回给客户端，不触发系统回退；回退得到的答案不进缓存。
 loopback 和自身监听地址会被过滤，避免形成递归自环。如果没有可用的接管前服务器，
 最终仍返回 `SERVFAIL`。
 
@@ -532,13 +613,17 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 网络服务是否仍严格指向接管地址。macOS 更新可能重写网络偏好、静默清除接管；
 看门狗检测到后，会先把当前网络的 DNS 捕获为新的运行时回退列表，再重新接管。
 原有服务的恢复 DNS 不会被替换；新服务和接管地址历史会在修改 DNS 前保存。
-若有外部工具持续改写 DNS，看门狗会退避到 30 分钟
-周期并在日志中说明，而不是无限对抗。
+网络偏好及接管标记未变化时，会跳过本轮子进程检查。新服务若已经列出接管地址，
+只告警并跳过该服务，其他服务仍继续修复。若有外部工具持续改写 DNS，看门狗会
+退避到 30 分钟周期并在日志中说明。
 
 ## 配置与缓存
 
 完整配置见 [`example.config.toml`](example.config.toml)。DoH/DoH3 默认端口为
 443，DoT/DoQ 为 853，传统 DNS 为 53。
+
+前台模式若需向其他主机提供 DNS，应绑定具体接口地址，避免 `0.0.0.0` 或 `::`
+通配监听在多接口环境中用错误的源地址应答。配置校验会对非 loopback 监听发出警告。
 
 `timeout` 省略时默认 5000 毫秒。显式写 `timeout = 0` 表示完全禁用超时，属于
 危险的高级选项：第一上游黑洞（丢包不拒绝）时，该查询不会进入后续上游或系统
@@ -550,17 +635,19 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 超时，让卡住的连接仍能断开并退避。包括后台落败请求和系统回退在内的所有尝试
 共用 512 项预算。`timeout = 0` 的上游不参与对冲。对冲意味着
 后续上游可能收到首上游本可以慢速应答的查询，因此只把同样愿意发送查询的上游
-排在后面。把同一解析服务依次配置为 `doh3` 和 `doh`，可以在网络丢弃 UDP/443
-时继续通过 TCP 应答。
+排在后面。不做 keep-alive 时，建议把 `doh` 放在 `doh3` 前面，让空闲后的首个
+查询延迟更稳定；DoH3 对端可能在空闲 30 秒后关闭 QUIC 连接。不启用 QUIC 0-RTT。
 
-缓存仅处理标准单问题递归查询。带 EDNS option、TSIG、非零 EDNS 版本或
-`RD=0` 的查询会绕过缓存，但仍正常转发。缓存键包含规范化域名、记录类型、类别、
+缓存仅处理标准单问题递归查询，并还原每个客户端的问题段大小写。应答超过 4096
+字节不缓存，`cache_size` 最大为 16384。带 EDNS option、非零 EDNS 版本、`RD=0`
+或应答/授权记录的查询绕过缓存；不支持的加密查询形态在本地拒绝。缓存键包含规范化域名、记录类型、类别、
 是否使用 EDNS 和 DNSSEC 请求位。负缓存使用 SOA TTL 与 SOA.MINIMUM 中较小的值，
 最多缓存 600 秒，不延长短 TTL；TTL 为零时不缓存。
 
 携带多个 question 的查询会在本地直接返回仅含报文头的 FORMERR，不会被转发
-（RFC 9619）。不含 question 的查询（如 RFC 7873 Cookie 探询）只会转发给
-`legacy` 上游；加密传输要求恰好一个 question。所有上游与回退响应必须与请求的
+（RFC 9619）。仅配置 `legacy` 上游时，不含 question 的查询仍可转发。配置含加密
+上游时，格式错误返回 FORMERR；不含 question、非 QUERY opcode、含非 OPT 记录
+或签名等不支持的形态在本地返回 NOTIMP。QR=1 报文直接丢弃。所有上游与回退响应必须与请求的
 question 一致，才会被返回或写入缓存（RFC 5452）。
 
 ## 安全边界
@@ -571,8 +658,10 @@ question 一致，才会被返回或写入缓存（RFC 5452）。
   外部清除的接管会让查询走系统自身 DNS。
 - VPN 与 Network Extension 的 scoped resolver 不在接管范围内，也不会被用作
   回退服务器。
-- 接管完好但 macOS 没有暴露换网后的 DNS 时，回退列表保持不变，日志会说明
-  没有刷新的原因。
+- DHCP 回退刷新依赖路由源地址变化和接口可读的 DHCP DNS；否则可能继续使用旧列表。
+- 没有针对局域网名字的分流；`.lan` 和以单播送来的 `.local` 等名字仍发往配置上游，
+  公共上游可能获知这些名字却无法解析。需要局域网解析时应配置合适的 resolver。
+- 守护进程仍以 root 运行，以绑定 53 端口并管理系统 DNS。
 - debug 日志可能包含查询域名和完整上游 URL。
 - 服务命令修改系统级 `launchd` 和网络 DNS，因此需要 `sudo`。
 - 源码会主动拒绝在非 macOS 目标上编译。
