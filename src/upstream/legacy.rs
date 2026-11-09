@@ -3,7 +3,9 @@
 //! UDP first; TCP only to chase a TC-truncated response, and only for TCP
 //! clients (UDP clients get the TC bit passed through and retry themselves).
 
+use ring::rand::{SecureRandom, SystemRandom};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -20,7 +22,27 @@ pub fn is_truncated(response: &[u8]) -> bool {
     response.len() >= 12 && response[2] & 0x02 != 0
 }
 
+fn randomized_query(query: &[u8]) -> Result<Vec<u8>, String> {
+    if query.len() < 12 {
+        return Err("query shorter than DNS header".into());
+    }
+    let mut outbound = query.to_vec();
+    SystemRandom::new()
+        .fill(&mut outbound[..2])
+        .map_err(|_| "DNS ID randomization failed")?;
+    Ok(outbound)
+}
+
 pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
+    query_udp_with_retry(addr, query, true).await
+}
+
+// Bootstrap already switches to TCP after one second.
+pub(super) async fn query_udp_with_retry(
+    addr: SocketAddr,
+    query: &[u8],
+    retry_udp: bool,
+) -> Result<Vec<u8>, String> {
     let bind = SocketAddr::new(
         if addr.is_ipv4() {
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
@@ -31,17 +53,29 @@ pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
     );
     let sock = UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
     sock.connect(addr).await.map_err(|e| e.to_string())?;
-    sock.send(query).await.map_err(|e| e.to_string())?;
+    let outbound = randomized_query(query)?;
+    sock.send(&outbound).await.map_err(|e| e.to_string())?;
+    let retry = tokio::time::sleep(Duration::from_secs(1));
+    tokio::pin!(retry);
+    let mut resent = !retry_udp;
     // One extra byte detects OS-level truncation without a 64 KiB allocation
     // per query. Never forward a clipped datagram with TC left clear.
     const MAX_UDP_RESPONSE: usize = 4096;
     let mut buf = vec![0u8; MAX_UDP_RESPONSE + 1];
     loop {
-        let n = sock.recv(&mut buf).await.map_err(|e| e.to_string())?;
+        let n = tokio::select! {
+            biased;
+            received = sock.recv(&mut buf) => received.map_err(|e| e.to_string())?,
+            () = &mut retry, if !resent => {
+                sock.send(&outbound).await.map_err(|e| e.to_string())?;
+                resent = true;
+                continue;
+            }
+        };
         // Accept only a datagram matching our ID and our question (RFC 5452);
         // keep waiting on anything else so the genuine reply can still arrive.
         if n >= 12
-            && buf[..2] == query[..2]
+            && buf[..2] == outbound[..2]
             && crate::wire::validate_response(query, &buf[..n]).is_ok()
         {
             buf.truncate(n);
@@ -52,6 +86,7 @@ pub async fn query_udp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
                 crate::wire::validate_response(query, &buf)
                     .map_err(|err| format!("truncated udp response rejected: {err}"))?;
             }
+            buf[..2].copy_from_slice(&query[..2]);
             return Ok(buf);
         }
     }
@@ -62,7 +97,8 @@ pub async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
     let mut stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
     let mut framed = Vec::with_capacity(2 + query.len());
     framed.extend_from_slice(&len.to_be_bytes());
-    framed.extend_from_slice(query);
+    let outbound = randomized_query(query)?;
+    framed.extend_from_slice(&outbound);
     stream.write_all(&framed).await.map_err(|e| e.to_string())?;
 
     let mut lenbuf = [0u8; 2];
@@ -77,11 +113,12 @@ pub async fn query_tcp(addr: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String
         .map_err(|e| e.to_string())?;
     // TCP has no stray-datagram problem, but the ID must still round-trip
     // and, as over UDP, the response must answer our question (RFC 5452).
-    if response.len() < 12 || response[..2] != query[..2] {
+    if response.len() < 12 || response[..2] != outbound[..2] {
         return Err("tcp response ID mismatch".into());
     }
     crate::wire::validate_response(query, &response)
         .map_err(|e| format!("tcp response rejected: {e}"))?;
+    response[..2].copy_from_slice(&query[..2]);
     Ok(response)
 }
 
@@ -117,7 +154,9 @@ mod tests {
         let responder = tokio::spawn(async move {
             let mut received = [0u8; 512];
             let (n, peer) = socket.recv_from(&mut received).await.unwrap();
-            assert_eq!(&received[..n], expected_request);
+            assert_eq!(&received[2..n], &expected_request[2..]);
+            let mut sent_response = sent_response;
+            sent_response[..2].copy_from_slice(&received[..2]);
             socket.send_to(&sent_response, peer).await.unwrap();
         });
 
@@ -146,9 +185,10 @@ mod tests {
         let responder = tokio::spawn(async move {
             let mut received = [0u8; 512];
             let (n, peer) = socket.recv_from(&mut received).await.unwrap();
-            assert_eq!(&received[..n], expected_request);
+            assert_eq!(&received[2..n], &expected_request[2..]);
             let mut truncated = sent_response.clone();
             truncated[2] |= 0x02;
+            truncated[..2].copy_from_slice(&received[..2]);
             socket.send_to(&truncated, peer).await.unwrap();
 
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -156,7 +196,9 @@ mod tests {
             stream.read_exact(&mut len).await.unwrap();
             assert_eq!(u16::from_be_bytes(len) as usize, expected_request.len());
             stream.read_exact(&mut received[..n]).await.unwrap();
-            assert_eq!(&received[..n], expected_request);
+            assert_eq!(&received[2..n], &expected_request[2..]);
+            let mut sent_response = sent_response;
+            sent_response[..2].copy_from_slice(&received[..2]);
             stream
                 .write_all(&(sent_response.len() as u16).to_be_bytes())
                 .await
@@ -200,6 +242,8 @@ mod tests {
                 let responder = tokio::spawn(async move {
                     let mut received = [0; 512];
                     let (_, peer) = socket.recv_from(&mut received).await.unwrap();
+                    let mut sent = sent;
+                    sent[..2].copy_from_slice(&received[..2]);
                     socket.send_to(&sent, peer).await.unwrap();
                     if size > 4096 && tcp_retry {
                         let (mut stream, _) = listener.accept().await.unwrap();
@@ -208,6 +252,7 @@ mod tests {
                             .read_exact(&mut received[..usize::from(len)])
                             .await
                             .unwrap();
+                        sent[..2].copy_from_slice(&received[..2]);
                         stream.write_u16(sent.len() as u16).await.unwrap();
                         stream.write_all(&sent).await.unwrap();
                     }
@@ -243,6 +288,7 @@ mod tests {
             let (_, peer) = socket.recv_from(&mut received).await.unwrap();
             let mut response = sent[..12].to_vec();
             response[2] |= 0x80;
+            response[..2].copy_from_slice(&received[..2]);
             response[7] = 1;
             // The question is valid before clipping but references NULL RDATA.
             response.extend_from_slice(&[0xc0, 29, 0, 1, 0, 1]);
@@ -283,7 +329,7 @@ mod tests {
         responder.await.unwrap();
     }
 
-    async fn tcp_responder(respond_with_id: u16, wrong_question: bool) -> std::net::SocketAddr {
+    async fn tcp_responder(wrong_id: bool, wrong_question: bool) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -292,7 +338,9 @@ mod tests {
             stream.read_exact(&mut lenbuf).await.unwrap();
             let mut received = vec![0u8; u16::from_be_bytes(lenbuf) as usize];
             stream.read_exact(&mut received).await.unwrap();
-            received[..2].copy_from_slice(&respond_with_id.to_be_bytes());
+            if wrong_id {
+                received[0] ^= 1;
+            }
             received[2] |= 0x80;
             if wrong_question {
                 received[13] = b'z';
@@ -306,22 +354,44 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_accepts_matching_id() {
-        let addr = tcp_responder(0x1234, false).await;
+        let addr = tcp_responder(false, false).await;
         let response = query_tcp(addr, &query_bytes(0x1234)).await.unwrap();
         assert_eq!(&response[..2], &0x1234u16.to_be_bytes());
     }
 
     #[tokio::test]
     async fn tcp_rejects_id_mismatch() {
-        let addr = tcp_responder(0xbeef, false).await;
+        let addr = tcp_responder(true, false).await;
         let err = query_tcp(addr, &query_bytes(0x1234)).await.unwrap_err();
         assert!(err.contains("ID mismatch"));
     }
 
     #[tokio::test]
     async fn tcp_rejects_answer_to_a_different_question() {
-        let addr = tcp_responder(0x1234, true).await;
+        let addr = tcp_responder(false, true).await;
         let err = query_tcp(addr, &query_bytes(0x1234)).await.unwrap_err();
         assert!(err.contains("rejected"), "{err}");
+    }
+    #[tokio::test]
+    async fn udp_retries_a_lost_packet_and_restores_the_client_id() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let request = query_bytes(0x1234);
+        let responder = tokio::spawn(async move {
+            let mut first = [0; 512];
+            let (n, peer) = socket.recv_from(&mut first).await.unwrap();
+            let mut second = [0; 512];
+            let (m, again) = socket.recv_from(&mut second).await.unwrap();
+            assert_eq!(peer, again);
+            assert_eq!(&first[..n], &second[..m]);
+            second[2] |= 0x80;
+            socket.send_to(&second[..m], peer).await.unwrap();
+        });
+        let answer = tokio::time::timeout(Duration::from_secs(2), query_udp(addr, &request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&answer[..2], &request[..2]);
+        responder.await.unwrap();
     }
 }

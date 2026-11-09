@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -288,7 +287,7 @@ async fn query(
     name: &Name,
     rtype: RecordType,
 ) -> Result<(Vec<IpAddr>, u32), String> {
-    let mut msg = Message::new(next_id(), MessageType::Query, OpCode::Query);
+    let mut msg = Message::new(0, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(name.clone(), rtype));
     let bytes = msg.to_vec().map_err(|e| e.to_string())?;
@@ -328,7 +327,12 @@ async fn query_if(
 
 /// UDP first; TCP when the datagram times out, errors, or comes back truncated.
 async fn exchange(server: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
-    let udp_err = match tokio::time::timeout(UDP_TIMEOUT, legacy::query_udp(server, query)).await {
+    let udp_err = match tokio::time::timeout(
+        UDP_TIMEOUT,
+        legacy::query_udp_with_retry(server, query, false),
+    )
+    .await
+    {
         Ok(Ok(response)) if !legacy::is_truncated(&response) => return Ok(response),
         Ok(Ok(_)) => "truncated".to_string(),
         Ok(Err(err)) => err,
@@ -345,21 +349,12 @@ async fn exchange(server: SocketAddr, query: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn next_id() -> u16 {
-    static COUNTER: AtomicU16 = AtomicU16::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u16;
-    nanos ^ COUNTER.fetch_add(0x9e37, Ordering::Relaxed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use hickory_net::proto::rr::Record;
     use hickory_net::proto::rr::rdata::{A, AAAA};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
