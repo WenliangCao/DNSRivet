@@ -18,7 +18,11 @@
 //! - host slept since the last query: drop the connection before sending,
 //!   no backoff, and re-resolve the bootstrap address (the peer has likely
 //!   forgotten it, and a black-holed send would burn the whole deadline and
-//!   push the query to the plaintext system fallback).
+//!   push the query to the plaintext system fallback);
+//! - route source for the peer changed (network switch, VPN up/down): drop
+//!   the connection before sending, no backoff;
+//! - deadline expiry after sleep or a route change under that lease: no
+//!   backoff, one retry on a fresh connection with a short extra budget.
 
 use crate::config::{Proto, Upstream};
 use crate::upstream::bootstrap::Bootstrap;
@@ -34,7 +38,7 @@ use hickory_net::xfer::{
     FirstAnswer,
 };
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
@@ -45,6 +49,10 @@ const MAX_BACKOFF_SHIFT: u32 = 5; // 2^5 = 32s cap
 const MIN_REDIAL_BUDGET: Duration = Duration::from_millis(250);
 /// Sleep longer than this renews connections before the next query.
 const RENEW_AFTER_SLEEP: Duration = Duration::from_secs(5);
+/// Route lookups cost a few syscalls; at most one per channel per interval.
+const ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Extra time a query gets when the network moved under its connection.
+pub(super) const STALE_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 /// rustls config shared by every encrypted upstream: ring provider,
 /// webpki (Mozilla) trust anchors, session resumption on by default.
@@ -83,6 +91,27 @@ impl Stamp {
     }
 }
 
+/// The kernel's source address for `peer`. `connect` on a UDP socket only
+/// consults the routing table; nothing is sent. None means no route now.
+fn route_source(peer: SocketAddr) -> Option<IpAddr> {
+    let unspecified = if peer.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    let socket = std::net::UdpSocket::bind((unspecified, 0)).ok()?;
+    socket.connect(peer).ok()?;
+    socket.local_addr().ok().map(|local| local.ip())
+}
+
+/// Where a connection was dialed to, and from which route-selected source.
+#[derive(Clone, Copy)]
+struct RoutePath {
+    peer: SocketAddr,
+    source: IpAddr,
+    checked: Instant,
+}
+
 /// Generation-tracked connection slot. Generic over the handle type so the
 /// invalidation rules are unit-testable without real connections.
 struct Slot<E> {
@@ -92,6 +121,7 @@ struct Slot<E> {
     cooldown_until: Option<Instant>,
     /// When the slot was last leased or stored, for sleep detection.
     last_used: Option<Stamp>,
+    path: Option<RoutePath>,
 }
 
 impl<E> Default for Slot<E> {
@@ -102,6 +132,7 @@ impl<E> Default for Slot<E> {
             connect_failures: 0,
             cooldown_until: None,
             last_used: None,
+            path: None,
         }
     }
 }
@@ -117,14 +148,49 @@ impl<E: Clone> Slot<E> {
         self.connect_failures = 0;
         self.cooldown_until = None;
         self.last_used = Some(Stamp::now());
+        self.path = None;
         self.generation
+    }
+
+    fn record_path(&mut self, peer: SocketAddr, source: Option<IpAddr>) {
+        self.path = source.map(|source| RoutePath {
+            peer,
+            source,
+            checked: Instant::now(),
+        });
     }
 
     /// Drop the connection if the host slept since the slot was last used,
     /// returning how long it slept. No backoff: the connection did not fail.
     fn drop_if_slept(&mut self, now: Stamp) -> Option<Duration> {
         let slept = now.slept_since(self.last_used.replace(now)?);
-        (slept > RENEW_AFTER_SLEEP && self.exchange.take().is_some()).then_some(slept)
+        if slept <= RENEW_AFTER_SLEEP || self.exchange.take().is_none() {
+            return None;
+        }
+        self.path = None;
+        Some(slept)
+    }
+
+    /// The peer to look up when this connection's route check is due.
+    fn route_check_due(&mut self, now: Instant) -> Option<SocketAddr> {
+        let path = self.path.as_mut()?;
+        if now.saturating_duration_since(path.checked) < ROUTE_CHECK_INTERVAL {
+            return None;
+        }
+        path.checked = now;
+        Some(path.peer)
+    }
+
+    /// Drop the connection if its route source changed, returning the old
+    /// and new source. No route says nothing: the same source may return.
+    fn drop_if_moved(&mut self, current: Option<IpAddr>) -> Option<(IpAddr, IpAddr)> {
+        let (from, to) = (self.path?.source, current?);
+        if from == to {
+            return None;
+        }
+        self.exchange = None;
+        self.path = None;
+        Some((from, to))
     }
 
     /// Clear the slot only if `generation` is still the current one; a
@@ -132,6 +198,7 @@ impl<E: Clone> Slot<E> {
     fn invalidate(&mut self, generation: u64) -> bool {
         if self.generation == generation && self.exchange.is_some() {
             self.exchange = None;
+            self.path = None;
             true
         } else {
             false
@@ -150,6 +217,19 @@ struct Lease {
     exchange: DnsExchange<TokioRuntimeProvider>,
     generation: u64,
     reused: bool,
+    path: Option<RoutePath>,
+    taken: Stamp,
+}
+
+impl Lease {
+    /// Whether the host slept or the route moved since this lease was taken,
+    /// so a deadline expiry says nothing about the upstream itself.
+    fn went_stale(&self) -> bool {
+        Stamp::now().slept_since(self.taken) > RENEW_AFTER_SLEEP
+            || self
+                .path
+                .is_some_and(|path| route_source(path.peer).is_some_and(|to| to != path.source))
+    }
 }
 
 enum SendFailure {
@@ -189,19 +269,37 @@ impl Channel {
     pub async fn query(
         &self,
         message: &Message,
-        deadline: Option<Instant>,
+        mut deadline: Option<Instant>,
     ) -> Result<Vec<u8>, String> {
+        let retry_budget = deadline.map(|at| {
+            at.saturating_duration_since(Instant::now())
+                .min(STALE_RETRY_BUDGET)
+        });
         let mut lease = self.acquire(deadline).await?;
         let mut retried = false;
         loop {
             match send(&lease.exchange, message.clone(), deadline).await {
                 Ok(buffer) => return Ok(buffer),
                 Err(SendFailure::Deadline) => {
+                    let stale = !retried && lease.went_stale();
                     let mut state = self.state.lock().await;
-                    if state.invalidate(lease.generation) {
-                        state.backoff();
+                    let invalidated = state.invalidate(lease.generation);
+                    if !stale {
+                        if invalidated {
+                            state.backoff();
+                        }
+                        return Err("no answer within the deadline".into());
                     }
-                    return Err("no answer within the deadline".into());
+                    drop(state);
+                    log::info!(
+                        "upstream {}: network changed during a query; retrying on a fresh connection",
+                        self.up.name
+                    );
+                    retried = true;
+                    deadline = retry_budget.map(|budget| Instant::now() + budget);
+                    lease = self.acquire(deadline).await.map_err(|err| {
+                        format!("no answer within the deadline; redial failed: {err}")
+                    })?;
                 }
                 Err(SendFailure::Transport(err)) => {
                     let mut state = self.state.lock().await;
@@ -234,8 +332,9 @@ impl Channel {
     async fn acquire(&self, deadline: Option<Instant>) -> Result<Lease, String> {
         // Holding the async lock across connect serializes dial attempts,
         // so a burst of queries cannot stampede-connect.
+        let now = Stamp::now();
         let mut state = self.state.lock().await;
-        if let Some(slept) = state.drop_if_slept(Stamp::now()) {
+        if let Some(slept) = state.drop_if_slept(now) {
             log::info!(
                 "upstream {}: host slept {:.0}s; renewing connection",
                 self.up.name,
@@ -245,11 +344,21 @@ impl Channel {
                 self.bootstrap.invalidate(&self.up.host).await;
             }
         }
+        if let Some(peer) = state.route_check_due(now.mono)
+            && let Some((from, to)) = state.drop_if_moved(route_source(peer))
+        {
+            log::info!(
+                "upstream {}: route source changed from {from} to {to}; renewing connection",
+                self.up.name
+            );
+        }
         if let Some((exchange, generation)) = state.lease() {
             return Ok(Lease {
                 exchange,
                 generation,
                 reused: true,
+                path: state.path,
+                taken: now,
             });
         }
         if let Some(until) = state.cooldown_until {
@@ -304,10 +413,13 @@ impl Channel {
                         self.up.proto.as_str()
                     );
                     let generation = state.store(exchange.clone());
+                    state.record_path(addr, route_source(addr));
                     return Ok(Lease {
                         exchange,
                         generation,
                         reused: false,
+                        path: state.path,
+                        taken: now,
                     });
                 }
                 Err(err) => {
@@ -1133,6 +1245,92 @@ mod tests {
         assert_eq!(slot.connect_failures, 0);
         assert!(slot.cooldown_until.is_none());
         assert_eq!(slot.drop_if_slept(woke), None, "nothing left to drop");
+    }
+
+    #[test]
+    fn route_lookup_finds_the_local_source_without_sending() {
+        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        assert_eq!(route_source(peer), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn route_changes_drop_the_connection_without_backoff() {
+        let (peer, old, new) = (
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 443)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),
+        );
+        let mut slot: Slot<u8> = Slot::default();
+        let generation = slot.store(1);
+        slot.record_path(peer, Some(old));
+
+        assert_eq!(slot.drop_if_moved(Some(old)), None);
+        assert_eq!(slot.drop_if_moved(None), None, "no route is not a move");
+        assert_eq!(slot.lease(), Some((1, generation)));
+
+        assert_eq!(slot.drop_if_moved(Some(new)), Some((old, new)));
+        assert!(slot.lease().is_none());
+        assert_eq!(slot.connect_failures, 0);
+        assert!(slot.cooldown_until.is_none());
+        assert_eq!(slot.drop_if_moved(Some(old)), None, "nothing left to drop");
+    }
+
+    #[test]
+    fn route_checks_are_rate_limited_per_connection() {
+        let peer = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 443));
+        let mut slot: Slot<u8> = Slot::default();
+        slot.store(1);
+        assert_eq!(slot.route_check_due(Instant::now()), None, "no path yet");
+
+        slot.record_path(peer, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        let start = slot.path.unwrap().checked;
+        assert_eq!(slot.route_check_due(start), None);
+        let later = start + ROUTE_CHECK_INTERVAL;
+        assert_eq!(slot.route_check_due(later), Some(peer));
+        assert_eq!(slot.route_check_due(later), None);
+    }
+
+    /// A deadline on a connection whose route moved is not the upstream's
+    /// fault: no backoff, and the query gets one more try on the successor.
+    #[tokio::test]
+    async fn deadline_after_a_route_change_retries_without_backoff() {
+        let (manager, old_background) = test_manager(TestTransport {
+            silent: true,
+            ..TestTransport::default()
+        })
+        .await;
+        let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+            unreachable!();
+        };
+        // The route to loopback is loopback, so any other source reads as moved.
+        channel.state.lock().await.record_path(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+        );
+
+        let message = encrypted_test_query(0);
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let query = channel.query(&message, Some(deadline));
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => panic!("silent connection answered: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // Model a concurrent query having already reconnected.
+        let (successor, background) = DnsExchange::from_stream(TestTransport::default());
+        let background = tokio::spawn(background);
+        let generation = channel.state.lock().await.store(successor);
+        query.await.expect("the retry must reach the successor");
+
+        let state = channel.state.lock().await;
+        assert_eq!(state.generation, generation);
+        assert!(state.exchange.is_some());
+        assert_eq!(state.connect_failures, 0);
+        assert!(state.cooldown_until.is_none());
+        drop(state);
+        old_background.abort();
+        background.abort();
     }
 
     #[test]

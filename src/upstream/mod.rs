@@ -38,6 +38,8 @@ struct Entry {
     name: String,
     timeout_ms: u64,
     backend: Backend,
+    /// Latest failure, written only on failed attempts, for the fallback warning.
+    last_failure: std::sync::Mutex<String>,
 }
 
 /// Borrow on the single-upstream path; own only when tasks can outlive forward.
@@ -135,6 +137,7 @@ impl Manager {
                 name,
                 timeout_ms,
                 backend,
+                last_failure: std::sync::Mutex::new(String::new()),
             }));
         }
         Ok(Self {
@@ -161,7 +164,7 @@ impl Manager {
         let response = if let [entry] = self.entries.as_slice() {
             // No task, owned query copy, or JoinSet for the common single-upstream case.
             let _permit = self.attempts.try_acquire().ok()?;
-            self.configured_answer(&entry.name, query, entry.run(&request, client_tcp).await)
+            self.configured_answer(entry, query, entry.run(&request, client_tcp).await)
         } else {
             self.forward_hedged(Arc::new(request.into_owned()), client_tcp)
                 .await
@@ -233,7 +236,7 @@ impl Manager {
                     };
                     if let Some((_, result)) = completed {
                         if let Some(response) = self.configured_answer(
-                            &self.entries[index].name,
+                            &self.entries[index],
                             shared.bytes.as_ref(),
                             result,
                         ) {
@@ -263,8 +266,7 @@ impl Manager {
                     continue;
                 }
             };
-            let Some(response) = self.configured_answer(&self.entries[index].name, query, result)
-            else {
+            let Some(response) = self.configured_answer(&self.entries[index], query, result) else {
                 continue;
             };
             // Legacy attempts have no connection health to maintain. Encrypted
@@ -281,14 +283,16 @@ impl Manager {
 
     fn configured_answer(
         &self,
-        name: &str,
+        entry: &Entry,
         query: &[u8],
         result: Result<Vec<u8>, String>,
     ) -> Option<Vec<u8>> {
+        let name = &entry.name;
         let mut response = match result {
             Ok(response) => response,
             Err(err) => {
                 log::debug!("upstream {name}: {err}");
+                *entry.last_failure.lock().unwrap() = err;
                 return None;
             }
         };
@@ -296,6 +300,7 @@ impl Manager {
         // parse the same question again here; this layer only selects answers.
         if response[3] & 0x0f == 2 {
             log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
+            *entry.last_failure.lock().unwrap() = "SERVFAIL".into();
             return None;
         }
         let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
@@ -310,6 +315,15 @@ impl Manager {
         Some(response)
     }
 
+    fn failure_summary(&self) -> String {
+        let failures: Vec<String> = self
+            .entries
+            .iter()
+            .map(|entry| format!("{}: {}", entry.name, entry.last_failure.lock().unwrap()))
+            .collect();
+        failures.join("; ")
+    }
+
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
         let _permit = self.attempts.try_acquire().ok()?;
         // Snapshot and drop the guard before any await: the read guard is not
@@ -318,13 +332,17 @@ impl Manager {
         if system_fallback.is_empty() {
             if !self.fallback_failed.swap(true, Ordering::Relaxed) {
                 log::warn!(
-                    "all configured upstreams failed and no system DNS fallback is available; returning SERVFAIL"
+                    "all configured upstreams failed ({}) and no system DNS fallback is available; returning SERVFAIL",
+                    self.failure_summary()
                 );
             }
             return None;
         }
         if !self.fallback_active.swap(true, Ordering::Relaxed) {
-            log::warn!("all configured upstreams failed; using pre-takeover system DNS directly");
+            log::warn!(
+                "all configured upstreams failed ({}); using pre-takeover system DNS directly",
+                self.failure_summary()
+            );
         }
         for server in &system_fallback {
             let attempt = legacy::query(*server, query, client_tcp);
@@ -369,7 +387,9 @@ impl Entry {
         let base = Duration::from_millis(self.timeout_ms);
         Some(match self.backend {
             Backend::Legacy { .. } => base,
-            Backend::Encrypted(_) => base + Duration::from_millis(250),
+            Backend::Encrypted(_) => {
+                base + Duration::from_millis(250) + base.min(encrypted::STALE_RETRY_BUDGET)
+            }
         })
     }
 
