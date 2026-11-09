@@ -52,7 +52,7 @@ const RENEW_AFTER_SLEEP: Duration = Duration::from_secs(5);
 /// Route lookups cost a few syscalls; at most one per channel per interval.
 const ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// Extra time a query gets when the network moved under its connection.
-pub(super) const STALE_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const STALE_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 /// rustls config shared by every encrypted upstream: ring provider,
 /// webpki (Mozilla) trust anchors, session resumption on by default.
@@ -521,7 +521,10 @@ async fn send(
                 SendFailure::Request(err.to_string())
             }
             // Hickory 0.26 represents HTTP status errors as text.
-            NetError::Msg(ref message) if message.starts_with("http unsuccessful code:") => {
+            NetError::Msg(ref message)
+                if message.starts_with("http unsuccessful code:")
+                    || message == "mpsc::SendError send failed because channel is full" =>
+            {
                 SendFailure::Request(err.to_string())
             }
             _ => SendFailure::Transport(err.to_string()),
@@ -1464,6 +1467,7 @@ mod tests {
         background.abort();
         for error in [
             NetError::Busy,
+            NetError::Msg("mpsc::SendError send failed because channel is full".into()),
             NetError::Msg("http unsuccessful code: 425, message: retry".into()),
         ] {
             let (manager, background) = test_manager(TestTransport {

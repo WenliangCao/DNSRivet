@@ -520,6 +520,14 @@ mod tests {
             assert_ne!(response[2] & 2, 0);
             wire::validate_response(&query, &response[..n]).unwrap();
         }
+        query[2] |= 0x80;
+        client.send(&query).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), client.recv(&mut response))
+                .await
+                .is_err()
+        );
+        query[2] &= 0x7f;
         assert!(upstream.try_recv_from(&mut [0; 512]).is_err());
         let held = inflight.acquire().await.unwrap();
         client.send(&query).await.unwrap();

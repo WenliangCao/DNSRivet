@@ -55,25 +55,8 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
     let qclass = read_u16(message, offset + 2)?;
     offset += 4;
 
-    let mut udp_size = 512;
-    let mut do_bit = false;
-    let mut saw_opt = false;
-    for _ in 0..read_u16(message, 10)? {
-        let rr = parse_rr(message, offset)?;
-        offset = rr.end;
-        if rr.kind != TYPE_OPT || saw_opt {
-            return None;
-        }
-        // EDNS options such as ECS and COOKIE can affect the response and are
-        // intentionally not represented in the cache key.
-        if rr.rdlen != 0 || message.get(rr.ttl_offset + 1).copied()? != 0 {
-            return None;
-        }
-        saw_opt = true;
-        udp_size = usize::from(rr.class).clamp(512, 4096);
-        do_bit = read_u32(message, rr.ttl_offset)? & 0x8000 != 0;
-    }
-    if offset != message.len() {
+    let edns = parse_edns(message, offset)?;
+    if !edns.cacheable {
         return None;
     }
 
@@ -82,12 +65,44 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
             qname,
             qtype,
             qclass,
-            do_bit,
-            edns: saw_opt,
+            do_bit: edns.do_bit,
+            edns: edns.present,
             dnssec_header_bits: message[3] & 0x30,
         },
-        udp_size,
+        udp_size: edns.udp_size,
     })
+}
+
+struct EdnsMeta {
+    udp_size: usize,
+    do_bit: bool,
+    present: bool,
+    cacheable: bool,
+}
+
+fn parse_edns(message: &[u8], mut offset: usize) -> Option<EdnsMeta> {
+    let mut meta = EdnsMeta {
+        udp_size: 512,
+        do_bit: false,
+        present: false,
+        cacheable: true,
+    };
+    for _ in 0..read_u16(message, 10)? {
+        let rr = parse_rr(message, offset)?;
+        offset = rr.end;
+        if rr.kind != TYPE_OPT {
+            meta.cacheable = false;
+            continue;
+        }
+        if meta.present {
+            return None;
+        }
+        meta.present = true;
+        meta.udp_size = usize::from(rr.class).clamp(512, 4096);
+        meta.do_bit = read_u32(message, rr.ttl_offset)? & 0x8000 != 0;
+        meta.cacheable &= rr.rdlen == 0 && message.get(rr.ttl_offset + 1).copied()? == 0;
+    }
+    (offset == message.len()).then_some(meta)
 }
 
 /// A bounded local error with no records copied from an unsupported query.
@@ -119,19 +134,7 @@ pub fn udp_payload_size(message: &[u8]) -> usize {
         };
         offset = rr.end;
     }
-    let Some(additional_count) = read_u16(message, 10) else {
-        return 512;
-    };
-    for _ in 0..additional_count {
-        let Some(rr) = parse_rr(message, offset) else {
-            return 512;
-        };
-        if rr.kind == TYPE_OPT {
-            return usize::from(rr.class).clamp(512, 4096);
-        }
-        offset = rr.end;
-    }
-    512
+    parse_edns(message, offset).map_or(512, |edns| edns.udp_size)
 }
 
 /// Decrease every resource-record TTL by the number of whole seconds elapsed.
@@ -1008,5 +1011,16 @@ mod tests {
         message.extend_from_slice(&pointer.to_be_bytes());
         assert!(skip_name(&message, over_limit).is_none());
         assert!(read_name(&message, over_limit).is_none());
+    }
+    #[test]
+    fn queries_with_answer_or_authority_records_bypass_cache() {
+        for authority in [false, true] {
+            let mut query = positive_response(1, 60, false);
+            query[2] &= 0x7f;
+            if authority {
+                query[6..10].copy_from_slice(&[0, 0, 0, 1]);
+            }
+            assert!(parse_query_meta(&query).is_none());
+        }
     }
 }
