@@ -4,6 +4,7 @@
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ struct Logger {
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= self.level
+            && (metadata.target().starts_with("dnsrivet") || metadata.level() == log::Level::Error)
     }
 
     fn log(&self, record: &Record) {
@@ -50,13 +52,17 @@ impl Log for Logger {
 pub fn init(level: LevelFilter, path: Option<&str>) -> Result<(), String> {
     let sink = match path {
         None => Sink::Stderr,
-        Some(p) => Sink::File(
-            OpenOptions::new()
+        Some(p) => {
+            let file = OpenOptions::new()
                 .create(true)
                 .append(true)
+                .mode(0o640)
                 .open(p)
-                .map_err(|e| format!("cannot open log file {p}: {e}"))?,
-        ),
+                .map_err(|e| format!("cannot open log file {p}: {e}"))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))
+                .map_err(|e| format!("secure log file {p}: {e}"))?;
+            Sink::File(file)
+        }
     };
     log::set_boxed_logger(Box::new(Logger {
         level,

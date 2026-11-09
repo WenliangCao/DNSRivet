@@ -168,6 +168,9 @@ pub fn load_text(text: &str) -> Result<Loaded, String> {
             .ip
             .parse()
             .map_err(|_| format!("[listener.{key}] invalid ip: {:?}", listener.ip))?;
+        if !ip.to_canonical().is_loopback() {
+            warnings.push(format!("[listener.{key}] {ip} exposes DNS to other hosts; bind a specific trusted interface address and restrict access"));
+        }
         listeners.push(SocketAddr::new(ip, listener.port));
     }
     if listeners.is_empty() {
@@ -329,10 +332,6 @@ fn parse_service(raw: RawService, warnings: &mut Vec<String>) -> Result<Service,
         "debug" => log::LevelFilter::Debug,
         "warn" | "warning" => log::LevelFilter::Warn,
         "error" => log::LevelFilter::Error,
-        "fatal" => {
-            warnings.push("[service] log_level \"fatal\" treated as \"error\"".into());
-            log::LevelFilter::Error
-        }
         other => return Err(format!("[service] invalid log_level: {other:?}")),
     };
     let cache_enable = raw.cache_enable && raw.cache_size > 0;
@@ -449,6 +448,23 @@ fn parse_upstream(
     let (host, port) = split_host_port(hostport, proto.default_port())
         .ok_or_else(|| format!("{ctx} invalid endpoint host: {hostport:?}"))?;
 
+    let hostname = host.strip_suffix('.').unwrap_or(&host);
+    if host.parse::<IpAddr>().is_err()
+        && (hostname.is_empty()
+            || hostname.len() > 253
+            || hostname.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }))
+    {
+        return Err(format!("{ctx} invalid endpoint hostname: {host:?}"));
+    }
+
     let mut bootstrap_ip = if raw.bootstrap_ip.is_empty() {
         None
     } else {
@@ -467,12 +483,6 @@ fn parse_upstream(
         "" | "both" => IpStack::Both,
         "v4" => IpStack::V4,
         "v6" => IpStack::V6,
-        "split" => {
-            warnings.push(format!(
-                "{ctx} ip_stack \"split\" treated as \"both\" in this build"
-            ));
-            IpStack::Both
-        }
         other => return Err(format!("{ctx} invalid ip_stack: {other:?}")),
     };
 
@@ -625,5 +635,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.config.upstreams[0].timeout_ms, 800);
+    }
+    #[test]
+    fn validates_cache_capacity_hostnames_and_exposed_listeners() {
+        for host in [
+            "bad host name!",
+            "-bad.example",
+            "bad..example",
+            "bad_.example",
+        ] {
+            assert!(quick_toml(&[], &[format!("dot={host}")], None, None, false).is_err());
+        }
+        assert!(
+            quick_toml(
+                &[],
+                &["dot=dns.example".into()],
+                None,
+                Some(99_999_999),
+                false
+            )
+            .is_err()
+        );
+        let text = quick_toml(
+            &["0.0.0.0:5354".into()],
+            &["dot=dns.example".into()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            load_text(&text)
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("exposes DNS"))
+        );
     }
 }

@@ -75,6 +75,8 @@ pub fn takeover_state() -> TakeoverState {
 #[derive(Debug, Deserialize, Serialize)]
 struct Backup {
     version: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
     services: Vec<ServiceDns>,
     #[serde(default)]
     fallback_servers: Vec<String>,
@@ -144,6 +146,7 @@ pub fn take_over(server: IpAddr) -> Result<(), String> {
 
     let backup = Backup {
         version: 2,
+        location: Some(current_location()?),
         services,
         takeover_servers: Some(vec![server]),
         fallback_servers: filter_fallback_servers(fallback_servers, &[server])
@@ -201,6 +204,7 @@ pub fn release() -> Result<bool, String> {
         }
         return Ok(false);
     }
+    verify_location(&read_backup()?, &current_location()?)?;
     // Marker first: a crash between these steps leaves backup-without-marker,
     // which `stop` can still restore from.
     remove_marker()?;
@@ -319,7 +323,14 @@ fn dns_may_depend_on_takeover(backup: &Backup, name: &str, servers: &[String]) -
 pub fn fallback_servers(listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, String> {
     let denied: Vec<IpAddr> = listeners.iter().map(SocketAddr::ip).collect();
     let candidates = if backup_exists() {
-        let backup = read_backup()?;
+        let backup = match read_backup() {
+            Ok(backup) => backup,
+            Err(_) if !nix::unistd::geteuid().is_root() => {
+                return effective_dns_servers()
+                    .map(|servers| filter_fallback_servers(servers, &denied));
+            }
+            Err(err) => return Err(err),
+        };
         if !matches!(backup.version, 1 | 2) {
             return Err(format!("unsupported DNS backup version {}", backup.version));
         }
@@ -374,18 +385,23 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
     }
     let expected = server.to_string();
     let mut backup = read_backup()?;
-    let known_services: HashSet<&str> = backup
-        .services
-        .iter()
-        .map(|service| service.name.as_str())
-        .collect();
-    let new_services: Vec<(String, Vec<String>)> = list_services()?
-        .into_iter()
-        .filter(|name| !known_services.contains(name.as_str()))
-        .map(|name| get_dns_servers(&name).map(|servers| (name, servers)))
-        .collect::<Result<_, _>>()?;
+    verify_location(&backup, &current_location()?)?;
+    let text = list_service_output()?;
+    let enabled = parse_services(&text);
+    let mut current = Vec::new();
+    let mut new_services = Vec::new();
+    for name in parse_all_services(&text) {
+        let known = backup.services.iter().any(|service| service.name == name);
+        if known || enabled.contains(&name) {
+            let servers = get_dns_servers(&name)?;
+            if !known {
+                new_services.push((name.clone(), servers.clone()));
+            }
+            current.push((name, servers));
+        }
+    }
     prepare_watchdog_backup(&mut backup, new_services, server, write_backup)?;
-    let current = service_dns_snapshot()?;
+    current.retain(|(name, _)| backup.services.iter().any(|service| &service.name == name));
     let drifted: Vec<String> = services_needing_reassert(&current, &expected)
         .into_iter()
         .map(str::to_string)
@@ -426,11 +442,13 @@ pub fn watchdog_tick(server: IpAddr) -> Result<TickOutcome, String> {
 pub fn takeover_intact(server: IpAddr) -> Result<bool, String> {
     let expected = server.to_string();
     let backup = read_backup()?;
+    verify_location(&backup, &current_location()?)?;
+    let text = list_service_output()?;
     takeover_intact_with(
         &backup,
         &expected,
-        &list_services()?,
-        list_all_services,
+        &parse_services(&text),
+        || Ok(parse_all_services(&text)),
         get_dns_servers,
     )
 }
@@ -456,20 +474,6 @@ fn takeover_intact_with(
         }
     }
     Ok(checked)
-}
-
-/// Current DNS list of every backed-up service that still exists.
-fn service_dns_snapshot() -> Result<Vec<(String, Vec<String>)>, String> {
-    let backup = read_backup()?;
-    let all_services = list_all_services()?;
-    let mut snapshot = Vec::new();
-    for service in &backup.services {
-        if !all_services.contains(&service.name) {
-            continue; // vanished service: nothing to reassert
-        }
-        snapshot.push((service.name.clone(), get_dns_servers(&service.name)?));
-    }
-    Ok(snapshot)
 }
 
 /// Persist restore data and address history before the watchdog changes DNS.
@@ -505,10 +509,10 @@ fn add_new_service_snapshots(
         if servers.iter().any(|server| server == expected)
             || dns_may_depend_on_takeover(backup, &name, &servers)
         {
-            return Err(format!(
-                "network service {name:?} already lists a DNSRivet takeover address as a DNS server; \
-                 refusing to capture an unknown restore state"
-            ));
+            log::warn!(
+                "skipping network service {name:?}: already lists a DNSRivet takeover address; restore its original DNS manually before stopping"
+            );
+            continue;
         }
         backup.services.push(ServiceDns { name, servers });
         added = true;
@@ -656,16 +660,82 @@ fn filter_fallback_servers(mut servers: Vec<SocketAddr>, denied: &[IpAddr]) -> V
     servers
 }
 
+fn list_service_output() -> Result<String, String> {
+    stdout(
+        &run(NETWORKSETUP, &["-listallnetworkservices"])?,
+        "list network services",
+    )
+}
+
 fn list_services() -> Result<Vec<String>, String> {
-    let output = run(NETWORKSETUP, &["-listallnetworkservices"])?;
-    let text = stdout(&output, "list network services")?;
-    Ok(parse_services(&text))
+    Ok(parse_services(&list_service_output()?))
 }
 
 fn list_all_services() -> Result<Vec<String>, String> {
-    let output = run(NETWORKSETUP, &["-listallnetworkservices"])?;
-    let text = stdout(&output, "list network services")?;
-    Ok(parse_all_services(&text))
+    Ok(parse_all_services(&list_service_output()?))
+}
+
+fn current_location() -> Result<String, String> {
+    stdout(
+        &run(NETWORKSETUP, &["-getcurrentlocation"])?,
+        "read network location",
+    )
+    .map(|text| text.trim().to_owned())
+}
+
+fn verify_location(backup: &Backup, current: &str) -> Result<(), String> {
+    if let Some(original) = &backup.location
+        && original != current
+    {
+        return Err(format!(
+            "DNS backup belongs to network location {original:?}, current location is {current:?}; switch back to {original:?}, then run `sudo dnsrivet stop` before changing locations"
+        ));
+    }
+    Ok(())
+}
+
+/// Skip unchanged preference checks without launching networksetup.
+pub fn watchdog_stamp() -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+    Some((
+        std::fs::metadata("/Library/Preferences/SystemConfiguration/preferences.plist")
+            .ok()?
+            .modified()
+            .ok()?,
+        std::fs::metadata(MARKER_PATH).ok()?.modified().ok()?,
+    ))
+}
+
+/// Read DHCP DNS from the interface selected by the default route, even while
+/// scutil exposes only the takeover resolver. Scoped VPN resolvers stay excluded.
+pub fn dhcp_fallback(source: IpAddr, listeners: &[SocketAddr]) -> Result<Vec<SocketAddr>, String> {
+    let interface = nix::ifaddrs::getifaddrs()
+        .map_err(|e| e.to_string())?
+        .find(|interface| {
+            interface.address.is_some_and(|address| {
+                address
+                    .as_sockaddr_in()
+                    .is_some_and(|addr| IpAddr::V4(addr.ip()) == source)
+                    || address
+                        .as_sockaddr_in6()
+                        .is_some_and(|addr| IpAddr::V6(addr.ip()) == source)
+            })
+        })
+        .ok_or_else(|| format!("no interface found for route source {source}"))?;
+    let output = run(
+        "/usr/sbin/ipconfig",
+        &["getoption", &interface.interface_name, "domain_name_server"],
+    )?;
+    let text = stdout(&output, "read DHCP DNS")?;
+    let servers = text
+        .split_whitespace()
+        .filter_map(|value| parse_dns_socket(value).ok())
+        .collect();
+    let denied: Vec<_> = listeners.iter().map(SocketAddr::ip).collect();
+    let servers = filter_fallback_servers(servers, &denied);
+    if servers.is_empty() {
+        return Err("DHCP reported no usable DNS server".into());
+    }
+    Ok(servers)
 }
 
 fn get_dns_servers(service: &str) -> Result<Vec<String>, String> {
@@ -820,6 +890,7 @@ mod tests {
     fn dns_backup_round_trips_through_toml() {
         let backup = Backup {
             version: 2,
+            location: None,
             services: vec![ServiceDns {
                 name: "USB & Wi-Fi".into(),
                 servers: vec!["1.1.1.1".into(), "2606:4700:4700::1111".into()],
@@ -947,6 +1018,7 @@ resolver #1
     fn new_service_snapshots_are_added_once_before_reassertion() {
         let mut backup = Backup {
             version: 2,
+            location: None,
             services: vec![ServiceDns {
                 name: "Wi-Fi".into(),
                 servers: vec!["192.0.2.53".into()],
@@ -980,21 +1052,30 @@ resolver #1
     }
 
     #[test]
-    fn new_service_already_pointing_at_proxy_is_rejected() {
-        let mut backup = Backup {
-            version: 2,
-            services: Vec::new(),
-            fallback_servers: Vec::new(),
-            takeover_servers: None,
-        };
-        let error = add_new_service_snapshots(
+    fn unknown_takeover_service_does_not_block_other_service_snapshots() {
+        let mut backup = restore_backup();
+        let added = add_new_service_snapshots(
             &mut backup,
-            vec![("iPhone USB".into(), vec!["127.0.0.1".into()])],
+            vec![
+                ("Renamed Wi-Fi".into(), vec!["127.0.0.1".into()]),
+                ("New adapter".into(), vec!["192.0.2.53".into()]),
+            ],
             "127.0.0.1",
         )
-        .unwrap_err();
-        assert!(error.contains("iPhone USB"));
-        assert!(backup.services.is_empty());
+        .unwrap();
+        assert!(added);
+        assert!(
+            backup
+                .services
+                .iter()
+                .any(|service| service.name == "New adapter")
+        );
+        assert!(
+            !backup
+                .services
+                .iter()
+                .any(|service| service.name == "Renamed Wi-Fi")
+        );
     }
 
     struct RestoreFixture {
@@ -1062,6 +1143,7 @@ resolver #1
     fn restore_backup() -> Backup {
         Backup {
             version: 2,
+            location: None,
             services: vec![
                 ServiceDns {
                     name: "Wi-Fi".into(),
@@ -1261,24 +1343,31 @@ resolver #1
                     "127.0.0.4".parse().unwrap(),
                     |_| panic!("must not capture an unknown previous takeover address"),
                 )
-                .is_err()
+                .is_ok()
             );
         }
     }
 
     #[test]
-    fn watchdog_rejects_new_name_still_using_a_previous_takeover_address() {
+    fn watchdog_skips_unknown_restore_state_but_records_address_history() {
         let mut backup = restore_backup();
-        let error = prepare_watchdog_backup(
+        prepare_watchdog_backup(
             &mut backup,
             vec![("Renamed Wi-Fi".into(), vec!["127.0.0.1".into()])],
             "127.0.0.4".parse().unwrap(),
-            |_| panic!("must not capture the old takeover as original DNS"),
+            |updated| {
+                assert_eq!(updated.services.len(), 2);
+                assert!(
+                    updated
+                        .takeover_servers
+                        .as_ref()
+                        .unwrap()
+                        .contains(&"127.0.0.4".parse().unwrap())
+                );
+                Ok(())
+            },
         )
-        .unwrap_err();
-        assert!(error.contains("Renamed Wi-Fi"));
-        assert!(error.contains("unknown restore state"));
-        assert_eq!(backup.services.len(), 2);
+        .unwrap();
     }
 
     #[test]
@@ -1433,5 +1522,15 @@ resolver #1
         assert_eq!(classify(true, true), TakeoverState::Active);
         assert_eq!(classify(true, false), TakeoverState::Indeterminate);
         assert_eq!(classify(false, true), TakeoverState::Corrupted);
+    }
+    #[test]
+    fn location_mismatch_keeps_the_restore_snapshot_for_the_original_location() {
+        let mut backup = restore_backup();
+        backup.location = Some("Home".into());
+        assert!(verify_location(&backup, "Home").is_ok());
+        let error = verify_location(&backup, "Work").unwrap_err();
+        assert!(error.contains("switch back to"));
+        let decoded: Backup = toml::from_str(&toml::to_string(&backup).unwrap()).unwrap();
+        assert_eq!(decoded.location.as_deref(), Some("Home"));
     }
 }

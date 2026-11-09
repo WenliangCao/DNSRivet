@@ -5,8 +5,9 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    BACKUP_PATH, TakeoverState, TickOutcome, backup_exists, current_loopback_dns, fallback_servers,
-    release, take_over, takeover_intact, takeover_state, watchdog_tick,
+    BACKUP_PATH, TakeoverState, TickOutcome, backup_exists, current_loopback_dns, dhcp_fallback,
+    fallback_servers, release, take_over, takeover_intact, takeover_state, watchdog_stamp,
+    watchdog_tick,
 };
 
 #[cfg(not(target_os = "macos"))]

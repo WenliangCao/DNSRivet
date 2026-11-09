@@ -7,7 +7,7 @@ use crate::upstream::Manager;
 use crate::wire;
 use cache::Cache;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
@@ -87,9 +87,44 @@ pub async fn serve(config: Config) -> Result<(), String> {
         Err(_) => log::debug!("takeover watchdog not started: no loopback port-53 listener"),
     }
 
+    tokio::spawn(fallback_refresh_loop(config.listeners, manager));
     wait_for_shutdown().await;
     log::info!("shutting down");
     Ok(())
+}
+
+/// Route checks do not send packets; spawn ipconfig only after a source change.
+async fn fallback_refresh_loop(listeners: Vec<std::net::SocketAddr>, manager: Arc<Manager>) {
+    let mut previous = None;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let source = crate::upstream::encrypted::route_source("1.1.1.1:53".parse().unwrap())
+            .or_else(|| {
+                crate::upstream::encrypted::route_source(
+                    "[2606:4700:4700::1111]:53".parse().unwrap(),
+                )
+            });
+        if source == previous {
+            continue;
+        }
+        previous = source;
+        let Some(source) = source else {
+            continue;
+        };
+        let listeners = listeners.clone();
+        match tokio::task::spawn_blocking(move || crate::osdns::dhcp_fallback(source, &listeners))
+            .await
+        {
+            Ok(Ok(servers)) => {
+                log::info!("route changed; runtime system DNS fallback refreshed: {servers:?}");
+                manager.set_system_fallback(servers);
+            }
+            Ok(Err(err)) => log::debug!("runtime DHCP DNS fallback not refreshed: {err}"),
+            Err(err) => log::warn!("runtime DHCP DNS refresh task failed: {err}"),
+        }
+    }
 }
 
 /// Periodically verify the DNS takeover and repair it when an external event
@@ -106,8 +141,13 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
     let mut ticks_since_reassert: Option<u32> = None;
     let mut flap_strikes = 0u32;
     let mut slow_mode = false;
+    let mut last_stamp = None;
     loop {
         interval.tick().await;
+        let stamp = crate::osdns::watchdog_stamp();
+        if stamp.is_some() && stamp == last_stamp {
+            continue;
+        }
         // networksetup/scutil are blocking subprocess calls; keep them off
         // the single-threaded reactor.
         let outcome =
@@ -118,6 +158,9 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                     continue;
                 }
             };
+        if outcome.is_ok() {
+            last_stamp = stamp;
+        }
         match outcome {
             Ok(crate::osdns::TickOutcome::NotActive) => {
                 log::debug!("takeover watchdog idle: takeover not active");
@@ -198,11 +241,14 @@ async fn udp_loop(
     // The extra byte detects datagrams clipped by recv_from. Oversized input
     // must not be forwarded as if it were a complete, valid 4 KiB query.
     let mut buf = vec![0u8; MAX_QUERY_SIZE + 1];
+    let mut last_warning = None;
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(received) => received,
             Err(err) => {
-                log::warn!("udp recv error: {err}");
+                if warning_due(&mut last_warning) {
+                    log::warn!("udp recv error: {err}");
+                }
                 continue;
             }
         };
@@ -210,7 +256,9 @@ async fn udp_loop(
             continue;
         }
         let Ok(permit) = inflight.clone().try_acquire_owned() else {
-            log::warn!("dropping query: {MAX_INFLIGHT} already in flight");
+            if warning_due(&mut last_warning) {
+                log::warn!("dropping query: {MAX_INFLIGHT} already in flight");
+            }
             continue;
         };
         let query = buf[..n].to_vec();
@@ -241,11 +289,14 @@ async fn tcp_loop(
     inflight: Arc<Semaphore>,
     connections: Arc<Semaphore>,
 ) {
+    let mut last_warning = None;
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let Ok(connection) = connections.clone().try_acquire_owned() else {
-                    log::warn!("dropping TCP connection: {MAX_TCP_CONNECTIONS} already open");
+                    if warning_due(&mut last_warning) {
+                        log::warn!("dropping TCP connection: {MAX_TCP_CONNECTIONS} already open");
+                    }
                     continue;
                 };
                 let manager = manager.clone();
@@ -256,9 +307,23 @@ async fn tcp_loop(
                     let _ = tcp_conn(stream, manager, cache, inflight).await;
                 });
             }
-            Err(err) => log::warn!("tcp accept error: {err}"),
+            Err(err) => {
+                if warning_due(&mut last_warning) {
+                    log::warn!("tcp accept error: {err}");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
+}
+
+fn warning_due(last: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < Duration::from_secs(1)) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 /// RFC 7766: length-prefixed messages, several per connection.

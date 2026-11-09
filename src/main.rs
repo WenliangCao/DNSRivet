@@ -70,6 +70,23 @@ fn service_result(result: Result<String, String>) -> ExitCode {
 }
 
 fn run(config: Option<PathBuf>, verbose: bool, quick: cli::QuickArgs) -> ExitCode {
+    let result = run_inner(config, verbose, quick);
+    if result != ExitCode::SUCCESS
+        && nix::unistd::geteuid().is_root()
+        && std::env::var("DNSRIVET_SERVICE").is_ok_and(|value| value == "1")
+    {
+        match osdns::release() {
+            Ok(true) => eprintln!("service startup failed; original system DNS restored"),
+            Ok(false) => {}
+            Err(err) => eprintln!(
+                "service startup failed; could not restore system DNS: {err}; run `sudo dnsrivet stop`"
+            ),
+        }
+    }
+    result
+}
+
+fn run_inner(config: Option<PathBuf>, verbose: bool, quick: cli::QuickArgs) -> ExitCode {
     let (loaded, source) = match quick_toml(&quick) {
         Ok(Some(text)) => match config::load_text(&text) {
             Ok(loaded) => (loaded, "command-line quick configuration".into()),

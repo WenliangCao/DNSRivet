@@ -1,5 +1,6 @@
 use crate::atomic_file;
 use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -11,6 +12,14 @@ pub fn write_plist(binary: &Path, config: &Path) -> Result<(), String> {
     if !binary.is_absolute() || !config.is_absolute() {
         return Err("launchd binary and config paths must be absolute".into());
     }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .open("/var/log/dnsrivet.log")
+        .map_err(|e| format!("open service log: {e}"))?;
+    log.set_permissions(std::fs::Permissions::from_mode(0o640))
+        .map_err(|e| format!("secure service log: {e}"))?;
     let plist = render_plist(binary, config);
     atomic_file::write(Path::new(PLIST_PATH), 0o644, |file, temporary| {
         file.write_all(plist.as_bytes())?;
@@ -130,6 +139,12 @@ fn render_plist(binary: &Path, config: &Path) -> String {
         <string>--config</string>
         <string>{}</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>DNSRIVET_SERVICE</key><string>1</string></dict>
+    <key>SoftResourceLimits</key>
+    <dict><key>NumberOfFiles</key><integer>4096</integer></dict>
+    <key>Umask</key>
+    <integer>23</integer>
     <key>WorkingDirectory</key>
     <string>/Library/Application Support/DNSRivet</string>
     <key>RunAtLoad</key>
