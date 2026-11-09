@@ -11,7 +11,7 @@
 //! - the redial's connect failure: backoff via the connect path only;
 //! - send failure after a redial, or on a freshly dialed connection:
 //!   invalidate + backoff;
-//! - deadline expiry: invalidate + backoff, no retry (a wedged-but-accepting
+//! - deadline expiry without another answer since send: invalidate + backoff (a wedged-but-accepting
 //!   upstream must not tax every query with its full timeout);
 //! - errors from a superseded generation: no state change; retry once on
 //!   the successor while budget remains if the failed lease was reused;
@@ -24,7 +24,7 @@
 //! - deadline expiry after sleep or a route change under that lease: no
 //!   backoff, one retry on a fresh connection with a short extra budget.
 
-use crate::config::{Proto, Upstream};
+use crate::config::{IpStack, Proto, Upstream};
 use crate::upstream::bootstrap::Bootstrap;
 use hickory_net::NetError;
 use hickory_net::h2::HttpsClientStream;
@@ -93,7 +93,7 @@ impl Stamp {
 
 /// The kernel's source address for `peer`. `connect` on a UDP socket only
 /// consults the routing table; nothing is sent. None means no route now.
-fn route_source(peer: SocketAddr) -> Option<IpAddr> {
+pub(crate) fn route_source(peer: SocketAddr) -> Option<IpAddr> {
     let unspecified = if peer.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
@@ -108,7 +108,7 @@ fn route_source(peer: SocketAddr) -> Option<IpAddr> {
 #[derive(Clone, Copy)]
 struct RoutePath {
     peer: SocketAddr,
-    source: IpAddr,
+    source: Option<IpAddr>,
     checked: Instant,
 }
 
@@ -122,6 +122,7 @@ struct Slot<E> {
     /// When the slot was last leased or stored, for sleep detection.
     last_used: Option<Stamp>,
     path: Option<RoutePath>,
+    last_answer: Option<Instant>,
 }
 
 impl<E> Default for Slot<E> {
@@ -133,6 +134,7 @@ impl<E> Default for Slot<E> {
             cooldown_until: None,
             last_used: None,
             path: None,
+            last_answer: None,
         }
     }
 }
@@ -149,11 +151,12 @@ impl<E: Clone> Slot<E> {
         self.cooldown_until = None;
         self.last_used = Some(Stamp::now());
         self.path = None;
+        self.last_answer = None;
         self.generation
     }
 
     fn record_path(&mut self, peer: SocketAddr, source: Option<IpAddr>) {
-        self.path = source.map(|source| RoutePath {
+        self.path = Some(RoutePath {
             peer,
             source,
             checked: Instant::now(),
@@ -164,10 +167,14 @@ impl<E: Clone> Slot<E> {
     /// returning how long it slept. No backoff: the connection did not fail.
     fn drop_if_slept(&mut self, now: Stamp) -> Option<Duration> {
         let slept = now.slept_since(self.last_used.replace(now)?);
-        if slept <= RENEW_AFTER_SLEEP || self.exchange.take().is_none() {
+        if slept <= RENEW_AFTER_SLEEP || (self.exchange.is_none() && self.cooldown_until.is_none())
+        {
             return None;
         }
+        self.exchange = None;
         self.path = None;
+        self.connect_failures = 0;
+        self.cooldown_until = None;
         Some(slept)
     }
 
@@ -183,13 +190,15 @@ impl<E: Clone> Slot<E> {
 
     /// Drop the connection if its route source changed, returning the old
     /// and new source. No route says nothing: the same source may return.
-    fn drop_if_moved(&mut self, current: Option<IpAddr>) -> Option<(IpAddr, IpAddr)> {
+    fn drop_if_moved(&mut self, current: Option<IpAddr>) -> Option<(Option<IpAddr>, IpAddr)> {
         let (from, to) = (self.path?.source, current?);
-        if from == to {
+        if from == Some(to) {
             return None;
         }
         self.exchange = None;
         self.path = None;
+        self.connect_failures = 0;
+        self.cooldown_until = None;
         Some((from, to))
     }
 
@@ -198,7 +207,9 @@ impl<E: Clone> Slot<E> {
     fn invalidate(&mut self, generation: u64) -> bool {
         if self.generation == generation && self.exchange.is_some() {
             self.exchange = None;
-            self.path = None;
+            if let Some(path) = self.path {
+                self.record_path(path.peer, route_source(path.peer));
+            }
             true
         } else {
             false
@@ -226,15 +237,16 @@ impl Lease {
     /// so a deadline expiry says nothing about the upstream itself.
     fn went_stale(&self) -> bool {
         Stamp::now().slept_since(self.taken) > RENEW_AFTER_SLEEP
-            || self
-                .path
-                .is_some_and(|path| route_source(path.peer).is_some_and(|to| to != path.source))
+            || self.path.is_some_and(|path| {
+                route_source(path.peer).is_some_and(|to| Some(to) != path.source)
+            })
     }
 }
 
 enum SendFailure {
     Deadline,
     Transport(String),
+    Request(String),
 }
 
 pub struct Channel {
@@ -279,18 +291,31 @@ impl Channel {
         let mut retried = false;
         loop {
             match send(&lease.exchange, message.clone(), deadline).await {
-                Ok(buffer) => return Ok(buffer),
+                Ok(buffer) => {
+                    if let Ok(mut state) = self.state.try_lock()
+                        && state.generation == lease.generation
+                    {
+                        state.last_answer = Some(Instant::now());
+                    }
+                    return Ok(buffer);
+                }
+                Err(SendFailure::Request(err)) => return Err(err),
                 Err(SendFailure::Deadline) => {
                     let stale = !retried && lease.went_stale();
-                    let mut state = self.state.lock().await;
-                    let invalidated = state.invalidate(lease.generation);
-                    if !stale {
-                        if invalidated {
+                    if let Ok(mut state) = self.state.try_lock() {
+                        let responsive = state.last_answer.is_some_and(|at| at >= lease.taken.mono);
+                        if !stale && responsive && state.generation == lease.generation {
+                            return Err(
+                                "no answer within the deadline; connection still responsive".into(),
+                            );
+                        }
+                        if state.invalidate(lease.generation) && !stale {
                             state.backoff();
                         }
+                    }
+                    if !stale {
                         return Err("no answer within the deadline".into());
                     }
-                    drop(state);
                     log::info!(
                         "upstream {}: network changed during a query; retrying on a fresh connection",
                         self.up.name
@@ -302,19 +327,19 @@ impl Channel {
                     })?;
                 }
                 Err(SendFailure::Transport(err)) => {
-                    let mut state = self.state.lock().await;
-                    let invalidated = state.invalidate(lease.generation);
                     let redial = lease.reused && !retried && budget_allows_redial(deadline);
+                    if let Ok(mut state) = self.state.try_lock()
+                        && state.invalidate(lease.generation)
+                        && !redial
+                    {
+                        state.backoff();
+                    }
                     if !redial {
-                        if invalidated {
-                            state.backoff();
-                        }
                         return Err(err);
                     }
                     // A concurrent query may already have invalidated or
                     // replaced this generation. Share its successor without
                     // changing that connection's state or backoff.
-                    drop(state);
                     log::debug!(
                         "upstream {}: stale connection ({err}); retrying once",
                         self.up.name
@@ -332,8 +357,8 @@ impl Channel {
     async fn acquire(&self, deadline: Option<Instant>) -> Result<Lease, String> {
         // Holding the async lock across connect serializes dial attempts,
         // so a burst of queries cannot stampede-connect.
+        let mut state = within(deadline, self.state.lock()).await?;
         let now = Stamp::now();
-        let mut state = self.state.lock().await;
         if let Some(slept) = state.drop_if_slept(now) {
             log::info!(
                 "upstream {}: host slept {:.0}s; renewing connection",
@@ -341,16 +366,17 @@ impl Channel {
                 slept.as_secs_f32()
             );
             if self.up.bootstrap_ip.is_none() {
-                self.bootstrap.invalidate(&self.up.host).await;
+                self.bootstrap.reset(&self.up.host).await;
             }
         }
         if let Some(peer) = state.route_check_due(now.mono)
             && let Some((from, to)) = state.drop_if_moved(route_source(peer))
         {
             log::info!(
-                "upstream {}: route source changed from {from} to {to}; renewing connection",
+                "upstream {}: route source changed from {from:?} to {to}; renewing connection",
                 self.up.name
             );
+            self.bootstrap.reset(&self.up.host).await;
         }
         if let Some((exchange, generation)) = state.lease() {
             return Ok(Lease {
@@ -371,16 +397,28 @@ impl Channel {
             }
         }
 
+        // Keep a route observation even when bootstrap or dialing fails.
+        let probe = self
+            .up
+            .bootstrap_ip
+            .unwrap_or_else(|| match self.up.ip_stack {
+                IpStack::V6 => "2606:4700:4700::1111".parse().unwrap(),
+                _ => "1.1.1.1".parse().unwrap(),
+            });
+        let peer = SocketAddr::new(probe, self.up.port);
+        state.record_path(peer, route_source(peer));
         let ips = match self.up.bootstrap_ip {
             Some(ip) => vec![ip],
             None => {
                 if state.connect_failures > 0 {
                     self.bootstrap.invalidate(&self.up.host).await;
                 }
-                match self
-                    .bootstrap
-                    .resolve(&self.up.host, self.up.ip_stack)
-                    .await
+                match within(
+                    deadline,
+                    self.bootstrap.resolve(&self.up.host, self.up.ip_stack),
+                )
+                .await
+                .and_then(|result| result)
                 {
                     Ok(ips) => ips,
                     Err(err) => {
@@ -392,7 +430,8 @@ impl Channel {
         };
 
         let mut last_err = String::from("no candidate addresses");
-        for ip in ips {
+        let count = ips.len();
+        for (index, ip) in ips.into_iter().enumerate() {
             let addr = SocketAddr::new(ip, self.up.port);
             if super::is_self_address(addr, &self.deny) {
                 last_err = format!("{addr} points back at our own listener");
@@ -405,9 +444,11 @@ impl Channel {
             );
             // Connection setup carries large TLS/QUIC futures. Allocate only
             // when dialing, so every forwarded query has a smaller future.
-            match Box::pin(connect(&self.up, &self.tls, addr, deadline)).await {
+            let candidate_deadline = dial_deadline(deadline, count - index);
+            state.record_path(addr, route_source(addr));
+            match Box::pin(connect(&self.up, &self.tls, addr, Some(candidate_deadline))).await {
                 Ok(exchange) => {
-                    log::info!(
+                    log::debug!(
                         "upstream {}: connected {} to {addr}",
                         self.up.name,
                         self.up.proto.as_str()
@@ -436,6 +477,24 @@ impl Channel {
     }
 }
 
+async fn within<T>(
+    deadline: Option<Instant>,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at.into(), future)
+            .await
+            .map_err(|_| "no answer within the deadline".into()),
+        None => Ok(future.await),
+    }
+}
+
+fn dial_deadline(deadline: Option<Instant>, remaining: usize) -> Instant {
+    let now = Instant::now();
+    let budget = deadline.map_or(CONNECT_TIMEOUT, |at| at.saturating_duration_since(now));
+    now + budget / u32::try_from(remaining).unwrap_or(u32::MAX)
+}
+
 fn budget_allows_redial(deadline: Option<Instant>) -> bool {
     deadline.is_none_or(|d| d.saturating_duration_since(Instant::now()) > MIN_REDIAL_BUDGET)
 }
@@ -456,7 +515,17 @@ async fn send(
     };
     result
         .map(|response| response.into_buffer())
-        .map_err(|err| SendFailure::Transport(err.to_string()))
+        .map_err(|err| match err {
+            NetError::Timeout => SendFailure::Deadline,
+            NetError::Busy | NetError::RequestTooLarge | NetError::Proto(_) => {
+                SendFailure::Request(err.to_string())
+            }
+            // Hickory 0.26 represents HTTP status errors as text.
+            NetError::Msg(ref message) if message.starts_with("http unsuccessful code:") => {
+                SendFailure::Request(err.to_string())
+            }
+            _ => SendFailure::Transport(err.to_string()),
+        })
 }
 
 async fn connect(
@@ -512,7 +581,9 @@ where
         async move {
             // Hickory requires a duration; Tokio saturates MAX to its far-future
             // timer. Cancellation and positive deadlines remain owned by Channel.
-            Ok(DnsMultiplexer::new(conn.await?, handle).with_timeout(Duration::MAX))
+            Ok(DnsMultiplexer::new(conn.await?, handle)
+                .with_max_active_requests(super::MAX_ATTEMPTS)
+                .with_timeout(Duration::MAX))
         },
         deadline,
     )
@@ -750,6 +821,8 @@ mod tests {
         failures: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
         /// Accept requests and never answer, like a path dropping UDP/443.
         silent: bool,
+        silent_first: bool,
+        request_error: Option<NetError>,
         wrong_question: bool,
     }
 
@@ -767,8 +840,11 @@ mod tests {
 
     impl DnsRequestSender for TestTransport {
         fn send_message(&mut self, request: DnsRequest) -> DnsResponseStream {
-            if self.silent {
+            if self.silent || std::mem::take(&mut self.silent_first) {
                 return Box::pin(std::future::pending()).into();
+            }
+            if let Some(error) = self.request_error.take() {
+                return error.into();
             }
             if let Some(failures) = &self.failures {
                 let (release, pending) = oneshot::channel();
@@ -1268,7 +1344,7 @@ mod tests {
         assert_eq!(slot.drop_if_moved(None), None, "no route is not a move");
         assert_eq!(slot.lease(), Some((1, generation)));
 
-        assert_eq!(slot.drop_if_moved(Some(new)), Some((old, new)));
+        assert_eq!(slot.drop_if_moved(Some(new)), Some((Some(old), new)));
         assert!(slot.lease().is_none());
         assert_eq!(slot.connect_failures, 0);
         assert!(slot.cooldown_until.is_none());
@@ -1366,5 +1442,141 @@ mod tests {
         assert!(!budget_allows_redial(Some(
             Instant::now() + Duration::from_millis(50)
         )));
+    }
+    #[tokio::test]
+    async fn a_slow_query_and_request_errors_preserve_a_responsive_connection() {
+        let (manager, background) = test_manager(TestTransport {
+            silent_first: true,
+            ..TestTransport::default()
+        })
+        .await;
+        let manager = Arc::new(manager);
+        let slow = start_query(&manager, Some(Instant::now() + Duration::from_millis(100)));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        start_query(&manager, None).await.unwrap().unwrap();
+        assert!(
+            slow.await
+                .unwrap()
+                .unwrap_err()
+                .contains("still responsive")
+        );
+        start_query(&manager, None).await.unwrap().unwrap();
+        background.abort();
+        for error in [
+            NetError::Busy,
+            NetError::Msg("http unsuccessful code: 425, message: retry".into()),
+        ] {
+            let (manager, background) = test_manager(TestTransport {
+                request_error: Some(error),
+                ..TestTransport::default()
+            })
+            .await;
+            let manager = Arc::new(manager);
+            assert!(start_query(&manager, None).await.unwrap().is_err());
+            start_query(&manager, None).await.unwrap().unwrap();
+            background.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_for_a_dial_obeys_the_query_deadline() {
+        let (manager, background) = test_manager(TestTransport::default()).await;
+        let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+            unreachable!()
+        };
+        let held = channel.state.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            channel.query(
+                &encrypted_test_query(0),
+                Some(Instant::now() + Duration::from_millis(20)),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("deadline"));
+        drop(held);
+        background.abort();
+    }
+
+    #[test]
+    fn network_recovery_clears_cooldown_without_an_existing_connection() {
+        let mut state: Slot<u8> = Slot::default();
+        state.record_path("192.0.2.53:853".parse().unwrap(), None);
+        for _ in 0..5 {
+            state.backoff();
+        }
+        assert!(
+            state
+                .drop_if_moved(Some("192.0.2.2".parse().unwrap()))
+                .is_some()
+        );
+        assert!(state.cooldown_until.is_none());
+        assert_eq!(state.connect_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn candidate_dial_leaves_time_for_the_next_address() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(
+            finish::<_, TestTransport>(
+                std::future::pending(),
+                Some(dial_deadline(Some(deadline), 2))
+            )
+            .await
+            .is_err()
+        );
+        let exchange = finish(
+            std::future::ready(Ok(TestTransport::default())),
+            Some(dial_deadline(Some(deadline), 1)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            send(&exchange, encrypted_test_query(0), Some(deadline))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn dot_accepts_more_than_32_inflight_requests() {
+        use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
+        use hickory_net::tcp::{TcpClientStream, TcpStream};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let (stream, handle) =
+                TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
+            let exchange = connect_dot(
+                std::future::ready(Ok(TcpClientStream::from_stream(stream))),
+                handle,
+                None,
+            )
+            .await
+            .unwrap();
+            let mut pending = tokio::task::JoinSet::new();
+            let mut responses = Vec::new();
+            for _ in 0..64 {
+                let exchange = exchange.clone();
+                pending.spawn(async move {
+                    send(&exchange, encrypted_test_query(0), None).await.is_ok()
+                });
+                let len = server.read_u16().await.unwrap();
+                let mut query = vec![0; len as usize];
+                server.read_exact(&mut query).await.unwrap();
+                query[2] |= 0x80;
+                responses.push(query);
+            }
+            for response in responses {
+                server.write_u16(response.len() as u16).await.unwrap();
+                server.write_all(&response).await.unwrap();
+            }
+            while let Some(result) = pending.join_next().await {
+                assert!(result.unwrap());
+            }
+        })
+        .await
+        .expect("all 64 requests must reach the peer before it answers");
     }
 }

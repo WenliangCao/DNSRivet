@@ -121,7 +121,16 @@ impl Slot {
             Err(err) => {
                 self.failure = Some(Failure {
                     err: err.clone(),
-                    retry_at: now + RETRY_AFTER_FAILURE,
+                    retry_at: now
+                        + if self
+                            .entry
+                            .as_ref()
+                            .is_some_and(|entry| entry.is_servable(now))
+                        {
+                            RETRY_AFTER_FAILURE
+                        } else {
+                            Duration::from_secs(2)
+                        },
                 });
                 match &self.entry {
                     Some(entry) if entry.is_servable(now) => {
@@ -209,6 +218,16 @@ impl Bootstrap {
                 && let Some(entry) = &mut slot.entry
             {
                 entry.expires = entry.expires.min(now);
+            }
+        }
+    }
+
+    /// A new network should not inherit the old network's failure pause.
+    pub async fn reset(&self, host: &str) {
+        self.invalidate(host).await;
+        for ((name, _), slot) in self.slots.lock().await.iter_mut() {
+            if name.eq_ignore_ascii_case(host) {
+                slot.failure = None;
             }
         }
     }
@@ -594,5 +613,25 @@ mod tests {
         assert!(!entry.is_fresh(expires));
         assert!(entry.is_servable(expires + MAX_STALE));
         assert!(!entry.is_servable(expires + MAX_STALE + Duration::from_secs(1)));
+    }
+    #[tokio::test]
+    async fn cold_bootstrap_failure_retries_quickly_and_network_reset_clears_it() {
+        let now = Instant::now();
+        let mut slot = Slot::default();
+        assert!(slot.record(Err("offline".into()), now).is_err());
+        assert!(matches!(
+            slot.plan(now + Duration::from_secs(2)),
+            Plan::Refresh { .. }
+        ));
+        let boot = Bootstrap::new();
+        boot.slots
+            .lock()
+            .await
+            .insert(("dns.example".into(), IpStack::V4), slot);
+        boot.reset("dns.example").await;
+        assert!(matches!(
+            boot.plan(&("dns.example".into(), IpStack::V4)).await,
+            Plan::Refresh { .. }
+        ));
     }
 }

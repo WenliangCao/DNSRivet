@@ -420,34 +420,18 @@ async fn wait_for_hedge(at: Option<Instant>) {
 }
 
 impl Entry {
-    /// Legacy transports have no internal deadline, so the outer timeout is
-    /// exact for them; encrypted channels time out internally, and the outer
-    /// bound only catches a stuck channel, with a small scheduling margin.
-    fn outer_timeout(&self) -> Option<Duration> {
-        if self.timeout_ms == 0 {
-            return None;
-        }
-        let base = Duration::from_millis(self.timeout_ms);
-        Some(match self.backend {
-            Backend::Legacy { .. } => base,
-            Backend::Encrypted(_) => {
-                base + Duration::from_millis(250) + base.min(encrypted::STALE_RETRY_BUDGET)
-            }
-        })
-    }
-
     async fn run(&self, request: &Request<'_>, client_tcp: bool) -> Result<Vec<u8>, String> {
-        // Encrypted channels enforce this deadline themselves so their
-        // invalidation stays generation-precise; the outer timeout below is a
-        // pure scheduling backstop with no channel side effects.
         let deadline =
             (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
         let attempt = self.attempt(request, client_tcp, deadline);
-        match self.outer_timeout() {
-            Some(limit) => tokio::time::timeout(limit, attempt)
+        if matches!(self.backend, Backend::Legacy { .. })
+            && let Some(at) = deadline
+        {
+            tokio::time::timeout_at(at.into(), attempt)
                 .await
-                .unwrap_or_else(|_| Err(format!("timeout after {}ms", self.timeout_ms))),
-            None => attempt.await,
+                .unwrap_or_else(|_| Err(format!("timeout after {}ms", self.timeout_ms)))
+        } else {
+            attempt.await
         }
     }
 
