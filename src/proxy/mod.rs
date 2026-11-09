@@ -328,50 +328,72 @@ fn warning_due(last: &mut Option<Instant>) -> bool {
 
 /// RFC 7766: length-prefixed messages, several per connection.
 async fn tcp_conn(
-    mut stream: TcpStream,
+    stream: TcpStream,
     manager: Arc<Manager>,
     cache: Arc<Cache>,
     inflight: Arc<Semaphore>,
 ) -> std::io::Result<()> {
-    let mut query = Vec::new();
-    let mut response = Vec::new();
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let mut pending = tokio::task::JoinSet::new();
     loop {
+        while let Some(result) = pending.try_join_next() {
+            result.map_err(std::io::Error::other)??;
+        }
         let mut lenbuf = [0u8; 2];
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut lenbuf)).await {
-            Err(_) | Ok(Err(_)) => return Ok(()), // idle timeout, EOF or reset
+        match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut lenbuf)).await {
+            Err(_) | Ok(Err(_)) => break,
             Ok(Ok(_)) => {}
         }
         let n = u16::from_be_bytes(lenbuf) as usize;
         if !(12..=MAX_QUERY_SIZE).contains(&n) {
             return Ok(());
         }
-        query.resize(n, 0);
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut query)).await {
+        let mut query = vec![0; n];
+        match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut query)).await {
             Err(_) | Ok(Err(_)) => return Ok(()),
             Ok(Ok(_)) => {}
         }
         if query[2] & 0x80 != 0 {
             continue;
         }
-        let _permit = inflight
-            .acquire()
+        let permit = inflight
+            .clone()
+            .acquire_owned()
             .await
             .expect("inflight semaphore is never closed");
-        let meta = cache.query_meta(&query);
-        if !local_response(&cache, &query, meta.as_ref(), &mut response) {
-            response = forward(&manager, &cache, &query, true, meta.as_ref()).await;
-        }
-        if response.len() > u16::MAX as usize {
-            response = wire::error_response(&query, 2);
-        }
-        let mut framed = Vec::with_capacity(response.len() + 2);
-        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&response);
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.write_all(&framed)).await {
-            Err(_) | Ok(Err(_)) => return Ok(()),
-            Ok(Ok(())) => {}
-        }
+        let (manager, cache, writer) = (manager.clone(), cache.clone(), writer.clone());
+        pending.spawn(async move {
+            let _permit = permit;
+            let meta = cache.query_meta(&query);
+            let mut response = Vec::new();
+            if !local_response(&cache, &query, meta.as_ref(), &mut response) {
+                response = forward(&manager, &cache, &query, true, meta.as_ref()).await;
+            }
+            let frame = tcp_frame(&query, response);
+            // Answers may finish out of order; serialize only the complete frame writes.
+            tokio::time::timeout(TCP_IDLE_TIMEOUT, async {
+                writer.lock().await.write_all(&frame).await
+            })
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+        });
     }
+    // A client can finish sending while still waiting for outstanding answers.
+    while let Some(result) = pending.join_next().await {
+        result.map_err(std::io::Error::other)??;
+    }
+    Ok(())
+}
+
+fn tcp_frame(query: &[u8], mut response: Vec<u8>) -> Vec<u8> {
+    if response.len() > u16::MAX as usize {
+        response = servfail(query);
+    }
+    let mut framed = Vec::with_capacity(response.len() + 2);
+    framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&response);
+    framed
 }
 
 /// Share the same local-answer gate between UDP and TCP clients.
@@ -624,5 +646,85 @@ mod tests {
         assert_eq!(response[13], b'A');
         assert!(local_response(&cache, &query, Some(&meta), &mut response));
         assert_eq!(response[13], b'a');
+    }
+    #[tokio::test]
+    async fn tcp_pipelining_returns_fast_answers_without_waiting_for_slow_queries() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = upstream.local_addr().unwrap();
+            let manager = Arc::new(
+                Manager::new(
+                    vec![Upstream {
+                        name: "pipelined".into(),
+                        proto: Proto::Legacy,
+                        host: address.ip().to_string(),
+                        port: address.port(),
+                        path: String::new(),
+                        bootstrap_ip: Some(address.ip()),
+                        timeout_ms: 5000,
+                        ip_stack: IpStack::Both,
+                    }],
+                    &[],
+                    vec![],
+                )
+                .unwrap(),
+            );
+            let responder = tokio::spawn(async move {
+                let mut responses = Vec::new();
+                for _ in 0..2 {
+                    let mut packet = vec![0; 512];
+                    let (n, peer) = upstream.recv_from(&mut packet).await.unwrap();
+                    packet.truncate(n);
+                    packet[2] |= 0x80;
+                    responses.push((packet, peer));
+                }
+                responses.sort_by_key(|(packet, _)| std::cmp::Reverse(packet[13]));
+                for (packet, peer) in responses {
+                    upstream.send_to(&packet, peer).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let serving = tokio::spawn(tcp_conn(
+                stream,
+                manager,
+                Arc::new(Cache::new(false, 1)),
+                Arc::new(Semaphore::new(2)),
+            ));
+            let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+            let mut frames = tcp_frame(&query, query.clone());
+            query[1] = 2;
+            query[13] = b'b';
+            frames.extend_from_slice(&tcp_frame(&query, query.clone()));
+            client.write_all(&frames).await.unwrap();
+            client.shutdown().await.unwrap();
+            for id in [2, 1] {
+                let len = client.read_u16().await.unwrap();
+                let mut answer = vec![0; len as usize];
+                client.read_exact(&mut answer).await.unwrap();
+                assert_eq!(answer[1], id);
+                assert_ne!(answer[2] & 0x80, 0);
+            }
+            serving.await.unwrap().unwrap();
+            responder.await.unwrap();
+        })
+        .await
+        .expect("the peer must receive both pipelined queries before answering");
+    }
+
+    #[test]
+    fn oversized_tcp_answers_become_well_formed_servfail_frames() {
+        let query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        let frame = tcp_frame(&query, vec![0; 65_536]);
+        assert_eq!(
+            u16::from_be_bytes([frame[0], frame[1]]) as usize,
+            frame.len() - 2
+        );
+        assert_eq!(frame[5] & 15, 2);
+        wire::validate_response(&query, &frame[2..]).unwrap();
     }
 }
