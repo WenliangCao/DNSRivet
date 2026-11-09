@@ -320,6 +320,9 @@ fn sorted_numeric<T>(map: BTreeMap<String, T>) -> Vec<(String, T)> {
 }
 
 fn parse_service(raw: RawService, warnings: &mut Vec<String>) -> Result<Service, String> {
+    if raw.cache_size > 16_384 {
+        return Err("[service] cache_size must not exceed 16384 entries".into());
+    }
     let log_level = match raw.log_level.to_ascii_lowercase().as_str() {
         "" | "info" => log::LevelFilter::Info,
         "trace" => log::LevelFilter::Trace,

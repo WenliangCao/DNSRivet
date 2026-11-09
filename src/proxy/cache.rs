@@ -68,6 +68,13 @@ impl Cache {
     }
 
     pub fn insert(&self, meta: &QueryMeta, response: &[u8]) {
+        if response.len() > 4096
+            || !response
+                .get(12..12 + meta.key.qname.len())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&meta.key.qname))
+        {
+            return;
+        }
         let Some(entries) = &self.entries else {
             return;
         };
@@ -413,5 +420,12 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn oversized_answers_are_not_cached() {
+        let cache = Cache::new(true, 2);
+        let meta = wire::parse_query_meta(&query(1)).unwrap();
+        cache.insert(&meta, &response_with_records(1, 60, 300));
+        assert!(cache.get(&meta, [0, 1]).is_none());
     }
 }

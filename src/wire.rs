@@ -40,20 +40,20 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
         || flags & 0x7800 != 0 // non-QUERY opcode
         || flags & 0x0100 == 0 // recursion not desired
         || read_u16(message, 4)? != 1
+        || read_u16(message, 6)? != 0
+        || read_u16(message, 8)? != 0
     {
         return None;
     }
 
     let (qname, mut offset) = read_name(message, HEADER_LEN)?;
+    // A cached reply can echo casing in place only for an uncompressed question.
+    if !message[HEADER_LEN..offset].eq_ignore_ascii_case(&qname) {
+        return None;
+    }
     let qtype = read_u16(message, offset)?;
     let qclass = read_u16(message, offset + 2)?;
     offset += 4;
-
-    let answer_count = read_u16(message, 6)? as usize;
-    let authority_count = read_u16(message, 8)? as usize;
-    for _ in 0..answer_count + authority_count {
-        offset = parse_rr(message, offset)?.end;
-    }
 
     let mut udp_size = 512;
     let mut do_bit = false;
@@ -88,6 +88,17 @@ pub fn parse_query_meta(message: &[u8]) -> Option<QueryMeta> {
         },
         udp_size,
     })
+}
+
+/// A bounded local error with no records copied from an unsupported query.
+pub fn error_response(query: &[u8], rcode: u8) -> Vec<u8> {
+    let mut response = vec![0; HEADER_LEN];
+    if query.len() >= HEADER_LEN {
+        response[..2].copy_from_slice(&query[..2]);
+        response[2] = (query[2] & 0x79) | 0x80;
+        response[3] = 0x80 | rcode;
+    }
+    response
 }
 
 /// Extract the client's advertised UDP payload size even when the query must

@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 
 /// Bound on concurrently in-flight queries (memory backstop).
 const MAX_INFLIGHT: usize = 512;
-const MAX_TCP_CONNECTIONS: usize = 256;
+const MAX_TCP_CONNECTIONS: usize = 64;
 const MAX_QUERY_SIZE: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -206,7 +206,7 @@ async fn udp_loop(
                 continue;
             }
         };
-        if !(12..=MAX_QUERY_SIZE).contains(&n) {
+        if !(12..=MAX_QUERY_SIZE).contains(&n) || buf[2] & 0x80 != 0 {
             continue;
         }
         let Ok(permit) = inflight.clone().try_acquire_owned() else {
@@ -285,6 +285,9 @@ async fn tcp_conn(
             Err(_) | Ok(Err(_)) => return Ok(()),
             Ok(Ok(_)) => {}
         }
+        if query[2] & 0x80 != 0 {
+            continue;
+        }
         let _permit = inflight
             .acquire()
             .await
@@ -293,12 +296,13 @@ async fn tcp_conn(
         if !local_response(&cache, &query, meta.as_ref(), &mut response) {
             response = forward(&manager, &cache, &query, true, meta.as_ref()).await;
         }
-        let len = u16::try_from(response.len()).unwrap_or(u16::MAX);
-        let write = async {
-            stream.write_all(&len.to_be_bytes()).await?;
-            stream.write_all(&response[..len as usize]).await
-        };
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, write).await {
+        if response.len() > u16::MAX as usize {
+            response = wire::error_response(&query, 2);
+        }
+        let mut framed = Vec::with_capacity(response.len() + 2);
+        framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&response);
+        match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.write_all(&framed)).await {
             Err(_) | Ok(Err(_)) => return Ok(()),
             Ok(Ok(())) => {}
         }
@@ -320,6 +324,8 @@ fn local_response(
     if let Some(meta) = meta
         && cache.get_into(meta, [query[0], query[1]], response)
     {
+        let end = 12 + meta.key.qname.len();
+        response[12..end].copy_from_slice(&query[12..end]);
         log::debug!("cache hit");
         return true;
     }
@@ -333,14 +339,15 @@ async fn forward(
     client_tcp: bool,
     meta: Option<&wire::QueryMeta>,
 ) -> Vec<u8> {
-    let response = match manager.forward(query, client_tcp).await {
-        Some(response) => response,
-        None => servfail(query),
+    let Some(answer) = manager.forward_answer(query, client_tcp).await else {
+        return servfail(query);
     };
-    if let Some(meta) = meta {
-        cache.insert(meta, &response);
+    if answer.cacheable
+        && let Some(meta) = meta
+    {
+        cache.insert(meta, &answer.bytes);
     }
-    response
+    answer.bytes
 }
 
 /// Header-echo SERVFAIL: QR=1, RA=1, RCODE=2, question section preserved.
@@ -505,5 +512,44 @@ mod tests {
             upstream_sock.try_recv_from(&mut buf).is_err(),
             "upstream received a packet for a FORMERR-gated query"
         );
+    }
+    #[tokio::test]
+    async fn fallback_answers_bypass_cache_and_cache_hits_echo_question_case() {
+        let query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        let mut answer = query.clone();
+        answer[2] |= 0x80;
+        answer[7] = 1;
+        answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let manager = Manager::new(vec![], &[], vec![socket.local_addr().unwrap()]).unwrap();
+        let sent = answer.clone();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
+            let mut sent = sent;
+            sent[..2].copy_from_slice(&buf[..2]);
+            socket.send_to(&sent, peer).await.unwrap();
+        });
+        let cache = Cache::new(true, 2);
+        let meta = cache.query_meta(&query).unwrap();
+        assert_eq!(
+            forward(&manager, &cache, &query, false, Some(&meta)).await,
+            answer
+        );
+        assert!(!local_response(
+            &cache,
+            &query,
+            Some(&meta),
+            &mut Vec::new()
+        ));
+        responder.await.unwrap();
+        cache.insert(&meta, &answer);
+        let mut upper = query.clone();
+        upper[13] = b'A';
+        let mut response = Vec::new();
+        assert!(local_response(&cache, &upper, Some(&meta), &mut response));
+        assert_eq!(response[13], b'A');
+        assert!(local_response(&cache, &query, Some(&meta), &mut response));
+        assert_eq!(response[13], b'a');
     }
 }

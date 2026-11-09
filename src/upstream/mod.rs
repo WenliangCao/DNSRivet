@@ -92,6 +92,11 @@ enum Backend {
     Encrypted(Box<encrypted::Channel>),
 }
 
+pub struct Answer {
+    pub bytes: Vec<u8>,
+    pub cacheable: bool,
+}
+
 impl Manager {
     pub fn new(
         all: Vec<Upstream>,
@@ -159,8 +164,27 @@ impl Manager {
     /// An upstream silent for [`HEDGE_DELAY`] is raced against the next one
     /// rather than waited out. `client_tcp` enables the TC-triggered TCP
     /// retry on legacy upstreams.
-    pub async fn forward(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
+    pub async fn forward_answer(&self, query: &[u8], client_tcp: bool) -> Option<Answer> {
+        if query.len() < 12 || query[2] & 0x80 != 0 {
+            return None;
+        }
         let request = Request::new(query);
+        if self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.backend, Backend::Encrypted(_)))
+            && request.message().is_err()
+        {
+            let rcode = if Message::from_vec(query).is_err() {
+                1
+            } else {
+                4
+            };
+            return Some(Answer {
+                bytes: crate::wire::error_response(query, rcode),
+                cacheable: false,
+            });
+        }
         let response = if let [entry] = self.entries.as_slice() {
             // No task, owned query copy, or JoinSet for the common single-upstream case.
             let _permit = self.attempts.try_acquire().ok()?;
@@ -170,9 +194,25 @@ impl Manager {
                 .await
         };
         match response {
-            Some(response) => Some(response),
-            None => self.forward_to_system(query, client_tcp).await,
+            Some(bytes) => Some(Answer {
+                bytes,
+                cacheable: true,
+            }),
+            None => self
+                .forward_to_system(query, client_tcp)
+                .await
+                .map(|bytes| Answer {
+                    bytes,
+                    cacheable: false,
+                }),
         }
+    }
+
+    #[cfg(test)]
+    async fn forward(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
+        self.forward_answer(query, client_tcp)
+            .await
+            .map(|answer| answer.bytes)
     }
 
     async fn forward_hedged(
@@ -184,6 +224,7 @@ impl Manager {
         let mut attempts = JoinSet::new();
         let mut legacy_attempts = Vec::new();
         let mut next = 0;
+        let mut servfail = None;
         // When to start the next upstream while earlier ones are pending.
         let mut hedge_at = None;
 
@@ -240,7 +281,10 @@ impl Manager {
                             shared.bytes.as_ref(),
                             result,
                         ) {
-                            return Some(response);
+                            if response[3] & 0x0f != 2 {
+                                return Some(response);
+                            }
+                            servfail = Some(response);
                         }
                         continue;
                     }
@@ -269,6 +313,10 @@ impl Manager {
             let Some(response) = self.configured_answer(&self.entries[index], query, result) else {
                 continue;
             };
+            if response[3] & 0x0f == 2 {
+                servfail = Some(response);
+                continue;
+            }
             // Legacy attempts have no connection health to maintain. Encrypted
             // losers keep their budget until their own deadline so stalled
             // channels still invalidate and back off without unbounded work.
@@ -278,7 +326,7 @@ impl Manager {
             attempts.detach_all();
             return Some(response);
         }
-        None
+        servfail
     }
 
     fn configured_answer(
@@ -298,11 +346,6 @@ impl Manager {
         };
         // Every backend validates before returning from Entry::attempt. Do not
         // parse the same question again here; this layer only selects answers.
-        if response[3] & 0x0f == 2 {
-            log::debug!("upstream {name}: SERVFAIL; waiting for another upstream");
-            *entry.last_failure.lock().unwrap() = "SERVFAIL".into();
-            return None;
-        }
         let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
         let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
         if fallback_was_active {
@@ -1066,5 +1109,53 @@ mod tests {
         assert!(manager.forward(&query, false).await.is_none());
         assert!(manager.fallback_failed.load(Ordering::Relaxed));
         drop(dead);
+    }
+    #[tokio::test]
+    async fn servfail_from_any_configured_upstream_never_uses_system_dns() {
+        for count in [1, 2] {
+            let configured = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = configured.local_addr().unwrap();
+            let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let responder = tokio::spawn(async move {
+                for _ in 0..count {
+                    let mut buf = [0; 512];
+                    let (n, peer) = configured.recv_from(&mut buf).await.unwrap();
+                    buf[2] |= 0x80;
+                    buf[3] = 0x82;
+                    configured.send_to(&buf[..n], peer).await.unwrap();
+                }
+            });
+            let manager = Manager::new(
+                (0..count)
+                    .map(|_| test_upstream("SERVFAIL", addr, 100))
+                    .collect(),
+                &[],
+                vec![fallback.local_addr().unwrap()],
+            )
+            .unwrap();
+            let response = manager.forward(&labeled_query(7), false).await.unwrap();
+            assert_eq!(response[3] & 15, 2);
+            assert!(!manager.fallback_active.load(Ordering::Relaxed));
+            assert!(fallback.try_recv_from(&mut [0; 512]).is_err());
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_encrypted_queries_are_answered_locally() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut upstream = test_upstream("encrypted", socket.local_addr().unwrap(), 100);
+        upstream.proto = Proto::Dot;
+        let manager =
+            Manager::new(vec![upstream], &[], vec![socket.local_addr().unwrap()]).unwrap();
+        for (query, rcode) in [
+            (vec![0; 12], 4),
+            (vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0], 1),
+        ] {
+            let answer = manager.forward_answer(&query, false).await.unwrap();
+            assert_eq!(answer.bytes[3] & 15, rcode);
+            assert!(!answer.cacheable);
+        }
+        assert!(socket.try_recv_from(&mut [0; 512]).is_err());
     }
 }
