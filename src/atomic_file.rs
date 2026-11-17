@@ -20,7 +20,13 @@ pub fn write(
         .file
         .set_permissions(std::fs::Permissions::from_mode(mode))?;
     temporary.file.sync_all()?;
-    std::fs::rename(&temporary.path, destination)
+    std::fs::rename(&temporary.path, destination)?;
+    if let Some(parent) = temporary.path.parent()
+        && let Err(err) = File::open(parent).and_then(|dir| dir.sync_all())
+    {
+        log::warn!("sync parent directory {}: {err}", parent.display());
+    }
+    Ok(())
 }
 
 struct TemporaryFile {

@@ -1,6 +1,6 @@
 mod launchd;
 
-use crate::osdns::lock::FsLock;
+use crate::osdns::lock::{FsLock, LIFECYCLE_LOCK_PATH};
 use crate::{atomic_file, config, osdns};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
@@ -12,9 +12,6 @@ pub const SUPPORT_DIR: &str = "/Library/Application Support/DNSRivet";
 pub const CONFIG_PATH: &str = "/Library/Application Support/DNSRivet/config.toml";
 pub const BINARY_PATH: &str = "/Library/Application Support/DNSRivet/dnsrivet";
 pub const COMMAND_PATH: &str = "/usr/local/bin/dnsrivet";
-// Independent of the DNS/watchdog lock: restart waits for daemon reassertion
-// while holding this guard. Never remove the file, including during uninstall.
-const LIFECYCLE_LOCK_PATH: &str = "/Library/Application Support/DNSRivet/.lifecycle.lock";
 
 pub fn start(
     config_path: Option<PathBuf>,

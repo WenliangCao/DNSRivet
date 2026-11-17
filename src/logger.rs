@@ -57,6 +57,7 @@ pub fn init(level: LevelFilter, path: Option<&str>) -> Result<(), String> {
                 .create(true)
                 .append(true)
                 .mode(0o640)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
                 .open(p)
                 .map_err(|e| format!("cannot open log file {p}: {e}"))?;
             file.set_permissions(std::fs::Permissions::from_mode(0o640))
@@ -101,4 +102,25 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn init_rejects_symlink_log_path() {
+        let dir = std::env::temp_dir().join(format!("dnsrivet-logger-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("target.log");
+        std::fs::write(&target, b"existing").unwrap();
+        let link = dir.join("symlink.log");
+        symlink(&target, &link).unwrap();
+
+        let err = init(LevelFilter::Info, Some(link.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("cannot open log file"), "{err}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -75,7 +75,7 @@ fn run(config: Option<PathBuf>, verbose: bool, quick: cli::QuickArgs) -> ExitCod
         && nix::unistd::geteuid().is_root()
         && std::env::var("DNSRIVET_SERVICE").is_ok_and(|value| value == "1")
     {
-        match osdns::release() {
+        match osdns::release_on_startup_failure() {
             Ok(true) => eprintln!("service startup failed; original system DNS restored"),
             Ok(false) => {}
             Err(err) => eprintln!(

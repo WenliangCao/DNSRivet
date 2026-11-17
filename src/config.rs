@@ -164,6 +164,9 @@ pub fn load_text(text: &str) -> Result<Loaded, String> {
 
     let mut listeners = Vec::new();
     for (key, listener) in sorted_numeric(raw.listener) {
+        if listener.port == 0 {
+            return Err(format!("[listener.{key}] port must not be 0"));
+        }
         let ip: IpAddr = listener
             .ip
             .parse()
@@ -231,11 +234,16 @@ pub fn quick_toml(
     }
 
     for (index, spec) in upstreams.iter().enumerate() {
-        let (kind, endpoint) = match spec.split_once('=') {
-            Some((kind, endpoint)) if !kind.is_empty() && !endpoint.is_empty() => {
-                (kind.to_string(), endpoint.to_string())
+        let (kind, endpoint) = match (spec.find('='), spec.find("://")) {
+            (Some(eq_pos), scheme_pos)
+                if scheme_pos.is_none_or(|pos| eq_pos < pos)
+                    && eq_pos > 0
+                    && eq_pos + 1 < spec.len() =>
+            {
+                (&spec[..eq_pos], &spec[eq_pos + 1..])
             }
-            None if !spec.is_empty() => (String::new(), spec.to_string()),
+            (Some(eq_pos), Some(scheme_pos)) if scheme_pos < eq_pos => ("", spec.as_str()),
+            (None, _) if !spec.is_empty() => ("", spec.as_str()),
             _ => {
                 return Err(format!(
                     "invalid --upstream {spec:?}; expected TYPE=ENDPOINT"
@@ -246,8 +254,8 @@ pub fn quick_toml(
             index.to_string(),
             RawUpstream {
                 name: format!("upstream.{index}"),
-                kind,
-                endpoint,
+                kind: kind.into(),
+                endpoint: endpoint.into(),
                 bootstrap_ip: String::new(),
                 timeout: Some(timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
                 ip_stack: "both".into(),
@@ -445,14 +453,20 @@ fn parse_upstream(
         (rest, String::new())
     };
 
-    let (host, port) = split_host_port(hostport, proto.default_port())
+    let (mut host, port) = split_host_port(hostport, proto.default_port())
         .ok_or_else(|| format!("{ctx} invalid endpoint host: {hostport:?}"))?;
+    if port == 0 {
+        return Err(format!("{ctx} port must not be 0"));
+    }
 
-    let hostname = host.strip_suffix('.').unwrap_or(&host);
-    if host.parse::<IpAddr>().is_err()
-        && (hostname.is_empty()
-            || hostname.len() > 253
-            || hostname.split('.').any(|label| {
+    let ip_literal = host.parse::<IpAddr>().ok();
+    if ip_literal.is_none() {
+        if host.ends_with('.') {
+            host.pop();
+        }
+        if host.is_empty()
+            || host.len() > 253
+            || host.split('.').any(|label| {
                 label.is_empty()
                     || label.len() > 63
                     || label.starts_with('-')
@@ -460,9 +474,20 @@ fn parse_upstream(
                     || !label
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            }))
-    {
-        return Err(format!("{ctx} invalid endpoint hostname: {host:?}"));
+            })
+            || host
+                .rsplit('.')
+                .next()
+                .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(format!("{ctx} invalid endpoint hostname: {host:?}"));
+        }
+    }
+    if matches!(proto, Proto::Doh | Proto::Doh3) && matches!(ip_literal, Some(IpAddr::V6(_))) {
+        return Err(format!(
+            "{ctx} IPv6 literal {host:?} is not supported in {} URLs; use a hostname with bootstrap_ip = {host:?}",
+            proto.as_str()
+        ));
     }
 
     let mut bootstrap_ip = if raw.bootstrap_ip.is_empty() {
@@ -476,7 +501,7 @@ fn parse_upstream(
     };
     // IP-literal hosts are already resolved.
     if bootstrap_ip.is_none() {
-        bootstrap_ip = host.parse::<IpAddr>().ok();
+        bootstrap_ip = ip_literal;
     }
 
     let ip_stack = match raw.ip_stack.to_ascii_lowercase().as_str() {
@@ -671,5 +696,44 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("exposes DNS"))
         );
+    }
+
+    #[test]
+    fn rejects_zero_ports_numeric_tlds_ipv6_doh_and_preserves_query_equals() {
+        assert!(
+            quick_toml(
+                &["127.0.0.1:0".into()],
+                &["dot=dns.example".into()],
+                None,
+                None,
+                false
+            )
+            .is_err()
+        );
+        assert!(quick_toml(&[], &["dot=dns.example:0".into()], None, None, false).is_err());
+
+        let trailing = quick_toml(&[], &["dot=dns.example.".into()], None, None, false).unwrap();
+        let loaded = load_text(&trailing).unwrap();
+        assert_eq!(loaded.config.upstreams[0].host, "dns.example");
+
+        assert!(quick_toml(&[], &["dot=127.0.0.1.999".into()], None, None, false).is_err());
+        assert!(quick_toml(&[], &["dot=foo.123".into()], None, None, false).is_err());
+
+        for spec in ["https://[::1]/dns-query", "doh3=[2606:4700:4700::1111]"] {
+            let err = quick_toml(&[], &[spec.into()], None, None, false).unwrap_err();
+            assert!(err.contains("bootstrap_ip"), "{spec}: {err}");
+        }
+
+        let query_eq = quick_toml(
+            &[],
+            &["https://dns.example/dns-query?a=1".into()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let loaded = load_text(&query_eq).unwrap();
+        assert_eq!(loaded.config.upstreams[0].proto, Proto::Doh);
+        assert_eq!(loaded.config.upstreams[0].path, "/dns-query?a=1");
     }
 }

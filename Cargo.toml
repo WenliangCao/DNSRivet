@@ -36,7 +36,7 @@ toml = { version = "1", default-features = false, features = ["std", "serde", "p
 log = { version = "0.4", features = ["std"] }
 lru = "0.19"
 lexopt = "0.3"
-nix = { version = "0.31.3", default-features = false, features = ["user", "net"] }
+nix = { version = "0.31.3", default-features = false, features = ["user", "net", "fs"] }
 
 [dev-dependencies]
 futures-core = { version = "0.3", default-features = false }

@@ -211,6 +211,18 @@ pub fn release() -> Result<bool, String> {
     restore()
 }
 
+/// Release DNS on startup failure unless a CLI lifecycle command holds `.lifecycle.lock`.
+pub fn release_on_startup_failure() -> Result<bool, String> {
+    release_on_startup_failure_at(Path::new(super::lock::LIFECYCLE_LOCK_PATH), release)
+}
+
+fn release_on_startup_failure_at(
+    lock_path: &Path,
+    release_fn: impl FnOnce() -> Result<bool, String>,
+) -> Result<bool, String> {
+    FsLock::try_acquire(lock_path)?.map_or(Ok(false), |_| release_fn())
+}
+
 fn system_points_at_loopback() -> Result<bool, String> {
     if !current_loopback_dns()?.is_empty() {
         return Ok(true);
@@ -1610,5 +1622,23 @@ resolver #1
                 "8.8.8.8:53".parse::<SocketAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn release_on_startup_failure_skips_when_lifecycle_lock_is_held() {
+        let fixture = RestoreFixture::new(&restore_backup(), &[("Wi-Fi", &["127.0.0.1"])]);
+        let lock_path = fixture.root.join(".lifecycle.lock");
+        let guard = FsLock::acquire(&lock_path).unwrap();
+
+        let released = release_on_startup_failure_at(&lock_path, || {
+            panic!("must not release while lifecycle lock is held")
+        })
+        .unwrap();
+        assert!(!released);
+        assert!(fixture.path.exists());
+
+        drop(guard);
+        let released = release_on_startup_failure_at(&lock_path, || Ok(true)).unwrap();
+        assert!(released);
     }
 }
