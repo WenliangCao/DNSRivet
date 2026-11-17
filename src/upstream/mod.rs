@@ -15,6 +15,7 @@ use tokio::task::JoinSet;
 
 /// Includes hedged attempts still running after their client has been answered.
 const MAX_ATTEMPTS: usize = 512;
+const MAX_SYSTEM_ATTEMPTS: usize = 64;
 
 /// How long an upstream may stay silent before the next one is queried in
 /// parallel. Well above a warm DoH/DoH3 round trip, so healthy upstreams
@@ -27,6 +28,7 @@ const HEDGE_DELAY: Duration = Duration::from_millis(300);
 pub struct Manager {
     entries: Vec<Arc<Entry>>,
     attempts: Arc<Semaphore>,
+    system_attempts: Semaphore,
     /// Runtime-refreshable: the watchdog swaps in the current network's DNS
     /// when it recovers a lost takeover. Never persisted to the backup.
     system_fallback: std::sync::RwLock<Vec<SocketAddr>>,
@@ -96,6 +98,12 @@ pub struct Answer {
     pub cacheable: bool,
 }
 
+enum ConfiguredOutcome {
+    Answered(Vec<u8>),
+    AllFailed,
+    BudgetExhausted,
+}
+
 impl Manager {
     pub fn new(
         all: Vec<Upstream>,
@@ -147,6 +155,7 @@ impl Manager {
         Ok(Self {
             entries,
             attempts: Arc::new(Semaphore::new(MAX_ATTEMPTS)),
+            system_attempts: Semaphore::new(MAX_SYSTEM_ATTEMPTS),
             system_fallback: std::sync::RwLock::new(system_fallback),
             fallback_active: AtomicBool::new(false),
             fallback_failed: AtomicBool::new(false),
@@ -179,26 +188,36 @@ impl Manager {
                 cacheable: false,
             });
         }
-        let response = if let [entry] = self.entries.as_slice() {
+        let outcome = if let [entry] = self.entries.as_slice() {
             // No task, owned query copy, or JoinSet for the common single-upstream case.
-            let _permit = self.attempts.try_acquire().ok()?;
-            self.configured_answer(entry, query, entry.run(&request, client_tcp).await)
+            if let Ok(_permit) = self.attempts.try_acquire() {
+                let result = entry.run(&request, client_tcp).await;
+                match self.configured_answer(entry, query, result) {
+                    Some(bytes) => ConfiguredOutcome::Answered(bytes),
+                    None => ConfiguredOutcome::AllFailed,
+                }
+            } else {
+                ConfiguredOutcome::BudgetExhausted
+            }
         } else {
             self.forward_hedged(Arc::new(request.into_owned()), client_tcp)
                 .await
         };
-        match response {
-            Some(bytes) => Some(Answer {
+        match outcome {
+            ConfiguredOutcome::Answered(bytes) => Some(Answer {
                 bytes,
                 cacheable: true,
             }),
-            None => self
-                .forward_to_system(query, client_tcp)
-                .await
-                .map(|bytes| Answer {
-                    bytes,
-                    cacheable: false,
-                }),
+            // Overload on configured upstreams must fail closed, never via plaintext DNS.
+            ConfiguredOutcome::BudgetExhausted => None,
+            ConfiguredOutcome::AllFailed => {
+                self.forward_to_system(query, client_tcp)
+                    .await
+                    .map(|bytes| Answer {
+                        bytes,
+                        cacheable: false,
+                    })
+            }
         }
     }
 
@@ -213,7 +232,7 @@ impl Manager {
         &self,
         shared: Arc<Request<'static>>,
         client_tcp: bool,
-    ) -> Option<Vec<u8>> {
+    ) -> ConfiguredOutcome {
         let query = shared.bytes.as_ref();
         let mut attempts = JoinSet::new();
         let mut legacy_attempts = Vec::new();
@@ -276,7 +295,7 @@ impl Manager {
                             result,
                         ) {
                             if response[3] & 0x0f != 2 {
-                                return Some(response);
+                                return ConfiguredOutcome::Answered(response);
                             }
                             servfail = Some(response);
                         }
@@ -318,9 +337,15 @@ impl Manager {
                 attempt.abort();
             }
             attempts.detach_all();
-            return Some(response);
+            return ConfiguredOutcome::Answered(response);
         }
-        servfail
+        if let Some(response) = servfail {
+            ConfiguredOutcome::Answered(response)
+        } else if next == self.entries.len() {
+            ConfiguredOutcome::AllFailed
+        } else {
+            ConfiguredOutcome::BudgetExhausted
+        }
     }
 
     fn configured_answer(
@@ -340,12 +365,14 @@ impl Manager {
         };
         // Every backend validates before returning from Entry::attempt. Do not
         // parse the same question again here; this layer only selects answers.
-        let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
-        let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
-        if fallback_was_active {
-            log::info!("configured DNS upstreams recovered; system fallback inactive");
-        } else if fallback_had_failed {
-            log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
+        if response[3] & 0x0f != 2 {
+            let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
+            let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
+            if fallback_was_active {
+                log::info!("configured DNS upstreams recovered; system fallback inactive");
+            } else if fallback_had_failed {
+                log::info!("configured DNS upstreams recovered after a SERVFAIL episode");
+            }
         }
         // Transports may rewrite the DNS ID (DoQ pins it to 0).
         response[..2].copy_from_slice(&query[..2]);
@@ -362,7 +389,7 @@ impl Manager {
     }
 
     async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
-        let _permit = self.attempts.try_acquire().ok()?;
+        let _permit = self.system_attempts.try_acquire().ok()?;
         // Snapshot and drop the guard before any await: the read guard is not
         // Send, and holding it would also block the watchdog's refresh.
         let system_fallback: Vec<SocketAddr> = self.system_fallback.read().unwrap().clone();
@@ -1138,5 +1165,97 @@ mod tests {
             assert!(!answer.cacheable);
         }
         assert!(socket.try_recv_from(&mut [0; 512]).is_err());
+    }
+
+    #[tokio::test]
+    async fn exhausted_attempt_budget_never_reaches_system_fallback_on_single_or_multi_upstream() {
+        for count in [1, 2] {
+            let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let manager = Manager::new(
+                (0..count)
+                    .map(|i| test_upstream(&format!("u{i}"), upstream.local_addr().unwrap(), 100))
+                    .collect(),
+                &[],
+                vec![fallback.local_addr().unwrap()],
+            )
+            .unwrap();
+            let _reserved = manager
+                .attempts
+                .acquire_many(MAX_ATTEMPTS as u32)
+                .await
+                .unwrap();
+            assert!(manager.forward(&TEST_QUERY, false).await.is_none());
+            assert!(upstream.try_recv_from(&mut [0; 512]).is_err());
+            assert!(fallback.try_recv_from(&mut [0; 512]).is_err());
+            assert!(!manager.fallback_active.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_upstream_exhaustion_uses_independent_system_attempts_budget() {
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        let fallback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = fallback.local_addr().unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = fallback.recv_from(&mut buf).await.unwrap();
+            seen_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            buf[2] |= 0x80;
+            buf[3] |= 0x80;
+            fallback.send_to(&buf[..n], peer).await.unwrap();
+        });
+
+        let manager = Arc::new(
+            Manager::new(
+                vec![test_upstream("dead", dead_addr, 20)],
+                &[],
+                vec![fallback_addr],
+            )
+            .unwrap(),
+        );
+        let mgr = manager.clone();
+        let pending = tokio::spawn(async move { mgr.forward(&TEST_QUERY, false).await });
+        seen_rx.await.unwrap();
+        assert_eq!(manager.attempts.available_permits(), MAX_ATTEMPTS);
+        assert_eq!(
+            manager.system_attempts.available_permits(),
+            MAX_SYSTEM_ATTEMPTS - 1
+        );
+        // Saturating remaining system_attempts blocks a second fallback query.
+        let _sys_reserved = manager
+            .system_attempts
+            .acquire_many((MAX_SYSTEM_ATTEMPTS - 1) as u32)
+            .await
+            .unwrap();
+        assert!(manager.forward(&TEST_QUERY, false).await.is_none());
+        release_tx.send(()).unwrap();
+        assert!(pending.await.unwrap().is_some());
+        responder.await.unwrap();
+        drop(dead);
+    }
+
+    #[tokio::test]
+    async fn servfail_does_not_clear_fallback_active() {
+        let configured = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = configured.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            let (n, peer) = configured.recv_from(&mut buf).await.unwrap();
+            buf[2] |= 0x80;
+            buf[3] = 0x82;
+            configured.send_to(&buf[..n], peer).await.unwrap();
+        });
+        let manager =
+            Manager::new(vec![test_upstream("SERVFAIL", addr, 100)], &[], vec![]).unwrap();
+        manager.fallback_active.store(true, Ordering::Relaxed);
+        let response = manager.forward(&labeled_query(9), false).await.unwrap();
+        assert_eq!(response[3] & 0x0f, 2);
+        assert!(manager.fallback_active.load(Ordering::Relaxed));
+        responder.await.unwrap();
     }
 }
