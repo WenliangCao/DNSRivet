@@ -191,7 +191,7 @@ impl Manager {
         let outcome = if let [entry] = self.entries.as_slice() {
             // No task, owned query copy, or JoinSet for the common single-upstream case.
             if let Ok(_permit) = self.attempts.try_acquire() {
-                let result = entry.run(&request, client_tcp).await;
+                let result = entry.run(&request, client_tcp, None).await;
                 match self.configured_answer(entry, query, result) {
                     Some(bytes) => ConfiguredOutcome::Answered(bytes),
                     None => ConfiguredOutcome::AllFailed,
@@ -235,7 +235,7 @@ impl Manager {
     ) -> ConfiguredOutcome {
         let query = shared.bytes.as_ref();
         let mut attempts = JoinSet::new();
-        let mut legacy_attempts = Vec::new();
+        let mut hedged = Vec::new();
         let mut next = 0;
         let mut servfail = None;
         // When to start the next upstream while earlier ones are pending.
@@ -273,11 +273,12 @@ impl Manager {
                 if entry.timeout_ms > 0 && racer.is_some_and(|racer| racer.timeout_ms > 0) {
                     hedge_at = Some(Instant::now() + HEDGE_DELAY);
                 }
-                let is_legacy = matches!(entry.backend, Backend::Legacy { .. });
-                let (entry, query) = (entry.clone(), shared.clone());
+                let pioneer = matches!(entry.backend, Backend::Encrypted(_))
+                    .then(|| Arc::new(AtomicBool::new(false)));
+                let (entry, query, flag) = (entry.clone(), shared.clone(), pioneer.clone());
                 let mut attempt = Box::pin(async move {
                     let _permit = permit;
-                    (index, entry.run(&query, client_tcp).await)
+                    (index, entry.run(&query, client_tcp, flag.as_deref()).await)
                 });
                 if attempts.is_empty() {
                     // Poll in the caller until we actually need a race. The
@@ -302,10 +303,7 @@ impl Manager {
                         continue;
                     }
                 }
-                let abort = attempts.spawn(attempt);
-                if is_legacy {
-                    legacy_attempts.push(abort);
-                }
+                hedged.push((attempts.spawn(attempt), pioneer));
                 continue;
             }
 
@@ -330,11 +328,10 @@ impl Manager {
                 servfail = Some(response);
                 continue;
             }
-            // Legacy attempts have no connection health to maintain. Encrypted
-            // losers keep their budget until their own deadline so stalled
-            // channels still invalidate and back off without unbounded work.
-            for attempt in legacy_attempts {
-                attempt.abort();
+            for (attempt, pioneer) in hedged {
+                if pioneer.is_none_or(|flag| !flag.load(Ordering::Acquire)) {
+                    attempt.abort();
+                }
             }
             attempts.detach_all();
             return ConfiguredOutcome::Answered(response);
@@ -441,10 +438,15 @@ async fn wait_for_hedge(at: Option<Instant>) {
 }
 
 impl Entry {
-    async fn run(&self, request: &Request<'_>, client_tcp: bool) -> Result<Vec<u8>, String> {
+    async fn run(
+        &self,
+        request: &Request<'_>,
+        client_tcp: bool,
+        pioneer: Option<&AtomicBool>,
+    ) -> Result<Vec<u8>, String> {
         let deadline =
             (self.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(self.timeout_ms));
-        let attempt = self.attempt(request, client_tcp, deadline);
+        let attempt = self.attempt(request, client_tcp, deadline, pioneer);
         if matches!(self.backend, Backend::Legacy { .. })
             && let Some(at) = deadline
         {
@@ -461,6 +463,7 @@ impl Entry {
         request: &Request<'_>,
         client_tcp: bool,
         deadline: Option<Instant>,
+        pioneer: Option<&AtomicBool>,
     ) -> Result<Vec<u8>, String> {
         let query = request.bytes.as_ref();
         match &self.backend {
@@ -494,7 +497,7 @@ impl Entry {
                 let message = request
                     .message()
                     .map_err(|rcode| format!("unsupported encrypted query (rcode {rcode})"))?;
-                let response = channel.query(message, deadline).await?;
+                let response = channel.query(message, deadline, pioneer).await?;
                 crate::wire::validate_response(query, &response)
                     .map_err(|err| format!("rejected response: {err}"))?;
                 Ok(response)

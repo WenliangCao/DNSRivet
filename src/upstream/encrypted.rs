@@ -40,7 +40,7 @@ use hickory_net::xfer::{
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
@@ -118,6 +118,50 @@ struct AliveGuard(Arc<AtomicBool>);
 impl Drop for AliveGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+const NO_PIONEER: u64 = u64::MAX;
+
+/// Deduplicates detached hedge-loser probes so at most one losing query per
+/// channel generation stays alive to detect a dead connection and trigger backoff.
+/// `slot` holds the claimed generation or `NO_PIONEER` when unclaimed; `SeqCst`
+/// gives a single total order across lock-free release-and-reclaim transitions.
+struct Pioneer<'a> {
+    slot: &'a AtomicU64,
+    flag: Option<&'a AtomicBool>,
+    claimed: u64,
+}
+
+impl Pioneer<'_> {
+    fn claim(&mut self, generation: u64) {
+        let Some(flag) = self.flag else {
+            return;
+        };
+        if self.claimed == generation {
+            return;
+        }
+        if self.claimed != NO_PIONEER {
+            let _ = self.slot.compare_exchange(
+                self.claimed,
+                NO_PIONEER,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        let won = generation != NO_PIONEER
+            && self
+                .slot
+                .compare_exchange(NO_PIONEER, generation, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        flag.store(won, Ordering::Release);
+        self.claimed = if won { generation } else { NO_PIONEER };
+    }
+}
+
+impl Drop for Pioneer<'_> {
+    fn drop(&mut self) {
+        self.claim(NO_PIONEER);
     }
 }
 
@@ -281,6 +325,7 @@ pub struct Channel {
     deny: Arc<Vec<SocketAddr>>,
     state: std::sync::Mutex<Slot<DnsExchange<TokioRuntimeProvider>>>,
     dial_lock: Mutex<()>,
+    probing_gen: AtomicU64,
 }
 
 impl Channel {
@@ -297,6 +342,7 @@ impl Channel {
             deny,
             state: std::sync::Mutex::new(Slot::default()),
             dial_lock: Mutex::new(()),
+            probing_gen: AtomicU64::new(NO_PIONEER),
         }
     }
 
@@ -308,14 +354,24 @@ impl Channel {
         &self,
         message: &Message,
         mut deadline: Option<Instant>,
+        pioneer: Option<&AtomicBool>,
     ) -> Result<Vec<u8>, String> {
         let retry_budget = deadline.map(|at| {
             at.saturating_duration_since(Instant::now())
                 .min(STALE_RETRY_BUDGET)
         });
+        let mut guard = Pioneer {
+            slot: &self.probing_gen,
+            flag: pioneer,
+            claimed: NO_PIONEER,
+        };
+        if pioneer.is_some() {
+            guard.claim(self.state.lock().unwrap().generation);
+        }
         let mut lease = self.acquire(deadline).await?;
         let mut retried = false;
         loop {
+            guard.claim(lease.generation);
             match send(&lease.exchange, &lease.alive, message.clone(), deadline).await {
                 Ok(buffer) => {
                     let mut state = self.state.lock().unwrap();
@@ -877,7 +933,7 @@ mod tests {
             ),
             (
                 "attempt",
-                std::mem::size_of_val(&manager.entries[0].run(&request, false)),
+                std::mem::size_of_val(&manager.entries[0].run(&request, false, None)),
             ),
         ] {
             assert!(size < 3072, "{name} future grew to {size} bytes");
@@ -991,7 +1047,9 @@ mod tests {
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!();
             };
-            channel.query(&encrypted_test_query(0), deadline).await
+            channel
+                .query(&encrypted_test_query(0), deadline, None)
+                .await
         })
     }
 
@@ -1463,7 +1521,7 @@ mod tests {
 
         let message = encrypted_test_query(0);
         let deadline = Instant::now() + Duration::from_millis(100);
-        let query = channel.query(&message, Some(deadline));
+        let query = channel.query(&message, Some(deadline), None);
         tokio::pin!(query);
         tokio::select! {
             result = &mut query => panic!("silent connection answered: {result:?}"),
@@ -1569,6 +1627,7 @@ mod tests {
             channel.query(
                 &encrypted_test_query(0),
                 Some(Instant::now() + Duration::from_millis(20)),
+                None,
             ),
         )
         .await
@@ -1704,6 +1763,7 @@ mod tests {
             .query(
                 &encrypted_test_query(0),
                 Some(Instant::now() + Duration::from_millis(30)),
+                None,
             )
             .await
             .unwrap_err();
@@ -1756,7 +1816,11 @@ mod tests {
             );
         }
         let message = encrypted_test_query(0);
-        let query = channel.query(&message, Some(Instant::now() + Duration::from_millis(80)));
+        let query = channel.query(
+            &message,
+            Some(Instant::now() + Duration::from_millis(80)),
+            None,
+        );
         tokio::pin!(query);
         tokio::select! {
             result = &mut query => panic!("silent connection answered: {result:?}"),
@@ -2084,7 +2148,7 @@ mod tests {
         );
 
         let q1 = encrypted_test_query(0);
-        let r1 = channel.query(&q1, None).await.unwrap();
+        let r1 = channel.query(&q1, None, None).await.unwrap();
         crate::wire::validate_response(&q1.to_vec().unwrap(), &r1).unwrap();
         assert_eq!(channel.state.lock().unwrap().generation, 1);
 
@@ -2098,7 +2162,7 @@ mod tests {
         assert!(!channel.state.lock().unwrap().alive.load(Ordering::Acquire));
 
         let q2 = encrypted_test_query(0);
-        let r2 = channel.query(&q2, None).await.unwrap();
+        let r2 = channel.query(&q2, None, None).await.unwrap();
         crate::wire::validate_response(&q2.to_vec().unwrap(), &r2).unwrap();
         assert_eq!(channel.state.lock().unwrap().generation, 2);
         assert_eq!(accept_count.load(Ordering::Relaxed), 2);
@@ -2214,7 +2278,7 @@ mod tests {
         );
 
         let q1 = encrypted_test_query(0);
-        let r1 = channel.query(&q1, None).await.unwrap();
+        let r1 = channel.query(&q1, None, None).await.unwrap();
         crate::wire::validate_response(&q1.to_vec().unwrap(), &r1).unwrap();
         assert_eq!(channel.state.lock().unwrap().generation, 1);
 
@@ -2222,12 +2286,71 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         let q2 = encrypted_test_query(0);
-        let r2 = channel.query(&q2, None).await.unwrap();
+        let r2 = channel.query(&q2, None, None).await.unwrap();
         crate::wire::validate_response(&q2.to_vec().unwrap(), &r2).unwrap();
         assert_eq!(channel.state.lock().unwrap().generation, 2);
         assert_eq!(accept_count.load(Ordering::Relaxed), 2);
         assert_eq!(channel.state.lock().unwrap().connect_failures, 0);
         let _ = done_tx.send(());
         server_task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hedged_520_query_burst_survives_blackholed_primary_encrypted_upstream() {
+        let up = |name: &str| Upstream {
+            name: name.into(),
+            proto: Proto::Doh,
+            host: "resolver.test".into(),
+            port: 443,
+            path: "/dns-query".into(),
+            bootstrap_ip: Some("192.0.2.53".parse().unwrap()),
+            timeout_ms: 5000,
+            ip_stack: IpStack::V4,
+        };
+        let manager =
+            Arc::new(Manager::new(vec![up("blackholed"), up("healthy")], &[], Vec::new()).unwrap());
+        let Backend::Encrypted(u0) = &manager.entries[0].backend else {
+            unreachable!();
+        };
+        let (ex0, bg0) = DnsExchange::from_stream(TestTransport {
+            silent: true,
+            ..TestTransport::default()
+        });
+        let (alive0, bg0) = spawn_background_alive(bg0);
+        u0.state.lock().unwrap().store(ex0, alive0);
+
+        let Backend::Encrypted(u1) = &manager.entries[1].backend else {
+            unreachable!();
+        };
+        let (ex1, bg1) = DnsExchange::from_stream(TestTransport::default());
+        let (alive1, bg1) = spawn_background_alive(bg1);
+        u1.state.lock().unwrap().store(ex1, alive1);
+
+        let query = encrypted_test_query(0).to_vec().unwrap();
+        let mut all = tokio::task::JoinSet::new();
+        for wave in 0..4 {
+            for _ in 0..130 {
+                let manager = manager.clone();
+                let query = query.clone();
+                all.spawn(async move { manager.forward(&query, false).await.is_some() });
+            }
+            if wave < 3 {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+        }
+        let mut ok = 0usize;
+        while let Some(res) = all.join_next().await {
+            if res.unwrap() {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 520, "all 520 queries must succeed via healthy U1");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            manager.attempts.available_permits(),
+            super::super::MAX_ATTEMPTS
+        );
+        bg0.abort();
+        bg1.abort();
     }
 }
