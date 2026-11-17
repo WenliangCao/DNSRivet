@@ -358,6 +358,33 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
 
+    impl Bootstrap {
+        pub(in crate::upstream) fn with_test_servers(servers: Vec<SocketAddr>) -> Self {
+            Self::with_servers(servers)
+        }
+
+        pub(in crate::upstream) async fn seed_test_failure(&self, host: &str, stack: IpStack) {
+            let mut slots = self.slots.lock().await;
+            let slot = slots.entry((host.to_ascii_lowercase(), stack)).or_default();
+            slot.failure = Some(Failure {
+                err: "seeded failure".into(),
+                retry_at: Instant::now() + RETRY_AFTER_FAILURE,
+            });
+        }
+
+        pub(in crate::upstream) async fn has_active_failure(
+            &self,
+            host: &str,
+            stack: IpStack,
+        ) -> bool {
+            self.slots
+                .lock()
+                .await
+                .get(&(host.to_ascii_lowercase(), stack))
+                .is_some_and(|slot| slot.failure.is_some())
+        }
+    }
+
     const V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
     const V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
 

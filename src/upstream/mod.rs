@@ -46,7 +46,7 @@ struct Entry {
 /// Encrypted attempts share one lazy parse, including failed parses.
 struct Request<'a> {
     bytes: Cow<'a, [u8]>,
-    parsed: OnceLock<Result<Message, String>>,
+    parsed: OnceLock<Result<Message, u8>>,
 }
 
 impl<'a> Request<'a> {
@@ -64,18 +64,17 @@ impl<'a> Request<'a> {
         }
     }
 
-    fn message(&self) -> Result<&Message, String> {
+    fn message(&self) -> Result<&Message, u8> {
         self.parsed
             .get_or_init(|| {
-                let message = Message::from_vec(&self.bytes)
-                    .map_err(|e| format!("unparseable query: {e}"))?;
+                let message = Message::from_vec(&self.bytes).map_err(|_| 1u8)?;
                 if !safe_encrypted_query(&message) {
-                    return Err("unsupported query shape for encrypted forwarding".into());
+                    return Err(4u8);
                 }
                 Ok(message)
             })
             .as_ref()
-            .map_err(Clone::clone)
+            .map_err(|&rcode| rcode)
     }
 }
 
@@ -173,13 +172,8 @@ impl Manager {
             .entries
             .iter()
             .any(|entry| matches!(entry.backend, Backend::Encrypted(_)))
-            && request.message().is_err()
+            && let Err(rcode) = request.message()
         {
-            let rcode = if Message::from_vec(query).is_err() {
-                1
-            } else {
-                4
-            };
             return Some(Answer {
                 bytes: crate::wire::error_response(query, rcode),
                 cacheable: false,
@@ -470,7 +464,10 @@ impl Entry {
                 Err(last_err.unwrap_or_else(|| "no addresses".into()))
             }
             Backend::Encrypted(channel) => {
-                let response = channel.query(request.message()?, deadline).await?;
+                let message = request
+                    .message()
+                    .map_err(|rcode| format!("unsupported encrypted query (rcode {rcode})"))?;
+                let response = channel.query(message, deadline).await?;
                 crate::wire::validate_response(query, &response)
                     .map_err(|err| format!("rejected response: {err}"))?;
                 Ok(response)

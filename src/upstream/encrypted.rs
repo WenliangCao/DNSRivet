@@ -40,6 +40,7 @@ use hickory_net::xfer::{
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
@@ -112,10 +113,19 @@ struct RoutePath {
     checked: Instant,
 }
 
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Generation-tracked connection slot. Generic over the handle type so the
 /// invalidation rules are unit-testable without real connections.
 struct Slot<E> {
     exchange: Option<E>,
+    alive: Arc<AtomicBool>,
     generation: u64,
     connect_failures: u32,
     cooldown_until: Option<Instant>,
@@ -129,6 +139,7 @@ impl<E> Default for Slot<E> {
     fn default() -> Self {
         Self {
             exchange: None,
+            alive: Arc::new(AtomicBool::new(false)),
             generation: 0,
             connect_failures: 0,
             cooldown_until: None,
@@ -140,13 +151,19 @@ impl<E> Default for Slot<E> {
 }
 
 impl<E: Clone> Slot<E> {
-    fn lease(&self) -> Option<(E, u64)> {
-        self.exchange.clone().map(|e| (e, self.generation))
+    fn lease(&mut self) -> Option<(E, Arc<AtomicBool>, u64)> {
+        if !self.alive.load(Ordering::Acquire) {
+            self.exchange = None;
+        }
+        self.exchange
+            .clone()
+            .map(|exchange| (exchange, self.alive.clone(), self.generation))
     }
 
-    fn store(&mut self, exchange: E) -> u64 {
+    fn store(&mut self, exchange: E, alive: Arc<AtomicBool>) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.exchange = Some(exchange);
+        self.alive = alive;
         self.connect_failures = 0;
         self.cooldown_until = None;
         self.last_used = Some(Stamp::now());
@@ -216,6 +233,12 @@ impl<E: Clone> Slot<E> {
         }
     }
 
+    fn fail(&mut self, generation: u64, backoff: bool) {
+        if self.invalidate(generation) && backoff {
+            self.backoff();
+        }
+    }
+
     fn backoff(&mut self) -> Duration {
         self.connect_failures = self.connect_failures.saturating_add(1);
         let backoff = Duration::from_secs(1 << self.connect_failures.min(MAX_BACKOFF_SHIFT));
@@ -226,6 +249,7 @@ impl<E: Clone> Slot<E> {
 
 struct Lease {
     exchange: DnsExchange<TokioRuntimeProvider>,
+    alive: Arc<AtomicBool>,
     generation: u64,
     reused: bool,
     path: Option<RoutePath>,
@@ -255,7 +279,8 @@ pub struct Channel {
     bootstrap: Arc<Bootstrap>,
     /// Our own listener addresses — refuse to dial ourselves.
     deny: Arc<Vec<SocketAddr>>,
-    state: Mutex<Slot<DnsExchange<TokioRuntimeProvider>>>,
+    state: std::sync::Mutex<Slot<DnsExchange<TokioRuntimeProvider>>>,
+    dial_lock: Mutex<()>,
 }
 
 impl Channel {
@@ -270,7 +295,8 @@ impl Channel {
             tls,
             bootstrap,
             deny,
-            state: Mutex::new(Slot::default()),
+            state: std::sync::Mutex::new(Slot::default()),
+            dial_lock: Mutex::new(()),
         }
     }
 
@@ -290,11 +316,10 @@ impl Channel {
         let mut lease = self.acquire(deadline).await?;
         let mut retried = false;
         loop {
-            match send(&lease.exchange, message.clone(), deadline).await {
+            match send(&lease.exchange, &lease.alive, message.clone(), deadline).await {
                 Ok(buffer) => {
-                    if let Ok(mut state) = self.state.try_lock()
-                        && state.generation == lease.generation
-                    {
+                    let mut state = self.state.lock().unwrap();
+                    if state.generation == lease.generation {
                         state.last_answer = Some(Instant::now());
                     }
                     return Ok(buffer);
@@ -302,16 +327,17 @@ impl Channel {
                 Err(SendFailure::Request(err)) => return Err(err),
                 Err(SendFailure::Deadline) => {
                     let stale = !retried && lease.went_stale();
-                    if let Ok(mut state) = self.state.try_lock() {
-                        let responsive = state.last_answer.is_some_and(|at| at >= lease.taken.mono);
+                    {
+                        let mut state = self.state.lock().unwrap();
+                        let responsive = state.last_answer.is_some_and(|at| {
+                            at >= lease.taken.mono && at.elapsed() <= Duration::from_secs(1)
+                        });
                         if !stale && responsive && state.generation == lease.generation {
                             return Err(
                                 "no answer within the deadline; connection still responsive".into(),
                             );
                         }
-                        if state.invalidate(lease.generation) && !stale {
-                            state.backoff();
-                        }
+                        state.fail(lease.generation, !stale);
                     }
                     if !stale {
                         return Err("no answer within the deadline".into());
@@ -320,6 +346,9 @@ impl Channel {
                         "upstream {}: network changed during a query; retrying on a fresh connection",
                         self.up.name
                     );
+                    if self.up.bootstrap_ip.is_none() {
+                        self.bootstrap.reset(&self.up.host).await;
+                    }
                     retried = true;
                     deadline = retry_budget.map(|budget| Instant::now() + budget);
                     lease = self.acquire(deadline).await.map_err(|err| {
@@ -328,12 +357,7 @@ impl Channel {
                 }
                 Err(SendFailure::Transport(err)) => {
                     let redial = lease.reused && !retried && budget_allows_redial(deadline);
-                    if let Ok(mut state) = self.state.try_lock()
-                        && state.invalidate(lease.generation)
-                        && !redial
-                    {
-                        state.backoff();
-                    }
+                    self.state.lock().unwrap().fail(lease.generation, !redial);
                     if !redial {
                         return Err(err);
                     }
@@ -355,11 +379,9 @@ impl Channel {
     }
 
     async fn acquire(&self, deadline: Option<Instant>) -> Result<Lease, String> {
-        // Holding the async lock across connect serializes dial attempts,
-        // so a burst of queries cannot stampede-connect.
-        let mut state = within(deadline, self.state.lock()).await?;
         let now = Stamp::now();
-        if let Some(slept) = state.drop_if_slept(now) {
+        let slept = self.state.lock().unwrap().drop_if_slept(now);
+        if let Some(slept) = slept {
             log::info!(
                 "upstream {}: host slept {:.0}s; renewing connection",
                 self.up.name,
@@ -369,63 +391,59 @@ impl Channel {
                 self.bootstrap.reset(&self.up.host).await;
             }
         }
-        if let Some(peer) = state.route_check_due(now.mono)
-            && let Some((from, to)) = state.drop_if_moved(route_source(peer))
-        {
-            log::info!(
-                "upstream {}: route source changed from {from:?} to {to}; renewing connection",
-                self.up.name
-            );
-            self.bootstrap.reset(&self.up.host).await;
-        }
-        if let Some((exchange, generation)) = state.lease() {
-            return Ok(Lease {
-                exchange,
-                generation,
-                reused: true,
-                path: state.path,
-                taken: now,
-            });
-        }
-        if let Some(until) = state.cooldown_until {
-            let now = Instant::now();
-            if now < until {
-                return Err(format!(
-                    "in cooldown for {:.1}s",
-                    (until - now).as_secs_f32()
-                ));
+        let peer = self.state.lock().unwrap().route_check_due(now.mono);
+        if let Some(peer) = peer {
+            let source = route_source(peer);
+            let moved = self.state.lock().unwrap().drop_if_moved(source);
+            if let Some((from, to)) = moved {
+                log::info!(
+                    "upstream {}: route source changed from {from:?} to {to}; renewing connection",
+                    self.up.name
+                );
+                self.bootstrap.reset(&self.up.host).await;
             }
         }
+        if let Some(lease) = self.reuse(now) {
+            return Ok(lease);
+        }
 
-        // Keep a route observation even when bootstrap or dialing fails.
-        let probe = self
-            .up
-            .bootstrap_ip
-            .unwrap_or_else(|| match self.up.ip_stack {
-                IpStack::V6 => "2606:4700:4700::1111".parse().unwrap(),
-                _ => "1.1.1.1".parse().unwrap(),
-            });
-        let peer = SocketAddr::new(probe, self.up.port);
-        state.record_path(peer, route_source(peer));
+        // Serializes cold dials so a burst cannot stampede-connect.
+        let _dial = within(deadline, self.dial_lock.lock()).await?;
+        if let Some(lease) = self.reuse(Stamp::now()) {
+            return Ok(lease);
+        }
+        let default_ip = match self.up.ip_stack {
+            IpStack::V6 => IpAddr::from([0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111]),
+            _ => IpAddr::from([1, 1, 1, 1]),
+        };
+        let peer = SocketAddr::new(self.up.bootstrap_ip.unwrap_or(default_ip), self.up.port);
+        let source = route_source(peer);
+        let need_invalidate = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(until) = state.cooldown_until
+                && let Some(wait) = until.checked_duration_since(Instant::now())
+            {
+                return Err(format!("in cooldown for {:.1}s", wait.as_secs_f32()));
+            }
+            state.record_path(peer, source);
+            state.connect_failures > 0
+        };
+
         let ips = match self.up.bootstrap_ip {
             Some(ip) => vec![ip],
             None => {
-                if state.connect_failures > 0 {
+                if need_invalidate {
                     self.bootstrap.invalidate(&self.up.host).await;
                 }
-                match within(
+                within(
                     deadline,
                     self.bootstrap.resolve(&self.up.host, self.up.ip_stack),
                 )
-                .await
-                .and_then(|result| result)
-                {
-                    Ok(ips) => ips,
-                    Err(err) => {
-                        state.backoff();
-                        return Err(format!("{err}; backing off after bootstrap failure"));
-                    }
-                }
+                .await?
+                .map_err(|err| {
+                    self.state.lock().unwrap().backoff();
+                    format!("{err}; backing off after bootstrap failure")
+                })?
             }
         };
 
@@ -445,22 +463,26 @@ impl Channel {
             // Connection setup carries large TLS/QUIC futures. Allocate only
             // when dialing, so every forwarded query has a smaller future.
             let candidate_deadline = dial_deadline(deadline, count - index);
-            state.record_path(addr, route_source(addr));
+            let source = route_source(addr);
+            self.state.lock().unwrap().record_path(addr, source);
             match Box::pin(connect(&self.up, &self.tls, addr, Some(candidate_deadline))).await {
-                Ok(exchange) => {
+                Ok((exchange, alive)) => {
                     log::debug!(
                         "upstream {}: connected {} to {addr}",
                         self.up.name,
                         self.up.proto.as_str()
                     );
-                    let generation = state.store(exchange.clone());
-                    state.record_path(addr, route_source(addr));
+                    let source = route_source(addr);
+                    let mut state = self.state.lock().unwrap();
+                    let generation = state.store(exchange.clone(), alive.clone());
+                    state.record_path(addr, source);
                     return Ok(Lease {
                         exchange,
+                        alive,
                         generation,
                         reused: false,
                         path: state.path,
-                        taken: now,
+                        taken: Stamp::now(),
                     });
                 }
                 Err(err) => {
@@ -470,10 +492,23 @@ impl Channel {
             }
         }
 
-        let backoff = state.backoff();
+        let backoff = self.state.lock().unwrap().backoff();
         Err(format!(
             "connect failed ({last_err}); backing off {backoff:?}"
         ))
+    }
+
+    fn reuse(&self, taken: Stamp) -> Option<Lease> {
+        let mut state = self.state.lock().unwrap();
+        let (exchange, alive, generation) = state.lease()?;
+        Some(Lease {
+            exchange,
+            alive,
+            generation,
+            reused: true,
+            path: state.path,
+            taken,
+        })
     }
 }
 
@@ -501,6 +536,7 @@ fn budget_allows_redial(deadline: Option<Instant>) -> bool {
 
 async fn send(
     exchange: &DnsExchange<TokioRuntimeProvider>,
+    alive: &AtomicBool,
     message: Message,
     deadline: Option<Instant>,
 ) -> Result<Vec<u8>, SendFailure> {
@@ -517,6 +553,9 @@ async fn send(
         .map(|response| response.into_buffer())
         .map_err(|err| match err {
             NetError::Timeout => SendFailure::Deadline,
+            NetError::Busy if !alive.load(Ordering::Acquire) => {
+                SendFailure::Transport("connection closed".into())
+            }
             NetError::Busy | NetError::RequestTooLarge | NetError::Proto(_) => {
                 SendFailure::Request(err.to_string())
             }
@@ -536,7 +575,7 @@ async fn connect(
     tls: &Arc<rustls::ClientConfig>,
     addr: SocketAddr,
     deadline: Option<Instant>,
-) -> Result<DnsExchange<TokioRuntimeProvider>, String> {
+) -> Result<(DnsExchange<TokioRuntimeProvider>, Arc<AtomicBool>), String> {
     let provider = TokioRuntimeProvider::new();
     match up.proto {
         Proto::Dot => {
@@ -575,7 +614,7 @@ async fn connect_dot<F, S>(
     conn: F,
     handle: BufDnsStreamHandle,
     deadline: Option<Instant>,
-) -> Result<DnsExchange<TokioRuntimeProvider>, String>
+) -> Result<(DnsExchange<TokioRuntimeProvider>, Arc<AtomicBool>), String>
 where
     F: Future<Output = Result<S, NetError>> + Send + 'static,
     S: DnsClientStream<Time = TokioTime>,
@@ -596,7 +635,7 @@ where
 async fn finish<F, S>(
     connect: F,
     deadline: Option<Instant>,
-) -> Result<DnsExchange<TokioRuntimeProvider>, String>
+) -> Result<(DnsExchange<TokioRuntimeProvider>, Arc<AtomicBool>), String>
 where
     F: Future<Output = Result<S, NetError>> + Send + 'static,
     S: DnsRequestSender,
@@ -610,8 +649,13 @@ where
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| e.to_string())?;
     let (exchange, background) = DnsExchange::from_stream(stream);
-    tokio::spawn(background);
-    Ok(exchange)
+    let alive = Arc::new(AtomicBool::new(true));
+    let guard = AliveGuard(alive.clone());
+    tokio::spawn(async move {
+        background.await;
+        drop(guard);
+    });
+    Ok((exchange, alive))
 }
 
 #[cfg(test)]
@@ -624,15 +668,38 @@ mod tests {
     use hickory_net::proto::rr::rdata::opt::EdnsOption;
     use hickory_net::proto::rr::{Name, RecordType};
     use hickory_net::xfer::DnsResponseStream;
+    use rustls::DigitallySignedStruct;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
+    };
     use std::pin::Pin;
+    use std::sync::atomic::AtomicU64;
     use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
+
+    fn spawn_background_alive(
+        background: impl Future<Output = ()> + Send + 'static,
+    ) -> (Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = AliveGuard(alive.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            background.await;
+        });
+        (alive, handle)
+    }
+
+    fn store_live<E: Clone>(slot: &mut Slot<E>, exchange: E) -> u64 {
+        slot.store(exchange, Arc::new(AtomicBool::new(true)))
+    }
 
     #[tokio::test(start_paused = true)]
     async fn dot_waits_past_five_seconds_but_obeys_the_channel_deadline() {
         use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
         use hickory_net::tcp::{TcpClientStream, TcpStream};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Exercise DoT's real framing and multiplexer over in-memory I/O. TLS
         // only supplies this byte stream; no certificate fixtures are needed.
@@ -642,11 +709,11 @@ mod tests {
             let (stream, handle) =
                 TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
             let conn = std::future::ready(Ok(TcpClientStream::from_stream(stream)));
-            let exchange = connect_dot(conn, handle, None).await.unwrap();
+            let (exchange, alive) = connect_dot(conn, handle, None).await.unwrap();
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!()
             };
-            channel.state.lock().await.store(exchange);
+            channel.state.lock().unwrap().store(exchange, alive);
             unused_background.await.unwrap();
             let (ready, received) = oneshot::channel();
             let responder = tokio::spawn(async move {
@@ -680,7 +747,6 @@ mod tests {
     async fn dot_reuses_a_backpressured_connection_without_reencoding_answers() {
         use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
         use hickory_net::tcp::{TcpClientStream, TcpStream};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Deliberately leave the answer owner uncompressed and mixed-case.
         // Re-encoding through Message would change these bytes.
@@ -703,7 +769,7 @@ mod tests {
             let (client, mut server) = tokio::io::duplex(64);
             let (stream, handle) =
                 TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
-            let exchange = connect_dot(
+            let (exchange, alive) = connect_dot(
                 std::future::ready(Ok(TcpClientStream::from_stream(stream))),
                 handle,
                 None,
@@ -713,7 +779,7 @@ mod tests {
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!();
             };
-            let generation = channel.state.lock().await.store(exchange);
+            let generation = channel.state.lock().unwrap().store(exchange, alive);
             unused_background.await.unwrap();
             let manager = Arc::new(manager);
             let mut query = encrypted_test_query(128);
@@ -775,7 +841,7 @@ mod tests {
                 let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                     unreachable!();
                 };
-                let state = channel.state.lock().await;
+                let state = channel.state.lock().unwrap();
                 assert_eq!(state.generation, generation);
                 assert_eq!(state.connect_failures, 0);
                 assert!(state.cooldown_until.is_none());
@@ -894,8 +960,9 @@ mod tests {
             panic!("the test upstream must use an encrypted channel");
         };
         let (exchange, background) = DnsExchange::from_stream(transport);
-        channel.state.lock().await.store(exchange);
-        (manager, tokio::spawn(background))
+        let (alive, handle) = spawn_background_alive(background);
+        channel.state.lock().unwrap().store(exchange, alive);
+        (manager, handle)
     }
 
     fn encrypted_test_query(padding: usize) -> Message {
@@ -967,15 +1034,15 @@ mod tests {
             ..TestTransport::default()
         };
         let (exchange, background) = DnsExchange::from_stream(transport);
-        let background = tokio::spawn(background);
-        channel.state.lock().await.store(exchange);
+        let (alive, background) = spawn_background_alive(background);
+        channel.state.lock().unwrap().store(exchange, alive);
 
         let query = encrypted_test_query(0).to_vec().unwrap();
         let started = tokio::time::Instant::now();
         let response = manager.forward(&query, false).await.unwrap();
         crate::wire::validate_response(&query, &response).unwrap();
         responder.await.unwrap();
-        assert!(channel.state.lock().await.exchange.is_some());
+        assert!(channel.state.lock().unwrap().exchange.is_some());
         assert_eq!(
             manager.attempts.available_permits(),
             super::super::MAX_ATTEMPTS - 1
@@ -984,7 +1051,7 @@ mod tests {
         // The original deadline is 600ms. Restarting the future at the 300ms
         // hedge would extend it to 900ms; check in between to catch that regression.
         tokio::time::sleep_until(started + Duration::from_millis(750)).await;
-        let state = channel.state.lock().await;
+        let state = channel.state.lock().unwrap();
         assert!(
             state.exchange.is_none(),
             "silent connection must be dropped"
@@ -1078,9 +1145,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_connection_attempt_releases_lock_and_socket() {
-        use tokio::io::AsyncReadExt;
-        use tokio::net::TcpListener;
-
         tokio::time::timeout(Duration::from_secs(2), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1110,12 +1174,13 @@ mod tests {
             let Backend::Encrypted(channel) = &manager.entries[0].backend else {
                 unreachable!();
             };
-            let state = channel.state.lock().await;
-            assert!(state.exchange.is_none());
-            assert_eq!(state.generation, 0);
-            assert_eq!(state.connect_failures, 0);
-            assert!(state.cooldown_until.is_none());
-            drop(state);
+            {
+                let state = channel.state.lock().unwrap();
+                assert!(state.exchange.is_none());
+                assert_eq!(state.generation, 0);
+                assert_eq!(state.connect_failures, 0);
+                assert!(state.cooldown_until.is_none());
+            }
 
             // Dropping the boxed dial future must close its TCP connection.
             socket.read_to_end(&mut Vec::new()).await.unwrap();
@@ -1155,10 +1220,10 @@ mod tests {
                 unreachable!();
             };
             let (successor, background) = DnsExchange::from_stream(TestTransport::default());
-            let background = tokio::spawn(background);
+            let (alive, background) = spawn_background_alive(background);
             // Model a concurrent query having already reconnected. No real
             // network or production connector hook is needed for this race.
-            let generation = channel.state.lock().await.store(successor);
+            let generation = channel.state.lock().unwrap().store(successor, alive);
             for release in pending {
                 release.send(()).unwrap();
             }
@@ -1166,17 +1231,18 @@ mod tests {
                 query.await.unwrap();
             }
 
-            let state = channel.state.lock().await;
-            assert_eq!(state.generation, generation);
-            assert!(state.exchange.is_some());
-            assert_eq!(state.connect_failures, 0);
-            assert!(state.cooldown_until.is_none());
-            assert!(
-                !manager
-                    .fallback_failed
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            );
-            drop(state);
+            {
+                let state = channel.state.lock().unwrap();
+                assert_eq!(state.generation, generation);
+                assert!(state.exchange.is_some());
+                assert_eq!(state.connect_failures, 0);
+                assert!(state.cooldown_until.is_none());
+                assert!(
+                    !manager
+                        .fallback_failed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
             drop(manager);
             old_background.await.unwrap();
             background.await.unwrap();
@@ -1208,30 +1274,33 @@ mod tests {
                 failures: Some(retry_tx),
                 ..TestTransport::default()
             });
-            let background = tokio::spawn(background);
-            let generation = channel.state.lock().await.store(successor);
+            let (alive, background) = spawn_background_alive(background);
+            let generation = channel.state.lock().unwrap().store(successor, alive);
             first_failure.send(()).unwrap();
             retries.recv().await.unwrap().send(()).unwrap();
             assert_eq!(first.await.unwrap().unwrap_err(), "stale connection");
 
-            let state = channel.state.lock().await;
-            assert_eq!(state.generation, generation);
-            assert!(state.exchange.is_none());
-            assert_eq!(state.connect_failures, 1);
-            let cooldown = state.cooldown_until;
-            assert!(cooldown.is_some());
-            drop(state);
+            let cooldown = {
+                let state = channel.state.lock().unwrap();
+                assert_eq!(state.generation, generation);
+                assert!(state.exchange.is_none());
+                assert_eq!(state.connect_failures, 1);
+                let cooldown = state.cooldown_until;
+                assert!(cooldown.is_some());
+                cooldown
+            };
 
             // A late failure from the original connection must neither dial
             // through the successor's cooldown nor increase its backoff.
             late_failure.send(()).unwrap();
             assert!(late.await.unwrap().unwrap_err().contains("in cooldown"));
-            let state = channel.state.lock().await;
-            assert_eq!(state.generation, generation);
-            assert!(state.exchange.is_none());
-            assert_eq!(state.connect_failures, 1);
-            assert_eq!(state.cooldown_until, cooldown);
-            drop(state);
+            {
+                let state = channel.state.lock().unwrap();
+                assert_eq!(state.generation, generation);
+                assert!(state.exchange.is_none());
+                assert_eq!(state.connect_failures, 1);
+                assert_eq!(state.cooldown_until, cooldown);
+            }
             drop(manager);
             old_background.await.unwrap();
             background.await.unwrap();
@@ -1256,17 +1325,18 @@ mod tests {
                 unreachable!();
             };
             let (successor, background) = DnsExchange::from_stream(TestTransport::default());
-            let background = tokio::spawn(background);
-            let generation = channel.state.lock().await.store(successor);
+            let (alive, background) = spawn_background_alive(background);
+            let generation = channel.state.lock().unwrap().store(successor, alive);
             failure.send(()).unwrap();
             assert_eq!(query.await.unwrap().unwrap_err(), "stale connection");
 
-            let state = channel.state.lock().await;
-            assert_eq!(state.generation, generation);
-            assert!(state.exchange.is_some());
-            assert_eq!(state.connect_failures, 0);
-            assert!(state.cooldown_until.is_none());
-            drop(state);
+            {
+                let state = channel.state.lock().unwrap();
+                assert_eq!(state.generation, generation);
+                assert!(state.exchange.is_some());
+                assert_eq!(state.connect_failures, 0);
+                assert!(state.cooldown_until.is_none());
+            }
             drop(manager);
             old_background.await.unwrap();
             background.await.unwrap();
@@ -1282,11 +1352,12 @@ mod tests {
             cooldown_until: Some(Instant::now()),
             ..Slot::default()
         };
-        let generation = slot.store(1);
+        let generation = store_live(&mut slot, 1);
         assert_eq!(generation, 1);
         assert_eq!(slot.connect_failures, 0);
         assert!(slot.cooldown_until.is_none());
-        assert_eq!(slot.lease(), Some((1, 1)));
+        let (ex, _, g) = slot.lease().unwrap();
+        assert_eq!((ex, g), (1, 1));
     }
 
     /// The core race: a failure from a superseded lease must not tear down
@@ -1294,10 +1365,11 @@ mod tests {
     #[test]
     fn invalidate_ignores_stale_generations() {
         let mut slot: Slot<u8> = Slot::default();
-        let old = slot.store(1);
-        let new = slot.store(2);
+        let old = store_live(&mut slot, 1);
+        let new = store_live(&mut slot, 2);
         assert!(!slot.invalidate(old), "stale generation must be a no-op");
-        assert_eq!(slot.lease(), Some((2, new)));
+        let (ex, _, g) = slot.lease().unwrap();
+        assert_eq!((ex, g), (2, new));
         assert!(slot.invalidate(new));
         assert!(slot.lease().is_none());
         assert!(!slot.invalidate(new), "second invalidation is a no-op");
@@ -1306,14 +1378,15 @@ mod tests {
     #[test]
     fn sleep_drops_the_connection_without_backoff() {
         let mut slot: Slot<u8> = Slot::default();
-        let generation = slot.store(1);
+        let generation = store_live(&mut slot, 1);
         let last = slot.last_used.unwrap();
         let awake = Stamp {
             mono: last.mono + Duration::from_secs(60),
             wall: last.wall + Duration::from_secs(61),
         };
         assert_eq!(slot.drop_if_slept(awake), None, "1s drift is not sleep");
-        assert_eq!(slot.lease(), Some((1, generation)));
+        let (ex, _, g) = slot.lease().unwrap();
+        assert_eq!((ex, g), (1, generation));
 
         let woke = Stamp {
             mono: awake.mono + Duration::from_secs(1),
@@ -1340,12 +1413,13 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),
         );
         let mut slot: Slot<u8> = Slot::default();
-        let generation = slot.store(1);
+        let generation = store_live(&mut slot, 1);
         slot.record_path(peer, Some(old));
 
         assert_eq!(slot.drop_if_moved(Some(old)), None);
         assert_eq!(slot.drop_if_moved(None), None, "no route is not a move");
-        assert_eq!(slot.lease(), Some((1, generation)));
+        let (ex, _, g) = slot.lease().unwrap();
+        assert_eq!((ex, g), (1, generation));
 
         assert_eq!(slot.drop_if_moved(Some(new)), Some((Some(old), new)));
         assert!(slot.lease().is_none());
@@ -1358,7 +1432,7 @@ mod tests {
     fn route_checks_are_rate_limited_per_connection() {
         let peer = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 53), 443));
         let mut slot: Slot<u8> = Slot::default();
-        slot.store(1);
+        store_live(&mut slot, 1);
         assert_eq!(slot.route_check_due(Instant::now()), None, "no path yet");
 
         slot.record_path(peer, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
@@ -1382,7 +1456,7 @@ mod tests {
             unreachable!();
         };
         // The route to loopback is loopback, so any other source reads as moved.
-        channel.state.lock().await.record_path(
+        channel.state.lock().unwrap().record_path(
             SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
             Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
         );
@@ -1398,11 +1472,11 @@ mod tests {
 
         // Model a concurrent query having already reconnected.
         let (successor, background) = DnsExchange::from_stream(TestTransport::default());
-        let background = tokio::spawn(background);
-        let generation = channel.state.lock().await.store(successor);
+        let (alive, background) = spawn_background_alive(background);
+        let generation = channel.state.lock().unwrap().store(successor, alive);
         query.await.expect("the retry must reach the successor");
 
-        let state = channel.state.lock().await;
+        let state = channel.state.lock().unwrap();
         assert_eq!(state.generation, generation);
         assert!(state.exchange.is_some());
         assert_eq!(state.connect_failures, 0);
@@ -1415,7 +1489,7 @@ mod tests {
     #[test]
     fn wall_clock_stepping_back_is_not_sleep() {
         let mut slot: Slot<u8> = Slot::default();
-        slot.store(1);
+        store_live(&mut slot, 1);
         let last = slot.last_used.unwrap();
         let stepped = Stamp {
             mono: last.mono + Duration::from_secs(10),
@@ -1488,7 +1562,8 @@ mod tests {
         let Backend::Encrypted(channel) = &manager.entries[0].backend else {
             unreachable!()
         };
-        let held = channel.state.lock().await;
+        channel.state.lock().unwrap().exchange = None;
+        let held = channel.dial_lock.lock().await;
         let result = tokio::time::timeout(
             Duration::from_millis(200),
             channel.query(
@@ -1530,14 +1605,14 @@ mod tests {
             .await
             .is_err()
         );
-        let exchange = finish(
+        let (exchange, alive) = finish(
             std::future::ready(Ok(TestTransport::default())),
             Some(dial_deadline(Some(deadline), 1)),
         )
         .await
         .unwrap();
         assert!(
-            send(&exchange, encrypted_test_query(0), Some(deadline))
+            send(&exchange, &alive, encrypted_test_query(0), Some(deadline))
                 .await
                 .is_ok()
         );
@@ -1547,12 +1622,11 @@ mod tests {
     async fn dot_accepts_more_than_32_inflight_requests() {
         use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
         use hickory_net::tcp::{TcpClientStream, TcpStream};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tokio::time::timeout(Duration::from_secs(2), async {
             let (client, mut server) = tokio::io::duplex(4096);
             let (stream, handle) =
                 TcpStream::from_stream(AsyncIoTokioAsStd(client), "127.0.0.1:853".parse().unwrap());
-            let exchange = connect_dot(
+            let (exchange, alive) = connect_dot(
                 std::future::ready(Ok(TcpClientStream::from_stream(stream))),
                 handle,
                 None,
@@ -1563,8 +1637,11 @@ mod tests {
             let mut responses = Vec::new();
             for _ in 0..64 {
                 let exchange = exchange.clone();
+                let alive = alive.clone();
                 pending.spawn(async move {
-                    send(&exchange, encrypted_test_query(0), None).await.is_ok()
+                    send(&exchange, &alive, encrypted_test_query(0), None)
+                        .await
+                        .is_ok()
                 });
                 let len = server.read_u16().await.unwrap();
                 let mut query = vec![0; len as usize];
@@ -1582,5 +1659,575 @@ mod tests {
         })
         .await
         .expect("all 64 requests must reach the peer before it answers");
+    }
+
+    #[tokio::test]
+    async fn busy_error_after_background_exit_classifies_as_transport() {
+        let (exchange, background) = DnsExchange::from_stream(TestTransport::default());
+        drop(background);
+        assert!(matches!(
+            send(
+                &exchange,
+                &AtomicBool::new(true),
+                encrypted_test_query(0),
+                None
+            )
+            .await,
+            Err(SendFailure::Request(_))
+        ));
+        match send(
+            &exchange,
+            &AtomicBool::new(false),
+            encrypted_test_query(0),
+            None,
+        )
+        .await
+        {
+            Err(SendFailure::Transport(err)) => assert_eq!(err, "connection closed"),
+            _ => panic!("dead background NetError::Busy must classify as Transport"),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_last_answer_does_not_keep_blackholed_connection_responsive() {
+        let (manager, background) = test_manager(TestTransport {
+            silent: true,
+            ..TestTransport::default()
+        })
+        .await;
+        let Backend::Encrypted(channel) = &manager.entries[0].backend else {
+            unreachable!();
+        };
+        let old_answer = Instant::now() - Duration::from_secs(2);
+        channel.state.lock().unwrap().last_answer = Some(old_answer);
+        let err = channel
+            .query(
+                &encrypted_test_query(0),
+                Some(Instant::now() + Duration::from_millis(30)),
+            )
+            .await
+            .unwrap_err();
+        assert!(!err.contains("still responsive"), "{err}");
+        let state = channel.state.lock().unwrap();
+        assert!(state.exchange.is_none());
+        assert!(state.cooldown_until.is_some());
+        drop(state);
+        background.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_deadline_retry_resets_bootstrap_cache() {
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let boot = Arc::new(Bootstrap::with_test_servers(vec![
+            blackhole.local_addr().unwrap(),
+        ]));
+        let up = Upstream {
+            name: "hostname DoH".into(),
+            proto: Proto::Doh,
+            host: "dns.example".into(),
+            port: 443,
+            path: "/dns-query".into(),
+            bootstrap_ip: None,
+            timeout_ms: 100,
+            ip_stack: IpStack::V4,
+        };
+        let channel = Channel::new(up, Arc::new(base_tls_config()), boot, Arc::new(Vec::new()));
+        channel
+            .bootstrap
+            .seed_test_failure("dns.example", IpStack::V4)
+            .await;
+        assert!(
+            channel
+                .bootstrap
+                .has_active_failure("dns.example", IpStack::V4)
+                .await
+        );
+        let (exchange, old_bg) = DnsExchange::from_stream(TestTransport {
+            silent: true,
+            ..TestTransport::default()
+        });
+        let (alive, old_bg) = spawn_background_alive(old_bg);
+        {
+            let mut state = channel.state.lock().unwrap();
+            state.store(exchange, alive);
+            state.record_path(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 443)),
+                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            );
+        }
+        let message = encrypted_test_query(0);
+        let query = channel.query(&message, Some(Instant::now() + Duration::from_millis(80)));
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => panic!("silent connection answered: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let (successor, succ_bg) = DnsExchange::from_stream(TestTransport::default());
+        let (succ_alive, succ_bg) = spawn_background_alive(succ_bg);
+        channel.state.lock().unwrap().store(successor, succ_alive);
+        query.await.expect("stale retry must reach successor");
+        assert!(
+            !channel
+                .bootstrap
+                .has_active_failure("dns.example", IpStack::V4)
+                .await,
+            "stale deadline retry must call bootstrap.reset(&self.up.host)"
+        );
+        old_bg.abort();
+        succ_bg.abort();
+    }
+
+    #[tokio::test]
+    async fn short_deadline_bootstrap_timeout_does_not_trigger_backoff() {
+        let blackhole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let boot = Arc::new(Bootstrap::with_test_servers(vec![
+            blackhole.local_addr().unwrap(),
+        ]));
+        let up = Upstream {
+            name: "slow bootstrap".into(),
+            proto: Proto::Dot,
+            host: "unresolvable.invalid".into(),
+            port: 853,
+            path: String::new(),
+            bootstrap_ip: None,
+            timeout_ms: 50,
+            ip_stack: IpStack::V4,
+        };
+        let channel = Channel::new(up, Arc::new(base_tls_config()), boot, Arc::new(Vec::new()));
+        let err = channel
+            .acquire(Some(Instant::now() + Duration::from_millis(20)))
+            .await
+            .err()
+            .expect("expected deadline error during bootstrap");
+        assert!(err.contains("deadline"), "{err}");
+        let state = channel.state.lock().unwrap();
+        assert!(state.cooldown_until.is_none());
+        assert_eq!(state.connect_failures, 0);
+    }
+
+    const TEST_CERT_DER: &[u8] = &[
+        48, 130, 1, 128, 48, 130, 1, 38, 160, 3, 2, 1, 2, 2, 20, 105, 212, 40, 228, 238, 197, 48,
+        212, 50, 60, 139, 88, 65, 216, 237, 137, 169, 196, 252, 5, 48, 10, 6, 8, 42, 134, 72, 206,
+        61, 4, 3, 2, 48, 24, 49, 22, 48, 20, 6, 3, 85, 4, 3, 12, 13, 114, 101, 115, 111, 108, 118,
+        101, 114, 46, 116, 101, 115, 116, 48, 32, 23, 13, 50, 54, 49, 49, 49, 55, 50, 48, 48, 51,
+        49, 54, 90, 24, 15, 50, 49, 50, 54, 49, 48, 50, 52, 50, 48, 48, 51, 49, 54, 90, 48, 24, 49,
+        22, 48, 20, 6, 3, 85, 4, 3, 12, 13, 114, 101, 115, 111, 108, 118, 101, 114, 46, 116, 101,
+        115, 116, 48, 89, 48, 19, 6, 7, 42, 134, 72, 206, 61, 2, 1, 6, 8, 42, 134, 72, 206, 61, 3,
+        1, 7, 3, 66, 0, 4, 101, 205, 19, 164, 107, 161, 146, 74, 173, 97, 196, 121, 29, 189, 167,
+        225, 71, 89, 116, 32, 104, 52, 47, 57, 131, 170, 118, 242, 43, 208, 74, 58, 176, 78, 190,
+        14, 6, 107, 251, 200, 63, 217, 53, 61, 182, 62, 199, 154, 244, 240, 230, 21, 112, 74, 207,
+        85, 146, 147, 116, 191, 118, 138, 69, 162, 163, 76, 48, 74, 48, 29, 6, 3, 85, 29, 14, 4,
+        22, 4, 20, 86, 20, 39, 216, 10, 181, 173, 86, 232, 143, 67, 33, 117, 204, 40, 220, 145,
+        185, 201, 76, 48, 15, 6, 3, 85, 29, 19, 1, 1, 255, 4, 5, 48, 3, 1, 1, 255, 48, 24, 6, 3,
+        85, 29, 17, 4, 17, 48, 15, 130, 13, 114, 101, 115, 111, 108, 118, 101, 114, 46, 116, 101,
+        115, 116, 48, 10, 6, 8, 42, 134, 72, 206, 61, 4, 3, 2, 3, 72, 0, 48, 69, 2, 32, 47, 50, 19,
+        59, 199, 227, 8, 115, 120, 163, 18, 56, 22, 195, 192, 62, 206, 254, 41, 222, 238, 188, 243,
+        29, 244, 38, 116, 95, 175, 172, 157, 18, 2, 33, 0, 172, 251, 134, 247, 206, 243, 210, 241,
+        177, 160, 46, 219, 105, 18, 123, 152, 77, 63, 183, 118, 166, 77, 66, 84, 16, 46, 215, 88,
+        254, 234, 196, 48,
+    ];
+
+    const TEST_KEY_DER: &[u8] = &[
+        48, 129, 135, 2, 1, 0, 48, 19, 6, 7, 42, 134, 72, 206, 61, 2, 1, 6, 8, 42, 134, 72, 206,
+        61, 3, 1, 7, 4, 109, 48, 107, 2, 1, 1, 4, 32, 145, 68, 233, 224, 119, 84, 104, 97, 7, 9,
+        163, 57, 66, 103, 252, 20, 212, 37, 185, 162, 167, 231, 196, 46, 182, 45, 114, 150, 107,
+        70, 122, 114, 161, 68, 3, 66, 0, 4, 101, 205, 19, 164, 107, 161, 146, 74, 173, 97, 196,
+        121, 29, 189, 167, 225, 71, 89, 116, 32, 104, 52, 47, 57, 131, 170, 118, 242, 43, 208, 74,
+        58, 176, 78, 190, 14, 6, 107, 251, 200, 63, 217, 53, 61, 182, 62, 199, 154, 244, 240, 230,
+        21, 112, 74, 207, 85, 146, 147, 116, 191, 118, 138, 69, 162,
+    ];
+
+    #[derive(Debug)]
+    struct TestCertVerifier;
+
+    impl ServerCertVerifier for TestCertVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            if end_entity.as_ref() == TEST_CERT_DER {
+                Ok(ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer,
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn test_tls_configs(
+        alpn: Option<&[u8]>,
+    ) -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TestCertVerifier))
+            .with_no_client_auth();
+        let mut server_cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(TEST_CERT_DER)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_KEY_DER)),
+            )
+            .unwrap();
+        if let Some(proto) = alpn {
+            server_cfg.alpn_protocols = vec![proto.to_vec()];
+        }
+        (Arc::new(client_cfg), Arc::new(server_cfg))
+    }
+
+    struct TestTlsConn {
+        tcp: TcpStream,
+        tls: rustls::ServerConnection,
+    }
+
+    impl TestTlsConn {
+        async fn handshake(
+            mut tcp: TcpStream,
+            server_cfg: Arc<rustls::ServerConfig>,
+        ) -> std::io::Result<Self> {
+            let mut tls =
+                rustls::ServerConnection::new(server_cfg).map_err(std::io::Error::other)?;
+            while tls.is_handshaking() {
+                Self::flush_tls(&mut tcp, &mut tls).await?;
+                if tls.wants_read() {
+                    let mut buf = [0u8; 4096];
+                    let n = tcp.read(&mut buf).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "tls handshake eof",
+                        ));
+                    }
+                    let mut cursor = std::io::Cursor::new(&buf[..n]);
+                    while cursor.position() < n as u64 {
+                        tls.read_tls(&mut cursor)?;
+                        tls.process_new_packets().map_err(std::io::Error::other)?;
+                    }
+                }
+            }
+            Self::flush_tls(&mut tcp, &mut tls).await?;
+            Ok(Self { tcp, tls })
+        }
+
+        async fn flush_tls(
+            tcp: &mut TcpStream,
+            tls: &mut rustls::ServerConnection,
+        ) -> std::io::Result<()> {
+            while tls.wants_write() {
+                let mut out = Vec::new();
+                tls.write_tls(&mut out)?;
+                if !out.is_empty() {
+                    tcp.write_all(&out).await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn read_plaintext(&mut self, dst: &mut Vec<u8>) -> std::io::Result<usize> {
+            use std::io::Read;
+            loop {
+                let mut tmp = [0u8; 4096];
+                match self.tls.reader().read(&mut tmp) {
+                    Ok(0) => return Ok(0),
+                    Ok(n) => {
+                        dst.extend_from_slice(&tmp[..n]);
+                        return Ok(n);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        let mut net = [0u8; 4096];
+                        let n = self.tcp.read(&mut net).await?;
+                        if n == 0 {
+                            return Ok(0);
+                        }
+                        let mut cursor = std::io::Cursor::new(&net[..n]);
+                        while cursor.position() < n as u64 {
+                            self.tls.read_tls(&mut cursor)?;
+                            let state = self
+                                .tls
+                                .process_new_packets()
+                                .map_err(std::io::Error::other)?;
+                            if state.peer_has_closed() {
+                                return Ok(0);
+                            }
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        async fn write_plaintext(&mut self, data: &[u8]) -> std::io::Result<()> {
+            use std::io::Write;
+            self.tls.writer().write_all(data)?;
+            Self::flush_tls(&mut self.tcp, &mut self.tls).await
+        }
+
+        async fn close_idle(mut self) {
+            self.tls.send_close_notify();
+            let _ = Self::flush_tls(&mut self.tcp, &mut self.tls).await;
+            let _ = self.tcp.shutdown().await;
+        }
+    }
+
+    fn h2_frame(typ: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut out = Vec::with_capacity(9 + len);
+        out.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, typ, flags]);
+        out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[tokio::test]
+    async fn dot_loopback_idle_server_close_redials_cleanly() {
+        let (client_tls, server_tls) = test_tls_configs(None);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_closed_tx, first_closed_rx) = oneshot::channel();
+        let mut first_closed_tx = Some(first_closed_tx);
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let mut done_rx = Some(done_rx);
+        let accept_count = Arc::new(AtomicU64::new(0));
+        let accept_count_srv = accept_count.clone();
+
+        let server_task = tokio::spawn(async move {
+            for round in 0..2u64 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accept_count_srv.fetch_add(1, Ordering::Relaxed);
+                let mut conn = TestTlsConn::handshake(tcp, server_tls.clone())
+                    .await
+                    .unwrap();
+                let mut buf = Vec::new();
+                while buf.len() < 2 {
+                    assert!(conn.read_plaintext(&mut buf).await.unwrap() > 0);
+                }
+                let qlen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                while buf.len() < 2 + qlen {
+                    assert!(conn.read_plaintext(&mut buf).await.unwrap() > 0);
+                }
+                let mut resp = buf[2..2 + qlen].to_vec();
+                resp[2] |= 0x80;
+                resp[3] |= 0x80;
+                let mut framed = Vec::with_capacity(2 + resp.len());
+                framed.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+                framed.extend_from_slice(&resp);
+                conn.write_plaintext(&framed).await.unwrap();
+                if round == 0 {
+                    conn.close_idle().await;
+                    if let Some(tx) = first_closed_tx.take() {
+                        let _ = tx.send(());
+                    }
+                } else if let Some(rx) = done_rx.take() {
+                    let _ = rx.await;
+                }
+            }
+        });
+
+        let up = Upstream {
+            name: "loopback dot".into(),
+            proto: Proto::Dot,
+            host: "resolver.test".into(),
+            port: addr.port(),
+            path: String::new(),
+            bootstrap_ip: Some(addr.ip()),
+            timeout_ms: 3000,
+            ip_stack: IpStack::V4,
+        };
+        let channel = Channel::new(
+            up,
+            client_tls,
+            Arc::new(Bootstrap::new()),
+            Arc::new(Vec::new()),
+        );
+
+        let q1 = encrypted_test_query(0);
+        let r1 = channel.query(&q1, None).await.unwrap();
+        crate::wire::validate_response(&q1.to_vec().unwrap(), &r1).unwrap();
+        assert_eq!(channel.state.lock().unwrap().generation, 1);
+
+        first_closed_rx.await.unwrap();
+        for _ in 0..100 {
+            if !channel.state.lock().unwrap().alive.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!channel.state.lock().unwrap().alive.load(Ordering::Acquire));
+
+        let q2 = encrypted_test_query(0);
+        let r2 = channel.query(&q2, None).await.unwrap();
+        crate::wire::validate_response(&q2.to_vec().unwrap(), &r2).unwrap();
+        assert_eq!(channel.state.lock().unwrap().generation, 2);
+        assert_eq!(accept_count.load(Ordering::Relaxed), 2);
+        assert_eq!(channel.state.lock().unwrap().connect_failures, 0);
+        let _ = done_tx.send(());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn doh_loopback_idle_server_close_redials_cleanly() {
+        let (client_tls, server_tls) = test_tls_configs(Some(b"h2"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_closed_tx, first_closed_rx) = oneshot::channel();
+        let mut first_closed_tx = Some(first_closed_tx);
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let mut done_rx = Some(done_rx);
+        let accept_count = Arc::new(AtomicU64::new(0));
+        let accept_count_srv = accept_count.clone();
+
+        let server_task = tokio::spawn(async move {
+            const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+            for round in 0..2u64 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                accept_count_srv.fetch_add(1, Ordering::Relaxed);
+                let mut conn = TestTlsConn::handshake(tcp, server_tls.clone())
+                    .await
+                    .unwrap();
+                let mut buf = Vec::new();
+                while buf.len() < PREFACE.len() {
+                    assert!(conn.read_plaintext(&mut buf).await.unwrap() > 0);
+                }
+                assert_eq!(&buf[..PREFACE.len()], PREFACE);
+                buf.drain(..PREFACE.len());
+
+                conn.write_plaintext(&h2_frame(4, 0, 0, &[])).await.unwrap();
+
+                let mut req_stream = 0u32;
+                let mut dns_req = Vec::new();
+                loop {
+                    while buf.len() < 9 {
+                        assert!(conn.read_plaintext(&mut buf).await.unwrap() > 0);
+                    }
+                    let len =
+                        ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | (buf[2] as usize);
+                    let typ = buf[3];
+                    let flags = buf[4];
+                    let stream_id =
+                        u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) & 0x7fff_ffff;
+                    while buf.len() < 9 + len {
+                        assert!(conn.read_plaintext(&mut buf).await.unwrap() > 0);
+                    }
+                    let payload = buf[9..9 + len].to_vec();
+                    buf.drain(..9 + len);
+                    match typ {
+                        4 if flags & 1 == 0 => {
+                            conn.write_plaintext(&h2_frame(4, 1, 0, &[])).await.unwrap();
+                        }
+                        1 => {
+                            req_stream = stream_id;
+                        }
+                        0 => {
+                            dns_req.extend_from_slice(&payload);
+                            if flags & 1 != 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                dns_req[2] |= 0x80;
+                dns_req[3] |= 0x80;
+                conn.write_plaintext(&h2_frame(1, 0x04, req_stream, &[0x88]))
+                    .await
+                    .unwrap();
+                conn.write_plaintext(&h2_frame(0, 0x01, req_stream, &dns_req))
+                    .await
+                    .unwrap();
+
+                if round == 0 {
+                    let mut goaway = Vec::new();
+                    goaway.extend_from_slice(&req_stream.to_be_bytes());
+                    goaway.extend_from_slice(&0u32.to_be_bytes());
+                    conn.write_plaintext(&h2_frame(7, 0, 0, &goaway))
+                        .await
+                        .unwrap();
+                    conn.close_idle().await;
+                    if let Some(tx) = first_closed_tx.take() {
+                        let _ = tx.send(());
+                    }
+                } else if let Some(rx) = done_rx.take() {
+                    let _ = rx.await;
+                }
+            }
+        });
+
+        let up = Upstream {
+            name: "loopback doh".into(),
+            proto: Proto::Doh,
+            host: "resolver.test".into(),
+            port: addr.port(),
+            path: "/dns-query".into(),
+            bootstrap_ip: Some(addr.ip()),
+            timeout_ms: 3000,
+            ip_stack: IpStack::V4,
+        };
+        let channel = Channel::new(
+            up,
+            client_tls,
+            Arc::new(Bootstrap::new()),
+            Arc::new(Vec::new()),
+        );
+
+        let q1 = encrypted_test_query(0);
+        let r1 = channel.query(&q1, None).await.unwrap();
+        crate::wire::validate_response(&q1.to_vec().unwrap(), &r1).unwrap();
+        assert_eq!(channel.state.lock().unwrap().generation, 1);
+
+        first_closed_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let q2 = encrypted_test_query(0);
+        let r2 = channel.query(&q2, None).await.unwrap();
+        crate::wire::validate_response(&q2.to_vec().unwrap(), &r2).unwrap();
+        assert_eq!(channel.state.lock().unwrap().generation, 2);
+        assert_eq!(accept_count.load(Ordering::Relaxed), 2);
+        assert_eq!(channel.state.lock().unwrap().connect_failures, 0);
+        let _ = done_tx.send(());
+        server_task.await.unwrap();
     }
 }
