@@ -479,14 +479,24 @@ impl Entry {
                     return legacy::query(SocketAddr::new(*ip, *port), query, client_tcp).await;
                 }
                 let ips = bootstrap.resolve(host, *stack).await?;
+                let count = ips.len();
                 let mut last_err = None;
-                for ip in ips {
+                for (index, ip) in ips.into_iter().enumerate() {
                     let addr = SocketAddr::new(ip, *port);
                     if is_self_address(addr, deny) {
                         last_err = Some(format!("{addr} points back at our own listener"));
                         continue;
                     }
-                    match legacy::query(addr, query, client_tcp).await {
+                    let attempt = legacy::query(addr, query, client_tcp);
+                    let result = if deadline.is_some() || count > 1 {
+                        let candidate_deadline = encrypted::dial_deadline(deadline, count - index);
+                        tokio::time::timeout_at(candidate_deadline.into(), attempt)
+                            .await
+                            .unwrap_or_else(|_| Err(format!("timeout querying {addr}")))
+                    } else {
+                        attempt.await
+                    };
+                    match result {
                         Ok(response) => return Ok(response),
                         Err(err) => last_err = Some(err),
                     }
@@ -1260,5 +1270,52 @@ mod tests {
         assert_eq!(response[3] & 0x0f, 2);
         assert!(manager.fallback_active.load(Ordering::Relaxed));
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_multi_ip_fails_over_when_first_ip_blackholes() {
+        let (blackhole, healthy, port) = loop {
+            let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = blackhole.local_addr().unwrap().port();
+            if let Ok(healthy) =
+                UdpSocket::bind(SocketAddr::new("::1".parse().unwrap(), port)).await
+            {
+                break (blackhole, healthy, port);
+            }
+        };
+        let responder = tokio::spawn(async move {
+            let mut query = [0u8; 512];
+            let (n, peer) = healthy.recv_from(&mut query).await.unwrap();
+            query[2] |= 0x80;
+            healthy.send_to(&query[..n], peer).await.unwrap();
+        });
+        let up = Upstream {
+            name: "multi-ip legacy".into(),
+            proto: Proto::Legacy,
+            host: "dns.example".into(),
+            port,
+            path: String::new(),
+            bootstrap_ip: None,
+            timeout_ms: 400,
+            ip_stack: IpStack::Both,
+        };
+        let manager = Manager::new(vec![up], &[], Vec::new()).unwrap();
+        let Backend::Legacy { bootstrap, .. } = &manager.entries[0].backend else {
+            unreachable!();
+        };
+        bootstrap
+            .seed_test_ips(
+                "dns.example",
+                IpStack::Both,
+                &[blackhole.local_addr().unwrap().ip(), "::1".parse().unwrap()],
+            )
+            .await;
+
+        let response = manager.forward(&TEST_QUERY, false).await.unwrap();
+        assert_eq!(&response[..2], &TEST_QUERY[..2]);
+        assert_ne!(response[2] & 0x80, 0);
+        responder.await.unwrap();
+        let mut buf = [0u8; 512];
+        assert!(blackhole.try_recv_from(&mut buf).is_ok());
     }
 }

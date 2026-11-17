@@ -580,7 +580,7 @@ async fn within<T>(
     }
 }
 
-fn dial_deadline(deadline: Option<Instant>, remaining: usize) -> Instant {
+pub(super) fn dial_deadline(deadline: Option<Instant>, remaining: usize) -> Instant {
     let now = Instant::now();
     let budget = deadline.map_or(CONNECT_TIMEOUT, |at| at.saturating_duration_since(now));
     now + budget / u32::try_from(remaining).unwrap_or(u32::MAX)

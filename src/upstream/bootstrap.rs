@@ -363,6 +363,22 @@ mod tests {
             Self::with_servers(servers)
         }
 
+        pub(in crate::upstream) async fn seed_test_ips(
+            &self,
+            host: &str,
+            stack: IpStack,
+            ips: &[IpAddr],
+        ) {
+            let mut slots = self.slots.lock().await;
+            slots
+                .entry((host.to_ascii_lowercase(), stack))
+                .or_default()
+                .entry = Some(Entry {
+                ips: ips.to_vec(),
+                expires: Instant::now() + Duration::from_secs(300),
+            });
+        }
+
         pub(in crate::upstream) async fn seed_test_failure(&self, host: &str, stack: IpStack) {
             let mut slots = self.slots.lock().await;
             let slot = slots.entry((host.to_ascii_lowercase(), stack)).or_default();
