@@ -7,14 +7,13 @@
 
 use crate::config::IpStack;
 use crate::upstream::legacy;
-use hickory_net::proto::op::{Message, MessageType, OpCode, Query};
+use hickory_net::proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_net::proto::rr::{Name, RData, RecordType};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 
 const SERVERS: [IpAddr; 4] = [
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -29,6 +28,7 @@ const UDP_TIMEOUT: Duration = Duration::from_secs(1);
 /// this bounds one server to 3s and a full failed lookup to 12s.
 const TCP_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TTL_SECS: u64 = 60;
+const PARTIAL_TTL_SECS: u64 = 60;
 const MAX_TTL_SECS: u64 = 86_400;
 /// How long expired addresses remain a fallback when every bootstrap server
 /// fails. Upstream providers rarely renumber within a day; beyond that a
@@ -70,13 +70,13 @@ struct Slot {
     /// Last failed refresh; no new lookup before its `retry_at`.
     failure: Option<Failure>,
     /// Held for the whole lookup so one refresh runs per key at a time.
-    refresh: Arc<Mutex<()>>,
+    refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 enum Plan {
     Answer(Result<Vec<IpAddr>, String>),
     Refresh {
-        refresh: Arc<Mutex<()>>,
+        refresh: Arc<tokio::sync::Mutex<()>>,
         stale: Option<Vec<IpAddr>>,
     },
 }
@@ -173,7 +173,7 @@ impl Bootstrap {
         stack: IpStack,
     ) -> Result<Vec<IpAddr>, String> {
         let key = (host.to_ascii_lowercase(), stack);
-        let (refresh, stale) = match self.plan(&key).await {
+        let (refresh, stale) = match self.plan(&key) {
             Plan::Answer(result) => return result,
             Plan::Refresh { refresh, stale } => (refresh, stale),
         };
@@ -186,7 +186,7 @@ impl Bootstrap {
                     return Ok(ips);
                 }
                 let guard = refresh.lock_owned().await;
-                if let Plan::Answer(result) = self.plan(&key).await {
+                if let Plan::Answer(result) = self.plan(&key) {
                     return result;
                 }
                 guard
@@ -200,7 +200,7 @@ impl Bootstrap {
         tokio::spawn(async move {
             let _refreshing = refreshing;
             let result = this.lookup(&host, stack).await;
-            let mut slots = this.slots.lock().await;
+            let mut slots = this.slots.lock().unwrap();
             slots.entry(key).or_default().record(result, Instant::now())
         })
         .await
@@ -209,11 +209,11 @@ impl Bootstrap {
 
     /// Force re-resolution after connect failures (host may have moved).
     /// The old addresses stay cached as a fallback if re-resolution fails.
-    pub async fn invalidate(&self, host: &str) {
+    pub fn invalidate(&self, host: &str) {
         let host = host.to_ascii_lowercase();
         let now = Instant::now();
-        for ((h, _), slot) in self.slots.lock().await.iter_mut() {
-            if *h == host
+        for ((name, _), slot) in self.slots.lock().unwrap().iter_mut() {
+            if *name == host
                 && let Some(entry) = &mut slot.entry
             {
                 entry.expires = entry.expires.min(now);
@@ -222,51 +222,75 @@ impl Bootstrap {
     }
 
     /// A new network should not inherit the old network's failure pause.
-    pub async fn reset(&self, host: &str) {
-        self.invalidate(host).await;
-        for ((name, _), slot) in self.slots.lock().await.iter_mut() {
+    pub fn reset(&self, host: &str) {
+        self.invalidate(host);
+        for ((name, _), slot) in self.slots.lock().unwrap().iter_mut() {
             if name.eq_ignore_ascii_case(host) {
                 slot.failure = None;
             }
         }
     }
 
-    async fn plan(&self, key: &Key) -> Plan {
-        let mut slots = self.slots.lock().await;
+    fn plan(&self, key: &Key) -> Plan {
+        let mut slots = self.slots.lock().unwrap();
         slots.entry(key.clone()).or_default().plan(Instant::now())
     }
 
-    /// Queries bootstrap servers in order; the first one with addresses wins.
+    /// Queries bootstrap servers in order; under `IpStack::Both`, queries
+    /// subsequent servers for a missing family if one family errored.
     async fn lookup(&self, host: &str, stack: IpStack) -> Result<(Vec<IpAddr>, u64), String> {
         let name = Name::from_str(host).map_err(|e| format!("invalid hostname {host:?}: {e}"))?;
-        let want_a = stack != IpStack::V6;
-        let want_aaaa = stack != IpStack::V4;
-
+        let mut need_a = stack != IpStack::V6;
+        let mut need_aaaa = stack != IpStack::V4;
+        let mut a_errored = false;
+        let mut aaaa_errored = false;
+        let mut ips = Vec::new();
+        let mut min_ttl = MAX_TTL_SECS;
         let mut last_err = String::from("no bootstrap servers");
+
         for server in ordered_servers(&self.servers, stack) {
             // A and AAAA go out together so a lost datagram costs one timeout.
             let (a, aaaa) = tokio::join!(
-                query_if(want_a, server, &name, RecordType::A),
-                query_if(want_aaaa, server, &name, RecordType::AAAA),
+                query_if(need_a, server, &name, RecordType::A),
+                query_if(need_aaaa, server, &name, RecordType::AAAA),
             );
-            let mut ips = Vec::new();
-            let mut min_ttl = MAX_TTL_SECS;
-            for result in [a, aaaa].into_iter().flatten() {
+            for (result, need, errored) in [
+                (a, &mut need_a, &mut a_errored),
+                (aaaa, &mut need_aaaa, &mut aaaa_errored),
+            ] {
                 match result {
-                    Ok((mut got, ttl)) => {
+                    Some(Ok((mut got, ttl))) => {
+                        *need = false;
+                        *errored = false;
                         min_ttl = min_ttl.min(u64::from(ttl));
                         ips.append(&mut got);
                     }
-                    Err(err) => last_err = err,
+                    Some(Err(err)) => {
+                        *errored = true;
+                        last_err = err;
+                    }
+                    None => {}
                 }
             }
-            if !ips.is_empty() {
-                ips.sort_by_key(|ip| ip.is_ipv6()); // prefer v4 dial order
-                ips.dedup();
-                let ttl = min_ttl.clamp(MIN_TTL_SECS, MAX_TTL_SECS);
-                log::debug!("bootstrap: {host} -> {ips:?} (ttl {ttl}s)");
-                return Ok((ips, ttl));
+            if !need_a && !need_aaaa && !ips.is_empty() {
+                break;
             }
+            if ips.is_empty() && !need_a && !need_aaaa {
+                need_a = stack != IpStack::V6;
+                need_aaaa = stack != IpStack::V4;
+            }
+        }
+        if !ips.is_empty() {
+            ips.sort_by_key(|ip| ip.is_ipv6()); // prefer v4 dial order
+            ips.dedup();
+            let max_ttl = if a_errored || aaaa_errored {
+                PARTIAL_TTL_SECS
+            } else {
+                MAX_TTL_SECS
+            };
+            let ttl = min_ttl.clamp(MIN_TTL_SECS, max_ttl);
+            log::debug!("bootstrap: {host} -> {ips:?} (ttl {ttl}s)");
+            return Ok((ips, ttl));
         }
         Err(format!("bootstrap failed for {host}: {last_err}"))
     }
@@ -294,6 +318,10 @@ async fn query(
 
     let response = exchange(server, &bytes).await?;
     let parsed = Message::from_vec(&response).map_err(|e| e.to_string())?;
+    let rcode = parsed.metadata.response_code;
+    if rcode != ResponseCode::NoError {
+        return Err(format!("bootstrap server {server}: {rcode}"));
+    }
     let mut ips = Vec::new();
     let mut ttl = u32::MAX;
     for record in &parsed.answers {
@@ -363,13 +391,13 @@ mod tests {
             Self::with_servers(servers)
         }
 
-        pub(in crate::upstream) async fn seed_test_ips(
+        pub(in crate::upstream) fn seed_test_ips(
             &self,
             host: &str,
             stack: IpStack,
             ips: &[IpAddr],
         ) {
-            let mut slots = self.slots.lock().await;
+            let mut slots = self.slots.lock().unwrap();
             slots
                 .entry((host.to_ascii_lowercase(), stack))
                 .or_default()
@@ -379,8 +407,8 @@ mod tests {
             });
         }
 
-        pub(in crate::upstream) async fn seed_test_failure(&self, host: &str, stack: IpStack) {
-            let mut slots = self.slots.lock().await;
+        pub(in crate::upstream) fn seed_test_failure(&self, host: &str, stack: IpStack) {
+            let mut slots = self.slots.lock().unwrap();
             let slot = slots.entry((host.to_ascii_lowercase(), stack)).or_default();
             slot.failure = Some(Failure {
                 err: "seeded failure".into(),
@@ -388,14 +416,10 @@ mod tests {
             });
         }
 
-        pub(in crate::upstream) async fn has_active_failure(
-            &self,
-            host: &str,
-            stack: IpStack,
-        ) -> bool {
+        pub(in crate::upstream) fn has_active_failure(&self, host: &str, stack: IpStack) -> bool {
             self.slots
                 .lock()
-                .await
+                .unwrap()
                 .get(&(host.to_ascii_lowercase(), stack))
                 .is_some_and(|slot| slot.failure.is_some())
         }
@@ -459,10 +483,10 @@ mod tests {
         (addr, queries)
     }
 
-    async fn insert_cached(boot: &Bootstrap, ips: &[IpAddr], expires: Instant) {
+    fn insert_cached(boot: &Bootstrap, ips: &[IpAddr], expires: Instant) {
         boot.slots
             .lock()
-            .await
+            .unwrap()
             .entry(("dns.example".into(), IpStack::V4))
             .or_default()
             .entry = Some(Entry {
@@ -509,13 +533,14 @@ mod tests {
     async fn invalidated_entry_survives_as_fallback_when_refresh_fails() {
         let boot = Arc::new(Bootstrap::with_servers(vec![dead_server().await]));
         let cached = [IpAddr::V4(V4)];
-        insert_cached(&boot, &cached, Instant::now() + Duration::from_secs(300)).await;
+        insert_cached(&boot, &cached, Instant::now() + Duration::from_secs(300));
 
-        boot.invalidate("DNS.example").await;
+        boot.invalidate("DNS.example");
         let key = ("dns.example".to_string(), IpStack::V4);
-        let slots = boot.slots.lock().await;
-        let expired = !slots[&key].entry.as_ref().unwrap().is_fresh(Instant::now());
-        drop(slots);
+        let expired = {
+            let slots = boot.slots.lock().unwrap();
+            !slots[&key].entry.as_ref().unwrap().is_fresh(Instant::now())
+        };
         assert!(expired, "invalidate must expire the entry, not delete it");
         let ips = boot.resolve("dns.example", IpStack::V4).await.unwrap();
         assert_eq!(ips, cached);
@@ -549,7 +574,7 @@ mod tests {
         let (server, queries) = counting_blackhole_server().await;
         let boot = Arc::new(Bootstrap::with_servers(vec![server]));
         let cached = [IpAddr::V4(V4)];
-        insert_cached(&boot, &cached, Instant::now()).await;
+        insert_cached(&boot, &cached, Instant::now());
 
         let (refreshing, waiting) = tokio::join!(boot.resolve("dns.example", IpStack::V4), async {
             // Let the first caller start its refresh.
@@ -569,7 +594,7 @@ mod tests {
         let (server, queries) = counting_blackhole_server().await;
         let boot = Arc::new(Bootstrap::with_servers(vec![server]));
         let cached = [IpAddr::V4(V4)];
-        insert_cached(&boot, &cached, Instant::now()).await;
+        insert_cached(&boot, &cached, Instant::now());
 
         // Upstream timeouts can be far shorter than a failed lookup.
         let cancelled = tokio::time::timeout(
@@ -623,7 +648,7 @@ mod tests {
         };
         // Every loopback on this port is denied, including IPv4-mapped IPv6.
         let ips = [self_ip, addr.ip(), "::ffff:127.0.0.1".parse().unwrap()];
-        insert_cached(bootstrap, &ips, Instant::now() + Duration::from_secs(60)).await;
+        insert_cached(bootstrap, &ips, Instant::now() + Duration::from_secs(60));
         let mut query = Message::new(0, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(
             Name::from_ascii("review.invalid.").unwrap(),
@@ -652,8 +677,8 @@ mod tests {
         assert!(entry.is_servable(expires + MAX_STALE));
         assert!(!entry.is_servable(expires + MAX_STALE + Duration::from_secs(1)));
     }
-    #[tokio::test]
-    async fn cold_bootstrap_failure_retries_quickly_and_network_reset_clears_it() {
+    #[test]
+    fn cold_bootstrap_failure_retries_quickly_and_network_reset_clears_it() {
         let now = Instant::now();
         let mut slot = Slot::default();
         assert!(slot.record(Err("offline".into()), now).is_err());
@@ -664,12 +689,111 @@ mod tests {
         let boot = Bootstrap::new();
         boot.slots
             .lock()
-            .await
+            .unwrap()
             .insert(("dns.example".into(), IpStack::V4), slot);
-        boot.reset("dns.example").await;
+        boot.reset("dns.example");
         assert!(matches!(
-            boot.plan(&("dns.example".into(), IpStack::V4)).await,
+            boot.plan(&("dns.example".into(), IpStack::V4)),
             Plan::Refresh { .. }
         ));
+    }
+
+    async fn mock_udp_dns(
+        mut handler: impl FnMut(RecordType, &[u8]) -> Vec<u8> + Send + 'static,
+    ) -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+                let msg = Message::from_vec(&buf[..n]).unwrap();
+                let resp = handler(msg.queries[0].query_type(), &buf[..n]);
+                let _ = sock.send_to(&resp, peer).await;
+            }
+        });
+        addr
+    }
+
+    fn rcode_answer(request: &[u8], rcode: ResponseCode) -> Vec<u8> {
+        let mut msg = Message::from_vec(request).unwrap();
+        msg.metadata.message_type = MessageType::Response;
+        msg.metadata.response_code = rcode;
+        msg.to_vec().unwrap()
+    }
+
+    #[tokio::test]
+    async fn non_noerror_rcode_returns_error_and_fails_over() {
+        let servfail_srv = mock_udp_dns(|_, req| rcode_answer(req, ResponseCode::ServFail)).await;
+        let refused_srv = mock_udp_dns(|_, req| rcode_answer(req, ResponseCode::Refused)).await;
+        let healthy_srv = mock_udp_dns(|_, req| answer(req)).await;
+
+        let failing = Arc::new(Bootstrap::with_servers(vec![servfail_srv, refused_srv]));
+        let err = failing
+            .resolve("dns.example", IpStack::V4)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ServFail") || err.contains("Refused"), "{err}");
+
+        let failover = Arc::new(Bootstrap::with_servers(vec![servfail_srv, healthy_srv]));
+        assert_eq!(
+            failover.resolve("dns.example", IpStack::V4).await.unwrap(),
+            [IpAddr::V4(V4)]
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_stack_partial_failure_recovers_missing_family_from_next_server() {
+        let srv0 = mock_udp_dns(|rtype, req| match rtype {
+            RecordType::A => answer(req),
+            _ => rcode_answer(req, ResponseCode::ServFail),
+        })
+        .await;
+        let srv1_a_queries = Arc::new(AtomicUsize::new(0));
+        let srv1_a = srv1_a_queries.clone();
+        let srv1 = mock_udp_dns(move |rtype, req| match rtype {
+            RecordType::A => {
+                srv1_a.fetch_add(1, Ordering::Relaxed);
+                answer(req)
+            }
+            _ => answer(req),
+        })
+        .await;
+
+        let boot = Arc::new(Bootstrap::with_servers(vec![srv0, srv1]));
+        let ips = boot.resolve("dns.example", IpStack::Both).await.unwrap();
+        assert_eq!(ips, [IpAddr::V4(V4), IpAddr::V6(V6)]);
+        assert_eq!(
+            srv1_a_queries.load(Ordering::Relaxed),
+            0,
+            "srv1 must only be queried for the missing AAAA family"
+        );
+        let slots = boot.slots.lock().unwrap();
+        let ttl = slots[&("dns.example".into(), IpStack::Both)]
+            .entry
+            .as_ref()
+            .unwrap()
+            .expires
+            .saturating_duration_since(Instant::now());
+        assert!(ttl > Duration::from_secs(PARTIAL_TTL_SECS));
+    }
+
+    #[tokio::test]
+    async fn dual_stack_persistent_partial_failure_caps_ttl_at_60s() {
+        let srv0 = mock_udp_dns(|rtype, req| match rtype {
+            RecordType::A => answer(req),
+            _ => rcode_answer(req, ResponseCode::ServFail),
+        })
+        .await;
+        let boot = Arc::new(Bootstrap::with_servers(vec![srv0]));
+        let ips = boot.resolve("dns.example", IpStack::Both).await.unwrap();
+        assert_eq!(ips, [IpAddr::V4(V4)]);
+        let slots = boot.slots.lock().unwrap();
+        let ttl = slots[&("dns.example".into(), IpStack::Both)]
+            .entry
+            .as_ref()
+            .unwrap()
+            .expires
+            .saturating_duration_since(Instant::now());
+        assert!(ttl <= Duration::from_secs(PARTIAL_TTL_SECS));
     }
 }

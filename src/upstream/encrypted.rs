@@ -403,7 +403,7 @@ impl Channel {
                         self.up.name
                     );
                     if self.up.bootstrap_ip.is_none() {
-                        self.bootstrap.reset(&self.up.host).await;
+                        self.bootstrap.reset(&self.up.host);
                     }
                     retried = true;
                     deadline = retry_budget.map(|budget| Instant::now() + budget);
@@ -436,27 +436,25 @@ impl Channel {
 
     async fn acquire(&self, deadline: Option<Instant>) -> Result<Lease, String> {
         let now = Stamp::now();
-        let slept = self.state.lock().unwrap().drop_if_slept(now);
-        if let Some(slept) = slept {
+        if let Some(slept) = self.state.lock().unwrap().drop_if_slept(now) {
             log::info!(
                 "upstream {}: host slept {:.0}s; renewing connection",
                 self.up.name,
                 slept.as_secs_f32()
             );
             if self.up.bootstrap_ip.is_none() {
-                self.bootstrap.reset(&self.up.host).await;
+                self.bootstrap.reset(&self.up.host);
             }
         }
         let peer = self.state.lock().unwrap().route_check_due(now.mono);
         if let Some(peer) = peer {
             let source = route_source(peer);
-            let moved = self.state.lock().unwrap().drop_if_moved(source);
-            if let Some((from, to)) = moved {
+            if let Some((from, to)) = self.state.lock().unwrap().drop_if_moved(source) {
                 log::info!(
                     "upstream {}: route source changed from {from:?} to {to}; renewing connection",
                     self.up.name
                 );
-                self.bootstrap.reset(&self.up.host).await;
+                self.bootstrap.reset(&self.up.host);
             }
         }
         if let Some(lease) = self.reuse(now) {
@@ -489,7 +487,7 @@ impl Channel {
             Some(ip) => vec![ip],
             None => {
                 if need_invalidate {
-                    self.bootstrap.invalidate(&self.up.host).await;
+                    self.bootstrap.invalidate(&self.up.host);
                 }
                 within(
                     deadline,
@@ -1794,13 +1792,11 @@ mod tests {
         let channel = Channel::new(up, Arc::new(base_tls_config()), boot, Arc::new(Vec::new()));
         channel
             .bootstrap
-            .seed_test_failure("dns.example", IpStack::V4)
-            .await;
+            .seed_test_failure("dns.example", IpStack::V4);
         assert!(
             channel
                 .bootstrap
                 .has_active_failure("dns.example", IpStack::V4)
-                .await
         );
         let (exchange, old_bg) = DnsExchange::from_stream(TestTransport {
             silent: true,
@@ -1833,8 +1829,7 @@ mod tests {
         assert!(
             !channel
                 .bootstrap
-                .has_active_failure("dns.example", IpStack::V4)
-                .await,
+                .has_active_failure("dns.example", IpStack::V4),
             "stale deadline retry must call bootstrap.reset(&self.up.host)"
         );
         old_bg.abort();

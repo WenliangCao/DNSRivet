@@ -1303,13 +1303,11 @@ mod tests {
         let Backend::Legacy { bootstrap, .. } = &manager.entries[0].backend else {
             unreachable!();
         };
-        bootstrap
-            .seed_test_ips(
-                "dns.example",
-                IpStack::Both,
-                &[blackhole.local_addr().unwrap().ip(), "::1".parse().unwrap()],
-            )
-            .await;
+        bootstrap.seed_test_ips(
+            "dns.example",
+            IpStack::Both,
+            &[blackhole.local_addr().unwrap().ip(), "::1".parse().unwrap()],
+        );
 
         let response = manager.forward(&TEST_QUERY, false).await.unwrap();
         assert_eq!(&response[..2], &TEST_QUERY[..2]);
