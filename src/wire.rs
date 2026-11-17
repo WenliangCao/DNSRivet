@@ -116,6 +116,21 @@ pub fn error_response(query: &[u8], rcode: u8) -> Vec<u8> {
     response
 }
 
+/// Build a SERVFAIL response echoing only a single valid question section.
+/// Strips client EDNS options (such as 8-byte RFC 7873 cookies) and trailing records.
+pub fn servfail_response(query: &[u8]) -> Vec<u8> {
+    if read_u16(query, 4) == Some(1)
+        && let Some(end) = questions_end(query)
+    {
+        let mut response = query[..end].to_vec();
+        response[2] = (query[2] & 0x79) | 0x80;
+        response[3] = 0x82;
+        response[6..12].fill(0);
+        return response;
+    }
+    error_response(query, 2)
+}
+
 /// Extract the client's advertised UDP payload size even when the query must
 /// bypass the cache (for example because it carries EDNS COOKIE or padding).
 pub fn udp_payload_size(message: &[u8]) -> usize {

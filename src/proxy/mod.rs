@@ -7,6 +7,7 @@ use crate::upstream::Manager;
 use crate::wire;
 use cache::Cache;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -15,6 +16,7 @@ use tokio::sync::Semaphore;
 /// Bound on concurrently in-flight queries (memory backstop).
 const MAX_INFLIGHT: usize = 512;
 const MAX_TCP_CONNECTIONS: usize = 64;
+const MAX_TCP_INFLIGHT_PER_CONN: usize = 32;
 const MAX_QUERY_SIZE: usize = 4096;
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -256,6 +258,7 @@ async fn udp_loop(
                 if warning_due(&mut last_warning) {
                     log::warn!("udp recv error: {err}");
                 }
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
         };
@@ -341,11 +344,16 @@ async fn tcp_conn(
     inflight: Arc<Semaphore>,
 ) -> std::io::Result<()> {
     let (mut reader, writer) = stream.into_split();
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    let writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
+    let writer_failed = Arc::new(AtomicBool::new(false));
+    let conn_inflight = Arc::new(Semaphore::new(MAX_TCP_INFLIGHT_PER_CONN));
     let mut pending = tokio::task::JoinSet::new();
     loop {
         while let Some(result) = pending.try_join_next() {
             result.map_err(std::io::Error::other)??;
+        }
+        if writer_failed.load(Ordering::Acquire) {
+            break;
         }
         let mut lenbuf = [0u8; 2];
         match tokio::time::timeout(TCP_IDLE_TIMEOUT, reader.read_exact(&mut lenbuf)).await {
@@ -364,14 +372,25 @@ async fn tcp_conn(
         if query[2] & 0x80 != 0 {
             continue;
         }
-        let permit = inflight
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("inflight semaphore is never closed");
-        let (manager, cache, writer) = (manager.clone(), cache.clone(), writer.clone());
+        let Ok(permits) = tokio::time::timeout(TCP_IDLE_TIMEOUT, async {
+            (
+                conn_inflight.clone().acquire_owned().await.unwrap(),
+                inflight.clone().acquire_owned().await.unwrap(),
+            )
+        })
+        .await
+        else {
+            break;
+        };
+        if writer_failed.load(Ordering::Acquire) {
+            break;
+        }
+        let manager = manager.clone();
+        let cache = cache.clone();
+        let writer = writer.clone();
+        let writer_failed = writer_failed.clone();
         pending.spawn(async move {
-            let _permit = permit;
+            let _permits = permits;
             let meta = cache.query_meta(&query);
             let mut response = Vec::new();
             if !local_response(&cache, &query, meta.as_ref(), &mut response) {
@@ -379,11 +398,19 @@ async fn tcp_conn(
             }
             let frame = tcp_frame(&query, response);
             // Answers may finish out of order; serialize only the complete frame writes.
-            tokio::time::timeout(TCP_IDLE_TIMEOUT, async {
-                writer.lock().await.write_all(&frame).await
-            })
-            .await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+            let mut guard = writer.lock().await;
+            let Some(mut stream_writer) = guard.take() else {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            };
+            let result = tokio::time::timeout(TCP_IDLE_TIMEOUT, stream_writer.write_all(&frame))
+                .await
+                .unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+            if result.is_ok() {
+                *guard = Some(stream_writer);
+            } else {
+                writer_failed.store(true, Ordering::Release);
+            }
+            result
         });
     }
     // A client can finish sending while still waiting for outstanding answers.
@@ -395,7 +422,7 @@ async fn tcp_conn(
 
 fn tcp_frame(query: &[u8], mut response: Vec<u8>) -> Vec<u8> {
     if response.len() > u16::MAX as usize {
-        response = servfail(query);
+        response = wire::servfail_response(query);
     }
     let mut framed = Vec::with_capacity(response.len() + 2);
     framed.extend_from_slice(&(response.len() as u16).to_be_bytes());
@@ -434,7 +461,7 @@ async fn forward(
     meta: Option<&wire::QueryMeta>,
 ) -> Vec<u8> {
     let Some(answer) = manager.forward_answer(query, client_tcp).await else {
-        return servfail(query);
+        return wire::servfail_response(query);
     };
     if answer.cacheable
         && let Some(meta) = meta
@@ -442,16 +469,6 @@ async fn forward(
         cache.insert(meta, &answer.bytes);
     }
     answer.bytes
-}
-
-/// Header-echo SERVFAIL: QR=1, RA=1, RCODE=2, question section preserved.
-fn servfail(query: &[u8]) -> Vec<u8> {
-    let mut response = query.to_vec();
-    if response.len() >= 12 {
-        response[2] = (response[2] & 0x79) | 0x80; // QR=1, keep opcode/RD, clear AA+TC
-        response[3] = 0x82; // RA=1, RCODE=SERVFAIL
-    }
-    response
 }
 
 /// Header-only FORMERR for multi-question queries. The question section is
@@ -733,5 +750,322 @@ mod tests {
         );
         assert_eq!(frame[5] & 15, 2);
         wire::validate_response(&query, &frame[2..]).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_slow_query_exceeding_idle_timeout_still_writes_response() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let manager = Arc::new(
+            Manager::new(
+                vec![Upstream {
+                    name: "slow".into(),
+                    proto: Proto::Legacy,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    path: String::new(),
+                    bootstrap_ip: Some(addr.ip()),
+                    timeout_ms: 20_000,
+                    ip_stack: IpStack::Both,
+                }],
+                &[],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let (tx_seen, mut rx_seen) = tokio::sync::mpsc::channel(1);
+        let responder = tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            let (n, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf[2] |= 0x80;
+            tx_seen.send((buf, peer, upstream)).await.unwrap();
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let serving = tokio::spawn(tcp_conn(
+            stream,
+            manager,
+            Arc::new(Cache::new(false, 1)),
+            Arc::new(Semaphore::new(4)),
+        ));
+
+        let query = vec![0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        client
+            .write_all(&tcp_frame(&query, query.clone()))
+            .await
+            .unwrap();
+        let (mut resp, peer, upstream) = rx_seen.recv().await.unwrap();
+        responder.await.unwrap();
+
+        // Advance past TCP_IDLE_TIMEOUT while the client keeps the TCP stream open and idle.
+        tokio::time::advance(TCP_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        resp[3] = 0x80;
+        upstream.send_to(&resp, peer).await.unwrap();
+
+        let len = client.read_u16().await.unwrap() as usize;
+        let mut answer = vec![0u8; len];
+        client.read_exact(&mut answer).await.unwrap();
+        wire::validate_response(&query, &answer).unwrap();
+        assert_eq!(&answer[..2], &[0, 7]);
+        serving.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_write_timeout_prevents_subsequent_frames() {
+        // Unresponsive upstream with 11s timeout: marker query finishes after 10s write timeout.
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = upstream.local_addr().unwrap();
+        let manager = Arc::new(
+            Manager::new(
+                vec![Upstream {
+                    name: "blackhole".into(),
+                    proto: Proto::Legacy,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    path: String::new(),
+                    bootstrap_ip: Some(addr.ip()),
+                    timeout_ms: 11_000,
+                    ip_stack: IpStack::Both,
+                }],
+                &[],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let cache = Arc::new(Cache::new(true, 4));
+        let cached_query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        let meta = wire::parse_query_meta(&cached_query).unwrap();
+        let mut big_answer = cached_query.clone();
+        big_answer[2] = 0x81;
+        big_answer[3] = 0x80;
+        // 250 A records = 4,019 bytes (fits Cache::insert's 4,096-byte cap).
+        let rrs: u16 = 250;
+        big_answer[6..8].copy_from_slice(&rrs.to_be_bytes());
+        for _ in 0..rrs {
+            big_answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        }
+        cache.insert(&meta, &big_answer);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        nix::sys::socket::setsockopt(&listener, nix::sys::socket::sockopt::SndBuf, &1024).unwrap();
+        nix::sys::socket::setsockopt(&listener, nix::sys::socket::sockopt::RcvBuf, &1024).unwrap();
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::RcvBuf, &1024).unwrap();
+        let mut client = sock.connect(listener.local_addr().unwrap()).await.unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let serving = tokio::spawn(tcp_conn(
+            stream,
+            manager,
+            cache,
+            Arc::new(Semaphore::new(64)),
+        ));
+
+        // Send 1 uncached marker query (11s timeout) + 300 cached ~4 KiB responses (~1.2 MiB).
+        let mut batch = Vec::new();
+        let marker_query = vec![
+            0x99, 0x99, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'b', 0, 0, 1, 0, 1,
+        ];
+        batch.extend_from_slice(&tcp_frame(&marker_query, marker_query.clone()));
+        for id in 1..=300u16 {
+            let mut q = cached_query.clone();
+            q[..2].copy_from_slice(&id.to_be_bytes());
+            batch.extend_from_slice(&tcp_frame(&q, q.clone()));
+        }
+        client.write_all(&batch).await.unwrap();
+
+        // Wait until tcp_conn has read marker_query and let cached writers fill the socket buffer.
+        let mut probe = [0u8; 64];
+        upstream.recv_from(&mut probe).await.unwrap();
+        for _ in 0..1024 {
+            tokio::task::yield_now().await;
+        }
+
+        // Keep the read loop alive past t=10s by sending an ignored QR=1 packet at t=5s.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let mut keepalive = cached_query.clone();
+        keepalive[2] |= 0x80;
+        client
+            .write_all(&tcp_frame(&keepalive, keepalive.clone()))
+            .await
+            .unwrap();
+
+        // Advance to t=10.5s so the blocked cached frame hits TCP_IDLE_TIMEOUT (10s) first,
+        // then advance to t=11.5s so marker_query's 11s timeout fires and tries to write.
+        tokio::time::advance(Duration::from_millis(5_500)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let _ = client.shutdown().await;
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = client.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&buf[..n]);
+        }
+
+        let frame_len = 2 + big_answer.len();
+        assert!(
+            received.len() < 300 * frame_len,
+            "expected write timeout to stop remaining frames, got {} bytes",
+            received.len()
+        );
+        let complete = received.len() / frame_len;
+        for i in 0..complete {
+            let frame = &received[i * frame_len..(i + 1) * frame_len];
+            let len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+            assert_eq!(len, big_answer.len());
+            let id = u16::from_be_bytes([frame[2], frame[3]]);
+            assert!((1..=300).contains(&id), "unexpected frame id {id:#x}");
+            assert_eq!(&frame[4..], &big_answer[2..]);
+        }
+        let tail = &received[complete * frame_len..];
+        if tail.len() >= 2 {
+            assert_eq!(
+                u16::from_be_bytes([tail[0], tail[1]]) as usize,
+                big_answer.len(),
+                "trailing partial frame must be the interrupted big frame, not marker"
+            );
+        }
+        if tail.len() >= 4 {
+            let id = u16::from_be_bytes([tail[2], tail[3]]);
+            assert!((1..=300).contains(&id), "unexpected tail frame id {id:#x}");
+            assert_eq!(&tail[4..], &big_answer[2..2 + tail.len() - 4]);
+        }
+        assert!(serving.await.is_ok(), "tcp_conn task must not panic");
+    }
+
+    #[tokio::test]
+    async fn tcp_per_conn_cap_prevents_exhausting_global_inflight() {
+        let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = upstream.local_addr().unwrap();
+        let (tx_seen, mut rx_seen) = tokio::sync::mpsc::channel(64);
+        let upstream_rx = upstream.clone();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = upstream_rx.recv_from(&mut buf).await {
+                if tx_seen.send((buf[..n].to_vec(), peer)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let manager = Arc::new(
+            Manager::new(
+                vec![Upstream {
+                    name: "cap".into(),
+                    proto: Proto::Legacy,
+                    host: addr.ip().to_string(),
+                    port: addr.port(),
+                    path: String::new(),
+                    bootstrap_ip: Some(addr.ip()),
+                    timeout_ms: 2_000,
+                    ip_stack: IpStack::Both,
+                }],
+                &[],
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let global_inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let serving = tokio::spawn(tcp_conn(
+            stream,
+            manager,
+            Arc::new(Cache::new(false, 1)),
+            global_inflight.clone(),
+        ));
+
+        let mut batch = Vec::new();
+        for id in 0..(MAX_TCP_INFLIGHT_PER_CONN + 2) as u16 {
+            let mut q = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+            q[..2].copy_from_slice(&id.to_be_bytes());
+            batch.extend_from_slice(&tcp_frame(&q, q.clone()));
+        }
+        client.write_all(&batch).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_TCP_INFLIGHT_PER_CONN {
+            held.push(
+                tokio::time::timeout(Duration::from_secs(1), rx_seen.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx_seen.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            global_inflight.available_permits(),
+            MAX_INFLIGHT - MAX_TCP_INFLIGHT_PER_CONN
+        );
+
+        let (mut first_q, first_peer) = held.remove(0);
+        first_q[2] |= 0x80;
+        upstream.send_to(&first_q, first_peer).await.unwrap();
+        held.push(
+            tokio::time::timeout(Duration::from_secs(1), rx_seen.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        for (mut q, peer) in held {
+            q[2] |= 0x80;
+            upstream.send_to(&q, peer).await.unwrap();
+        }
+        if let Ok(Some((mut q, peer))) =
+            tokio::time::timeout(Duration::from_secs(1), rx_seen.recv()).await
+        {
+            q[2] |= 0x80;
+            upstream.send_to(&q, peer).await.unwrap();
+        }
+        for _ in 0..(MAX_TCP_INFLIGHT_PER_CONN + 2) {
+            let len = client.read_u16().await.unwrap() as usize;
+            let mut answer = vec![0u8; len];
+            client.read_exact(&mut answer).await.unwrap();
+            assert_ne!(answer[2] & 0x80, 0);
+        }
+        serving.await.unwrap().unwrap();
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn servfail_strips_edns_cookie_and_trailing_records() {
+        let mut query = vec![
+            0x42, 0x42, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1,
+        ];
+        let question_end = query.len();
+        // OPT RR with 8-byte RFC 7873 COOKIE option (code 10, len 8).
+        query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 12]);
+        query.extend_from_slice(&[0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let manager = Manager::new(vec![], &[], Vec::new()).unwrap();
+        let cache = Cache::new(false, 1);
+        let resp = forward(&manager, &cache, &query, false, None).await;
+        assert_eq!(resp.len(), question_end);
+        assert_eq!(&resp[..2], &[0x42, 0x42]);
+        assert_eq!(resp[2], 0x81);
+        assert_eq!(resp[3], 0x82);
+        assert_eq!(&resp[4..12], &[0, 1, 0, 0, 0, 0, 0, 0]);
+        wire::validate_response(&query, &resp).unwrap();
     }
 }
