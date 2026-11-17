@@ -182,7 +182,7 @@ pub fn adjust_ttls(message: &mut [u8], elapsed_secs: u64) -> bool {
 
 /// Determine how long a successful response is safe to cache.
 ///
-/// Positive answers use the minimum answer/authority TTL, capped at one day.
+/// Positive answers use the minimum answer TTL, capped at one day.
 /// NXDOMAIN/NODATA uses RFC 2308's min(SOA TTL, SOA.MINIMUM), capped at
 /// 600 seconds. A zero TTL is never cached, and short TTLs are not extended.
 pub fn cache_ttl(message: &[u8], query_type: u16) -> Option<u32> {
@@ -205,13 +205,14 @@ pub fn cache_ttl(message: &[u8], query_type: u16) -> Option<u32> {
 
     for index in 0..answers + authorities + additionals {
         let rr = parse_rr(message, offset)?;
+        if rr.kind == TYPE_OPT && message.get(rr.ttl_offset).copied().unwrap_or(0) != 0 {
+            return None;
+        }
         let in_answer = index < answers;
         let in_authority = index >= answers && index < answers + authorities;
 
-        if in_answer || in_authority {
+        if in_answer && rr.kind != TYPE_OPT {
             positive_min = Some(positive_min.map_or(rr.ttl, |ttl| ttl.min(rr.ttl)));
-        }
-        if in_answer {
             has_requested_answer |= rr.kind == query_type;
             has_cname |= rr.kind == TYPE_CNAME;
         }
@@ -1037,5 +1038,35 @@ mod tests {
             }
             assert!(parse_query_meta(&query).is_none());
         }
+    }
+
+    #[test]
+    fn cache_ttl_rejects_empty_referrals_and_badvers() {
+        // NOERROR empty-answer referral (ANCOUNT=0, NSCOUNT=1) must not be cached.
+        let mut referral = question(1, false);
+        referral[2] = 0x81;
+        referral[3] = 0x80;
+        referral[8..10].copy_from_slice(&1u16.to_be_bytes());
+        referral.extend_from_slice(&[0xc0, 0x0c, 0, 2, 0, 1]);
+        referral.extend_from_slice(&3600u32.to_be_bytes());
+        referral.extend_from_slice(&[0, 2, 0xc0, 0x0c]);
+        assert_eq!(cache_ttl(&referral, 1), None);
+
+        // BADVERS=16 (header RCODE=0, OPT EXTENDED-RCODE=1) must not be cached.
+        let mut badvers = positive_response(1, 120, true);
+        let opt_offset = questions_end(&badvers).unwrap() + 16;
+        let opt = parse_rr(&badvers, opt_offset).unwrap();
+        badvers[opt.ttl_offset] = 1;
+        assert_eq!(cache_ttl(&badvers, 1), None);
+    }
+
+    #[test]
+    fn cache_ttl_does_not_clamp_answer_ttl_with_authority_ns_ttl() {
+        let mut resp = positive_response(1, 300, false);
+        resp[8..10].copy_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&[0xc0, 0x0c, 0, 2, 0, 1]);
+        resp.extend_from_slice(&10u32.to_be_bytes());
+        resp.extend_from_slice(&[0, 2, 0xc0, 0x0c]);
+        assert_eq!(cache_ttl(&resp, 1), Some(300));
     }
 }
