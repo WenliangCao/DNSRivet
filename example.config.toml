@@ -34,3 +34,12 @@ type = "dot"
 endpoint = "resolver-backup.example"
 bootstrap_ip = "192.0.2.53"
 timeout = 5000
+
+# Optional domain-suffix routing overrides (longest suffix wins).
+# Targets: "system" (pre-takeover OS DNS), an upstream name or "upstream.N",
+# or a literal "IP[:PORT]" (default port 53).
+# "system" and literal IP targets bypass the shared cache.
+# [split_dns]
+# "home.arpa" = "system"
+# "corp.internal" = "10.0.0.53"
+# "company.example" = "Primary DoH"

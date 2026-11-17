@@ -94,3 +94,43 @@ fn dangling_output_symlink_is_preserved_without_force() {
     assert!(!target.exists());
     assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
 }
+
+#[test]
+fn config_init_supports_split_dns_and_check_rejects_self_loop() {
+    let directory = TestDirectory::new();
+    let init = directory.init(&[
+        "--split-dns",
+        "corp.local=10.0.0.53",
+        "--split-dns",
+        "home.arpa=system",
+        "--split-dns",
+        "internal.example=upstream.0",
+    ]);
+    assert!(init.status.success(), "{init:?}");
+
+    let written = std::fs::read_to_string(directory.0.join("dnsrivet.toml")).unwrap();
+    assert!(written.contains("[split_dns]"), "{written}");
+    assert!(written.contains("corp.local"), "{written}");
+
+    let check = Command::new(env!("CARGO_BIN_EXE_dnsrivet"))
+        .args(["config", "check"])
+        .current_dir(&directory.0)
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{check:?}");
+
+    let bad_path = directory.0.join("bad.toml");
+    std::fs::write(
+        &bad_path,
+        "[listener.0]\nip = \"127.0.0.1\"\nport = 53\n\
+         [upstream.0]\nendpoint = \"1.1.1.1\"\n\
+         [split_dns]\n\"corp.local\" = \"127.0.0.1:53\"\n",
+    )
+    .unwrap();
+    let bad = Command::new(env!("CARGO_BIN_EXE_dnsrivet"))
+        .args(["config", "check", "--config"])
+        .arg(&bad_path)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}

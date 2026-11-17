@@ -19,6 +19,7 @@ One binary. One runtime thread. No telemetry. No control plane.
 - DoH, DoH3, DoT, DoQ, and conventional UDP/TCP upstreams
 - Persistent multiplexed encrypted connections
 - Ordered failover with hedging, per-upstream timeouts, and exponential reconnect backoff
+- Split-DNS suffix routing to `system`, a named upstream, or a direct `IP[:PORT]` resolver (`[split_dns]` / `--split-dns`)
 - Direct fallback to system DNS only when every configured upstream fails to return a DNS response
 - Bootstrap resolution that bypasses the system resolver to prevent loops
 - Local UDP and pipelined TCP listeners with bounded concurrency
@@ -190,7 +191,17 @@ For a one-line test, pass the listener and one or more ordered upstreams directl
 ```
 
 Each upstream uses `TYPE=ENDPOINT`; repeat `--upstream` to define failover order.
-The accepted types are `doh`, `doh3`, `dot`, `doq`, and `legacy`.
+The accepted types are `doh`, `doh3`, `dot`, `doq`, and `legacy`. Add `--split-dns
+SUFFIX=TARGET` (repeatable) to route matching domain suffixes to `system`, a
+configured upstream name or `upstream.N`, or a direct `IP[:PORT]`:
+
+```bash
+./target/release/dnsrivet run \
+  --listen 127.0.0.1:5354 \
+  --upstream 'doh3=https://resolver.example/profile' \
+  --split-dns 'corp.internal=10.0.0.53' \
+  --split-dns 'home.arpa=system'
+```
 
 To keep the configuration as TOML, generate and validate it from the same CLI
 options:
@@ -249,7 +260,8 @@ will not guess how to rewrite existing DNS settings. Service commands use the
 installed configuration, explicit `--config`, or CLI options; they never import
 `./dnsrivet.toml` implicitly. Logs are written to `/var/log/dnsrivet.log` with mode
 `0640`. Connection messages are debug-only; dependency logs are limited to errors.
-The service permits 4,096 file descriptors and at most 64 client TCP connections.
+The service permits 4,096 file descriptors, at most 64 client TCP connections,
+and up to 32 concurrent in-flight queries per TCP connection.
 
 When upgrading an older installation, run `sudo dnsrivet stop` followed by
 `sudo dnsrivet start` once to load the new launchd resource limits, startup
@@ -366,14 +378,27 @@ upstream's reachability is fully trusted.
 
 Failover is hedged: when an upstream has not answered within 300 ms, the next
 upstream is queried in parallel and the first valid non-SERVFAIL answer wins.
-Losing legacy attempts are cancelled; encrypted attempts keep running to their
-own timeout so stalled connections still back off. All attempts, including
-background losers and system fallback, share a 512-attempt budget. Upstreams
-with `timeout = 0` are never raced. Hedging means a later upstream can see a
-query the first one would have answered slowly, so order upstreams you are
-equally willing to send queries to. Prefer `doh` before `doh3` for steadier first
-queries after idle periods; DoH3 peers may close idle QUIC connections after
-30 seconds. QUIC keep-alive and 0-RTT are not enabled.
+Losing legacy attempts are cancelled; detached encrypted hedge losers are
+deduplicated to at most one pioneer probe per `(upstream, generation)` so stalled
+connections still back off without exhausting the budget. Configured upstream
+attempts share a 512-permit budget, while system fallback and `system` split-DNS
+queries use an independent 64-permit budget so stalled primaries cannot starve
+fallback. Upstreams with `timeout = 0` are never raced. Hedging means a later
+upstream can see a query the first one would have answered slowly, so order
+upstreams you are equally willing to send queries to. Prefer `doh` before `doh3`
+for steadier first queries after idle periods; DoH3 peers may close idle QUIC
+connections after 30 seconds. QUIC keep-alive and 0-RTT are not enabled.
+
+`[split_dns]` (and `--split-dns`) routes queries by longest label-boundary
+domain suffix match to `"system"` (the captured pre-takeover system DNS servers),
+a configured upstream name or `"upstream.N"`, or a direct `IP[:PORT]` (default
+port 53; self-listener addresses are rejected). Rules targeting a configured
+upstream share the main cache; `system` and direct `IP[:PORT]` rules bypass the
+shared cache and leave response TTLs untouched. When `system` has no usable
+fallback servers, it returns `SERVFAIL` without triggering normal fallback
+warnings. Note: when on-demand split-tunnel tools are disconnected, `NXDOMAIN`
+replies from `system` may be cached by macOS `mDNSResponder` for their SOA TTL;
+flush with `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`.
 
 See [`example.config.toml`](example.config.toml) for the complete annotated
 example. DoH and DoH3 default to port 443; DoT and DoQ default to 853;
@@ -411,10 +436,10 @@ cached (RFC 5452).
   never used as fallback servers.
 - DHCP fallback refresh depends on a change in route source address and an
   interface exposing DHCP DNS; otherwise the prior fallback may remain in use.
-- Local names (including unicast `.local` and `.lan` queries) are forwarded to
-  configured upstreams. There is no split DNS routing for private names; a public
-  upstream may receive them and fail to resolve them. Configure an appropriate
-  resolver if local names are required.
+- Without `[split_dns]` rules, local names (including unicast `.local` and `.lan`
+  queries) are forwarded to configured upstreams and public resolvers may fail to
+  resolve them. Configure `[split_dns]` to route private suffixes to `system`, a
+  direct `IP[:PORT]`, or a dedicated upstream.
 - The daemon runs as root for port 53 and system DNS management.
 - Debug logs can contain queried domain names and complete upstream URLs.
 - Service commands modify system-wide `launchd` and network DNS state and
@@ -446,6 +471,7 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 支持 DoH、DoH3、DoT、DoQ 和传统 UDP/TCP 上游
 - 加密连接持久化并复用
 - 带对冲的顺序故障转移、独立超时和指数退避重连
+- 按域名后缀分流到 `system`、指定上游或直连 `IP[:PORT]`（`[split_dns]` / `--split-dns`）
 - 所有配置上游均未返回 DNS 应答时，才直接回退到系统 DNS
 - bootstrap 解析绕过系统 resolver，避免 DNS 自环
 - UDP/TCP 本地监听、有界并发及 TCP 查询流水线
@@ -525,6 +551,16 @@ cp example.config.toml dnsrivet.toml
 ```
 
 每个上游使用 `TYPE=ENDPOINT` 格式；重复 `--upstream` 即可定义故障转移顺序。
+可配合 `--split-dns SUFFIX=TARGET`（可重复指定）将匹配后缀路由到 `system`、
+已配置上游名称或 `upstream.N`、或直连 `IP[:PORT]`：
+
+```bash
+./target/release/dnsrivet run \
+  --listen 127.0.0.1:5354 \
+  --upstream 'doh3=https://resolver.example/profile' \
+  --split-dns 'corp.internal=10.0.0.53' \
+  --split-dns 'home.arpa=system'
+```
 如果希望保存为文件，可以使用同一组参数生成并验证 TOML：
 
 ```bash
@@ -618,7 +654,8 @@ Homebrew 等包管理器持有，则保留包管理器入口。DNSRivet 不会�
 原子写入；没有备份时，DNSRivet 不会猜测性改写原有 DNS。服务命令只使用已安装配置、
 显式 `--config` 或命令行选项，不再隐式导入当前目录的 `dnsrivet.toml`。日志位于
 `/var/log/dnsrivet.log`，权限为 `0640`；连接成功日志仅在 debug 级别输出，依赖库仅
-输出 error。服务文件描述符软上限为 4096，客户端 TCP 连接上限为 64。
+输出 error。服务文件描述符软上限为 4096，客户端 TCP 连接上限为 64，每个 TCP
+连接最多 32 个并发在途查询。
 
 旧安装升级后，执行一次 `sudo dnsrivet stop` 再 `sudo dnsrivet start`，加载新的
 launchd 限制、启动恢复环境及带网络位置信息的备份。日志不自动轮转；需要归档时，
@@ -679,12 +716,23 @@ loopback 和自身监听地址会被过滤，避免形成递归自环。如果�
 仅在完全信任首上游可达性时使用。
 
 故障转移带对冲：某个上游 300 毫秒内未应答时，会并发查询下一个上游，取先到的
-合法且非 `SERVFAIL` 的应答。落败的 legacy 请求会取消；加密请求继续运行至自身
-超时，让卡住的连接仍能断开并退避。包括后台落败请求和系统回退在内的所有尝试
-共用 512 项预算。`timeout = 0` 的上游不参与对冲。对冲意味着
-后续上游可能收到首上游本可以慢速应答的查询，因此只把同样愿意发送查询的上游
-排在后面。不做 keep-alive 时，建议把 `doh` 放在 `doh3` 前面，让空闲后的首个
-查询延迟更稳定；DoH3 对端可能在空闲 30 秒后关闭 QUIC 连接。不启用 QUIC 0-RTT。
+合法且非 `SERVFAIL` 的应答。落败的 legacy 请求会取消；落败的加密对冲按
+`(upstream, generation)` 去重，最多保留 1 个先锋探测继续运行至自身超时，让卡住的
+连接仍能断开并退避而不占满并发额度。所有配置上游尝试共用 512 项预算，而系统
+回退与 `system` 分流查询使用独立的 64 项预算，避免卡住的主上游探测饿死回退。
+`timeout = 0` 的上游不参与对冲。对冲意味着后续上游可能收到首上游本可以慢速应答的查询，
+因此只把同样愿意发送查询的上游排在后面。不做 keep-alive 时，建议把 `doh` 放在
+`doh3` 前面，让空闲后的首个查询延迟更稳定；DoH3 对端可能在空闲 30 秒后关闭 QUIC 连接。
+不启用 QUIC 0-RTT。
+
+`[split_dns]`（及 `--split-dns`）按最长标签边界匹配域名后缀，可路由到 `system`
+（接管前捕获的系统 DNS）、已配置上游名称或 `upstream.N`，或直连 `IP[:PORT]`
+（默认 53 端口，拒绝自环/自身监听地址）。指向配置上游的规则共用主缓存；
+`system` 与直连 `IP[:PORT]` 规则绕过共享缓存且不改写应答 TTL。当 `system`
+没有可用回退服务器时直接返回 `SERVFAIL`（不触发常规回退告警）。注意：当按需
+分流工具断开连接时，`system` 返回的 `NXDOMAIN` 可能被 macOS `mDNSResponder`
+按其 SOA TTL 缓存；可执行 `sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder`
+刷新缓存。
 
 缓存仅处理标准单问题递归查询，并还原每个客户端的问题段大小写。应答超过 4096
 字节不缓存，`cache_size` 最大为 16384。带 EDNS option、非零 EDNS 版本、`RD=0`
@@ -707,8 +755,9 @@ question 一致，才会被返回或写入缓存（RFC 5452）。
 - VPN 与 Network Extension 的 scoped resolver 不在接管范围内，也不会被用作
   回退服务器。
 - DHCP 回退刷新依赖路由源地址变化和接口可读的 DHCP DNS；否则可能继续使用旧列表。
-- 没有针对局域网名字的分流；`.lan` 和以单播送来的 `.local` 等名字仍发往配置上游，
-  公共上游可能获知这些名字却无法解析。需要局域网解析时应配置合适的 resolver。
+- 未配置 `[split_dns]` 规则时，`.lan` 和以单播送来的 `.local` 等局域网名字仍发往
+  配置上游，公共上游可能获知这些名字却无法解析；如需本机或内网解析，可通过
+  `[split_dns]` 将对应后缀路由到 `system`、直连 `IP[:PORT]` 或专用上游。
 - 守护进程仍以 root 运行，以绑定 53 端口并管理系统 DNS。
 - debug 日志可能包含查询域名和完整上游 URL。
 - 服务命令修改系统级 `launchd` 和网络 DNS，因此需要 `sudo`。

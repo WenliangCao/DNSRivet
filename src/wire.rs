@@ -345,6 +345,41 @@ pub fn is_multi_question_query(message: &[u8]) -> bool {
         && read_u16(message, 4).is_some_and(|count| count > 1)
 }
 
+/// Return the index of the first matching suffix in `suffixes` (caller-sorted
+/// longest-first) for `query`'s first QNAME on a label boundary.
+pub fn match_domain_suffix(query: &[u8], suffixes: &[impl AsRef<str>]) -> Option<usize> {
+    if suffixes.is_empty()
+        || query.len() < HEADER_LEN
+        || query[2] & 0x78 != 0
+        || read_u16(query, 4)? == 0
+    {
+        return None;
+    }
+    let mut name = [0u8; 255];
+    let mut len = 0;
+    let mut embedded_dot = false;
+    walk_name(query, HEADER_LEN, |label| {
+        if label.len() > 1 {
+            embedded_dot |= label[1..].contains(&b'.');
+            name[len..len + label.len() - 1].copy_from_slice(&label[1..]);
+            name[len + label.len() - 1] = b'.';
+            len += label.len();
+        }
+    })?;
+    if embedded_dot || len == 0 {
+        return None;
+    }
+    let qname = &mut name[..len - 1];
+    qname.make_ascii_lowercase();
+    suffixes.iter().position(|entry| {
+        let suffix = entry.as_ref().as_bytes();
+        &*qname == suffix
+            || qname
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with(b"."))
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ResourceRecord {
     kind: u16,
@@ -1068,5 +1103,42 @@ mod tests {
         resp.extend_from_slice(&10u32.to_be_bytes());
         resp.extend_from_slice(&[0, 2, 0xc0, 0x0c]);
         assert_eq!(cache_ttl(&resp, 1), Some(300));
+    }
+
+    #[test]
+    fn match_domain_suffix_enforces_label_boundary_longest_match_and_case_insensitivity() {
+        let suffixes = ["corp.example.com", "example.com", "internal"];
+
+        assert_eq!(
+            match_domain_suffix(&named_question(b"\x07ExAmPlE\x03CoM\0"), &suffixes),
+            Some(1)
+        );
+        assert_eq!(
+            match_domain_suffix(
+                &named_question(b"\x03api\x04CORP\x07example\x03cOm\0"),
+                &suffixes
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            match_domain_suffix(&named_question(b"\x03nas\x08INTERNAL\0"), &suffixes),
+            Some(2)
+        );
+        assert_eq!(
+            match_domain_suffix(&named_question(b"\x0anotexample\x03com\0"), &suffixes),
+            None
+        );
+        assert_eq!(
+            match_domain_suffix(
+                &named_question(b"\x07example\x03com\x04evil\x03org\0"),
+                &suffixes
+            ),
+            None
+        );
+        assert_eq!(
+            match_domain_suffix(&named_question(b"\x0ccorp.example\x03com\0"), &suffixes),
+            None
+        );
+        assert_eq!(match_domain_suffix(&named_question(b"\0"), &suffixes), None);
     }
 }

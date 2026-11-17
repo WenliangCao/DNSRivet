@@ -28,6 +28,7 @@ QUICK CONFIG OPTIONS (run, start, restart, config init):
         --listen <IP:PORT>    Listener; repeat for multiple listeners
         --upstream <SPEC>     Upstream as TYPE=ENDPOINT; repeat for failover
                               TYPE: doh, doh3, dot, doq, legacy
+        --split-dns <RULE>    Route suffix as SUFFIX=TARGET; repeat for multiple
         --timeout <MS>        Timeout for each quick-config upstream (default: 5000)
         --cache-size <COUNT>  Enable a cache with this capacity (default: 4096)
         --no-cache            Disable the cache
@@ -40,6 +41,7 @@ CONFIG INIT OPTIONS:
 pub struct QuickArgs {
     pub listeners: Vec<String>,
     pub upstreams: Vec<String>,
+    pub split_dns: Vec<String>,
     pub timeout_ms: Option<u64>,
     pub cache_size: Option<usize>,
     pub no_cache: bool,
@@ -49,6 +51,7 @@ impl QuickArgs {
     pub fn is_empty(&self) -> bool {
         self.listeners.is_empty()
             && self.upstreams.is_empty()
+            && self.split_dns.is_empty()
             && self.timeout_ms.is_none()
             && self.cache_size.is_none()
             && !self.no_cache
@@ -112,6 +115,7 @@ where
             Short('h') | Long("help") => return Ok(Command::Help),
             Long("listen") => quick.listeners.push(parser.value()?.string()?),
             Long("upstream") => quick.upstreams.push(parser.value()?.string()?),
+            Long("split-dns") => quick.split_dns.push(parser.value()?.string()?),
             Long("timeout") => {
                 quick.timeout_ms = Some(parse_number(parser.value()?.string()?, "timeout")?)
             }
@@ -329,5 +333,32 @@ mod tests {
             panic!("expected config init command");
         };
         assert_eq!(output, PathBuf::from("custom.toml"));
+    }
+
+    #[test]
+    fn parses_split_dns_quick_options() {
+        let with_split = QuickArgs {
+            split_dns: vec!["home.arpa=system".into()],
+            ..QuickArgs::default()
+        };
+        assert!(!with_split.is_empty());
+
+        let command = parse_args([
+            "run",
+            "--upstream",
+            "doh=https://1.1.1.1/dns-query",
+            "--split-dns",
+            "corp.internal=10.0.0.53",
+            "--split-dns",
+            "home.arpa=system",
+        ])
+        .unwrap();
+        let Command::Run { quick, .. } = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            quick.split_dns,
+            vec!["corp.internal=10.0.0.53", "home.arpa=system"]
+        );
     }
 }

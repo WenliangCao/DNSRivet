@@ -11,6 +11,8 @@ struct RawConfig {
     service: RawService,
     listener: BTreeMap<String, RawListener>,
     upstream: BTreeMap<String, RawUpstream>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    split_dns: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -82,6 +84,26 @@ pub struct Config {
     pub service: Service,
     pub listeners: Vec<SocketAddr>,
     pub upstreams: Vec<Upstream>,
+    pub split_dns: Vec<SplitRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitTarget {
+    System,
+    Upstream(usize),
+    Direct(SocketAddr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitRule {
+    pub suffix: String,
+    pub target: SplitTarget,
+}
+
+impl AsRef<str> for SplitRule {
+    fn as_ref(&self) -> &str {
+        &self.suffix
+    }
 }
 
 #[derive(Debug)]
@@ -181,11 +203,49 @@ pub fn load_text(text: &str) -> Result<Loaded, String> {
     }
 
     let mut upstreams = Vec::new();
+    let mut keys = Vec::new();
     for (key, upstream) in sorted_numeric(raw.upstream) {
         upstreams.push(parse_upstream(&key, upstream, &mut warnings)?);
+        keys.push(key);
     }
     if upstreams.is_empty() {
         return Err("at least one [upstream.N] section is required".into());
+    }
+    let mut split_dns = Vec::with_capacity(raw.split_dns.len());
+    for (raw_suffix, raw_target) in raw.split_dns {
+        let suffix = raw_suffix.trim_matches('.').to_ascii_lowercase();
+        if !valid_dns_name(&suffix) {
+            return Err(format!("[split_dns] invalid suffix {raw_suffix:?}"));
+        }
+        let target = if raw_target.eq_ignore_ascii_case("system") {
+            SplitTarget::System
+        } else if let Some(index) = upstreams
+            .iter()
+            .position(|upstream| upstream.name == raw_target)
+            .or_else(|| {
+                keys.iter()
+                    .position(|key| raw_target.strip_prefix("upstream.") == Some(key.as_str()))
+            })
+        {
+            SplitTarget::Upstream(index)
+        } else if let Some(addr) = split_host_port(&raw_target, 53)
+            .and_then(|(host, port)| Some(SocketAddr::new(host.parse().ok()?, port)))
+            .filter(|addr| addr.port() != 0 && !crate::upstream::is_self_address(*addr, &listeners))
+        {
+            SplitTarget::Direct(addr)
+        } else {
+            return Err(format!("[split_dns] invalid target {raw_target:?}"));
+        };
+        split_dns.push(SplitRule { suffix, target });
+    }
+    split_dns.sort_by(|left, right| {
+        (right.suffix.len(), &left.suffix).cmp(&(left.suffix.len(), &right.suffix))
+    });
+    if split_dns
+        .windows(2)
+        .any(|pair| pair[0].suffix == pair[1].suffix)
+    {
+        return Err("[split_dns] duplicate suffix".into());
     }
 
     Ok(Loaded {
@@ -193,6 +253,7 @@ pub fn load_text(text: &str) -> Result<Loaded, String> {
             service,
             listeners,
             upstreams,
+            split_dns,
         },
         warnings,
     })
@@ -203,6 +264,7 @@ pub fn load_text(text: &str) -> Result<Loaded, String> {
 pub fn quick_toml(
     listeners: &[String],
     upstreams: &[String],
+    split_dns: &[String],
     timeout_ms: Option<u64>,
     cache_size: Option<usize>,
     no_cache: bool,
@@ -263,6 +325,15 @@ pub fn quick_toml(
         );
     }
 
+    for rule in split_dns {
+        let (suffix, target) = rule
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --split-dns {rule:?}"))?;
+        if raw.split_dns.insert(suffix.into(), target.into()).is_some() {
+            return Err(format!("duplicate --split-dns suffix {suffix:?}"));
+        }
+    }
+
     let text =
         toml::to_string_pretty(&raw).map_err(|e| format!("serialize quick configuration: {e}"))?;
     load_text(&text)?;
@@ -273,7 +344,7 @@ pub fn quick_toml(
 /// of silently swallowing them so migrating users know what changed.
 fn scan_unknown(root: &toml::Table, warnings: &mut Vec<String>) {
     for key in root.keys() {
-        if !matches!(key.as_str(), "service" | "listener" | "upstream") {
+        if !["service", "listener", "upstream", "split_dns"].contains(&key.as_str()) {
             warnings.push(format!("section [{key}] is not supported and was ignored"));
         }
     }
@@ -464,17 +535,7 @@ fn parse_upstream(
         if host.ends_with('.') {
             host.pop();
         }
-        if host.is_empty()
-            || host.len() > 253
-            || host.split('.').any(|label| {
-                label.is_empty()
-                    || label.len() > 63
-                    || label.starts_with('-')
-                    || label.ends_with('-')
-                    || !label
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            })
+        if !valid_dns_name(&host)
             || host
                 .rsplit('.')
                 .next()
@@ -525,6 +586,18 @@ fn parse_upstream(
         timeout_ms: raw.timeout.unwrap_or(DEFAULT_TIMEOUT_MS),
         ip_stack,
     })
+}
+
+fn valid_dns_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 fn split_scheme(endpoint: &str) -> (Option<&str>, &str) {
@@ -616,6 +689,7 @@ mod tests {
                 "doh3=https://resolver.example/profile".into(),
                 "dot=resolver-backup.example".into(),
             ],
+            &[],
             Some(750),
             Some(128),
             false,
@@ -631,7 +705,8 @@ mod tests {
 
     #[test]
     fn quick_config_rejects_ambiguous_hostname_without_type() {
-        let err = quick_toml(&[], &["resolver.example".into()], None, None, false).unwrap_err();
+        let err =
+            quick_toml(&[], &["resolver.example".into()], &[], None, None, false).unwrap_err();
         assert!(err.contains("type is required"));
     }
 
@@ -669,12 +744,13 @@ mod tests {
             "bad..example",
             "bad_.example",
         ] {
-            assert!(quick_toml(&[], &[format!("dot={host}")], None, None, false).is_err());
+            assert!(quick_toml(&[], &[format!("dot={host}")], &[], None, None, false).is_err());
         }
         assert!(
             quick_toml(
                 &[],
                 &["dot=dns.example".into()],
+                &[],
                 None,
                 Some(99_999_999),
                 false
@@ -684,6 +760,7 @@ mod tests {
         let text = quick_toml(
             &["0.0.0.0:5354".into()],
             &["dot=dns.example".into()],
+            &[],
             None,
             None,
             false,
@@ -704,29 +781,32 @@ mod tests {
             quick_toml(
                 &["127.0.0.1:0".into()],
                 &["dot=dns.example".into()],
+                &[],
                 None,
                 None,
                 false
             )
             .is_err()
         );
-        assert!(quick_toml(&[], &["dot=dns.example:0".into()], None, None, false).is_err());
+        assert!(quick_toml(&[], &["dot=dns.example:0".into()], &[], None, None, false).is_err());
 
-        let trailing = quick_toml(&[], &["dot=dns.example.".into()], None, None, false).unwrap();
+        let trailing =
+            quick_toml(&[], &["dot=dns.example.".into()], &[], None, None, false).unwrap();
         let loaded = load_text(&trailing).unwrap();
         assert_eq!(loaded.config.upstreams[0].host, "dns.example");
 
-        assert!(quick_toml(&[], &["dot=127.0.0.1.999".into()], None, None, false).is_err());
-        assert!(quick_toml(&[], &["dot=foo.123".into()], None, None, false).is_err());
+        assert!(quick_toml(&[], &["dot=127.0.0.1.999".into()], &[], None, None, false).is_err());
+        assert!(quick_toml(&[], &["dot=foo.123".into()], &[], None, None, false).is_err());
 
         for spec in ["https://[::1]/dns-query", "doh3=[2606:4700:4700::1111]"] {
-            let err = quick_toml(&[], &[spec.into()], None, None, false).unwrap_err();
+            let err = quick_toml(&[], &[spec.into()], &[], None, None, false).unwrap_err();
             assert!(err.contains("bootstrap_ip"), "{spec}: {err}");
         }
 
         let query_eq = quick_toml(
             &[],
             &["https://dns.example/dns-query?a=1".into()],
+            &[],
             None,
             None,
             false,
@@ -735,5 +815,137 @@ mod tests {
         let loaded = load_text(&query_eq).unwrap();
         assert_eq!(loaded.config.upstreams[0].proto, Proto::Doh);
         assert_eq!(loaded.config.upstreams[0].path, "/dns-query?a=1");
+    }
+
+    #[test]
+    fn parses_normalizes_and_sorts_split_dns_rules() {
+        let loaded = load_text(
+            "[listener.0]\nip = \"127.0.0.1\"\nport = 53\n\
+             [upstream.0]\nname = \"cloudflare\"\nendpoint = \"https://1.1.1.1/dns-query\"\n\
+             [upstream.10]\nname = \"quad9\"\nendpoint = \"https://9.9.9.9/dns-query\"\n\
+             [split_dns]\n\
+             \"local\" = \"SYSTEM\"\n\
+             \".Corp.Internal.\" = \"10.0.0.1\"\n\
+             \"sub.corp.internal\" = \"cloudflare\"\n\
+             \"b.home.arpa\" = \"upstream.10\"\n\
+             \"c.home.arpa\" = \"[2001:db8::53]\"\n\
+             \"a.home.arpa\" = \"[fd00::53]:5353\"\n",
+        )
+        .unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert_eq!(
+            loaded.config.split_dns,
+            vec![
+                SplitRule {
+                    suffix: "sub.corp.internal".into(),
+                    target: SplitTarget::Upstream(0),
+                },
+                SplitRule {
+                    suffix: "corp.internal".into(),
+                    target: SplitTarget::Direct("10.0.0.1:53".parse().unwrap()),
+                },
+                SplitRule {
+                    suffix: "a.home.arpa".into(),
+                    target: SplitTarget::Direct("[fd00::53]:5353".parse().unwrap()),
+                },
+                SplitRule {
+                    suffix: "b.home.arpa".into(),
+                    target: SplitTarget::Upstream(1),
+                },
+                SplitRule {
+                    suffix: "c.home.arpa".into(),
+                    target: SplitTarget::Direct("[2001:db8::53]:53".parse().unwrap()),
+                },
+                SplitRule {
+                    suffix: "local".into(),
+                    target: SplitTarget::System,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_and_self_loop_split_dns_rules() {
+        let base = "[listener.0]\nip = \"127.0.0.1\"\nport = 53\n\
+                    [upstream.0]\nendpoint = \"https://1.1.1.1/dns-query\"\n";
+
+        for bad_suffix in ["", ".", "..", "a..b", "-bad.local", "bad_.local", "*.local"] {
+            let err = load_text(&format!("{base}[split_dns]\n{bad_suffix:?} = \"system\"\n"))
+                .unwrap_err();
+            assert!(err.contains("[split_dns]"), "{bad_suffix:?}: {err}");
+        }
+
+        let dup = load_text(&format!(
+            "{base}[split_dns]\n\"corp.local\" = \"system\"\n\".CORP.LOCAL.\" = \"10.0.0.1\"\n"
+        ))
+        .unwrap_err();
+        assert!(dup.contains("duplicate"), "{dup}");
+
+        for bad_target in [
+            "unknown-upstream",
+            "10.0.0.1:0",
+            "[fd00::53]:0",
+            "127.0.0.1",
+            "127.0.0.1:53",
+            "[::ffff:127.0.0.1]:53",
+            "0.0.0.0:53",
+            "[::1]:53",
+        ] {
+            let err = load_text(&format!(
+                "{base}[split_dns]\n\"corp.local\" = {bad_target:?}\n"
+            ))
+            .unwrap_err();
+            assert!(err.contains("[split_dns]"), "{bad_target:?}: {err}");
+        }
+
+        let non_loop = load_text(&format!(
+            "{base}[split_dns]\n\"corp.local\" = \"127.0.0.1:5353\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            non_loop.config.split_dns[0].target,
+            SplitTarget::Direct("127.0.0.1:5353".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn quick_toml_validates_split_dns() {
+        let text = quick_toml(
+            &["127.0.0.1:5354".into()],
+            &["doh=https://1.1.1.1/dns-query".into()],
+            &[
+                "corp.local=10.0.0.1".into(),
+                "home.arpa=system".into(),
+                "ts.net=upstream.0".into(),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let loaded = load_text(&text).unwrap();
+        assert_eq!(loaded.config.split_dns.len(), 3);
+        assert!(
+            quick_toml(
+                &[],
+                &["doh=https://1.1.1.1/dns-query".into()],
+                &["missing_equals".into()],
+                None,
+                None,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            quick_toml(
+                &[],
+                &["doh=https://1.1.1.1/dns-query".into()],
+                &["corp.local=system".into(), "corp.local=10.0.0.1".into()],
+                None,
+                None,
+                false,
+            )
+            .is_err()
+        );
     }
 }

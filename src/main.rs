@@ -163,6 +163,7 @@ fn quick_toml(quick: &cli::QuickArgs) -> Result<Option<String>, String> {
     config::quick_toml(
         &quick.listeners,
         &quick.upstreams,
+        &quick.split_dns,
         quick.timeout_ms,
         quick.cache_size,
         quick.no_cache,

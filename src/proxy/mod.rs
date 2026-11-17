@@ -2,7 +2,7 @@
 
 mod cache;
 
-use crate::config::Config;
+use crate::config::{Config, SplitRule, SplitTarget};
 use crate::upstream::Manager;
 use crate::wire;
 use cache::Cache;
@@ -52,6 +52,7 @@ pub async fn serve(config: Config) -> Result<(), String> {
         config.service.cache_enable,
         config.service.cache_size,
     ));
+    let split_rules: Arc<[SplitRule]> = config.split_dns.into();
     let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT));
     let tcp_connections = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
 
@@ -67,12 +68,14 @@ pub async fn serve(config: Config) -> Result<(), String> {
             Arc::new(udp),
             manager.clone(),
             cache.clone(),
+            split_rules.clone(),
             inflight.clone(),
         ));
         tokio::spawn(tcp_loop(
             tcp,
             manager.clone(),
             cache.clone(),
+            split_rules.clone(),
             inflight.clone(),
             tcp_connections.clone(),
         ));
@@ -267,6 +270,7 @@ async fn udp_loop(
     sock: Arc<UdpSocket>,
     manager: Arc<Manager>,
     cache: Arc<Cache>,
+    rules: Arc<[SplitRule]>,
     inflight: Arc<Semaphore>,
 ) {
     // The extra byte detects datagrams clipped by recv_from. Oversized input
@@ -297,17 +301,9 @@ async fn udp_loop(
         let sock = sock.clone();
         let manager = manager.clone();
         let cache = cache.clone();
+        let rules = rules.clone();
         tokio::spawn(async move {
-            let meta = cache.query_meta(&query);
-            let mut response = Vec::new();
-            if !local_response(&cache, &query, meta.as_ref(), &mut response) {
-                response = forward(&manager, &cache, &query, false, meta.as_ref()).await;
-            }
-            wire::truncate_to(
-                &mut response,
-                meta.as_ref()
-                    .map_or_else(|| wire::udp_payload_size(&query), |meta| meta.udp_size),
-            );
+            let response = resolve_query(&manager, &cache, &rules, &query, false).await;
             let _ = sock.send_to(&response, peer).await;
             drop(permit);
         });
@@ -318,6 +314,7 @@ async fn tcp_loop(
     listener: TcpListener,
     manager: Arc<Manager>,
     cache: Arc<Cache>,
+    rules: Arc<[SplitRule]>,
     inflight: Arc<Semaphore>,
     connections: Arc<Semaphore>,
 ) {
@@ -333,10 +330,11 @@ async fn tcp_loop(
                 };
                 let manager = manager.clone();
                 let cache = cache.clone();
+                let rules = rules.clone();
                 let inflight = inflight.clone();
                 tokio::spawn(async move {
                     let _connection = connection;
-                    let _ = tcp_conn(stream, manager, cache, inflight).await;
+                    let _ = tcp_conn(stream, manager, cache, rules, inflight).await;
                 });
             }
             Err(err) => {
@@ -363,6 +361,7 @@ async fn tcp_conn(
     stream: TcpStream,
     manager: Arc<Manager>,
     cache: Arc<Cache>,
+    split_rules: Arc<[SplitRule]>,
     inflight: Arc<Semaphore>,
 ) -> std::io::Result<()> {
     let (mut reader, writer) = stream.into_split();
@@ -409,15 +408,12 @@ async fn tcp_conn(
         }
         let manager = manager.clone();
         let cache = cache.clone();
+        let rules = split_rules.clone();
         let writer = writer.clone();
         let writer_failed = writer_failed.clone();
         pending.spawn(async move {
             let _permits = permits;
-            let meta = cache.query_meta(&query);
-            let mut response = Vec::new();
-            if !local_response(&cache, &query, meta.as_ref(), &mut response) {
-                response = forward(&manager, &cache, &query, true, meta.as_ref()).await;
-            }
+            let response = resolve_query(&manager, &cache, &rules, &query, true).await;
             let frame = tcp_frame(&query, response);
             // Answers may finish out of order; serialize only the complete frame writes.
             let mut guard = writer.lock().await;
@@ -475,22 +471,40 @@ fn local_response(
     false
 }
 
-async fn forward(
+async fn resolve_query(
     manager: &Manager,
     cache: &Cache,
+    rules: &[SplitRule],
     query: &[u8],
     client_tcp: bool,
-    meta: Option<&wire::QueryMeta>,
 ) -> Vec<u8> {
-    let Some(answer) = manager.forward_answer(query, client_tcp).await else {
-        return wire::servfail_response(query);
-    };
-    if answer.cacheable
-        && let Some(meta) = meta
-    {
-        cache.insert(meta, &answer.bytes);
+    let target = wire::match_domain_suffix(query, rules).map(|index| rules[index].target);
+    let bypass_cache = matches!(target, Some(SplitTarget::System | SplitTarget::Direct(_)));
+    let meta = (!bypass_cache).then(|| cache.query_meta(query)).flatten();
+    let mut response = Vec::new();
+    if !local_response(cache, query, meta.as_ref(), &mut response) {
+        let answer = match target {
+            Some(target) => manager.forward_split(query, client_tcp, target).await,
+            None => manager.forward_answer(query, client_tcp).await,
+        };
+        if let Some(answer) = answer {
+            if answer.cacheable
+                && let Some(meta) = meta.as_ref()
+            {
+                cache.insert(meta, &answer.bytes);
+            }
+            response = answer.bytes;
+        } else {
+            response = wire::servfail_response(query);
+        }
     }
-    answer.bytes
+    if !client_tcp {
+        let max_payload = meta
+            .as_ref()
+            .map_or_else(|| wire::udp_payload_size(query), |meta| meta.udp_size);
+        wire::truncate_to(&mut response, max_payload);
+    }
+    response
 }
 
 /// Header-only FORMERR for multi-question queries. The question section is
@@ -517,6 +531,24 @@ async fn wait_for_shutdown() {
 mod tests {
     use super::*;
     use crate::config::{IpStack, Proto, Upstream};
+
+    async fn forward(
+        manager: &Manager,
+        cache: &Cache,
+        query: &[u8],
+        client_tcp: bool,
+        meta: Option<&wire::QueryMeta>,
+    ) -> Vec<u8> {
+        let Some(answer) = manager.forward_answer(query, client_tcp).await else {
+            return wire::servfail_response(query);
+        };
+        if answer.cacheable
+            && let Some(meta) = meta
+        {
+            cache.insert(meta, &answer.bytes);
+        }
+        answer.bytes
+    }
 
     fn multi_question_query() -> Vec<u8> {
         let mut query = vec![0xab, 0xcd, 0x01, 0x00, 0x00, 0x02, 0, 0, 0, 0, 0, 0];
@@ -572,7 +604,13 @@ mod tests {
         let listener = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let listen_addr = listener.local_addr().unwrap();
         let inflight = Arc::new(Semaphore::new(1));
-        let serving = tokio::spawn(udp_loop(listener, manager, cache, inflight.clone()));
+        let serving = tokio::spawn(udp_loop(
+            listener,
+            manager,
+            cache,
+            Arc::from([]),
+            inflight.clone(),
+        ));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(listen_addr).await.unwrap();
         let mut response = [0; 1024];
@@ -739,6 +777,7 @@ mod tests {
                 stream,
                 manager,
                 Arc::new(Cache::new(false, 1)),
+                Arc::from([]),
                 Arc::new(Semaphore::new(2)),
             ));
             let mut query = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
@@ -813,6 +852,7 @@ mod tests {
             stream,
             manager,
             Arc::new(Cache::new(false, 1)),
+            Arc::from([]),
             Arc::new(Semaphore::new(4)),
         ));
 
@@ -887,6 +927,7 @@ mod tests {
             stream,
             manager,
             cache,
+            Arc::from([]),
             Arc::new(Semaphore::new(64)),
         ));
 
@@ -1010,6 +1051,7 @@ mod tests {
             stream,
             manager,
             Arc::new(Cache::new(false, 1)),
+            Arc::from([]),
             global_inflight.clone(),
         ));
 
@@ -1117,5 +1159,202 @@ mod tests {
         assert!(!slow_mode);
         assert_eq!(strikes, 0);
         assert!(ticks_since.is_none());
+    }
+
+    fn named_a_query(id: u16, labels: &[&[u8]]) -> Vec<u8> {
+        let mut q = Vec::from(id.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        for label in labels {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label);
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        q
+    }
+
+    async fn counting_responder(
+        sock: Arc<UdpSocket>,
+        rcode: u8,
+        ttl: u32,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let mut buf = [0u8; 512];
+        while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
+            count.fetch_add(1, Ordering::Relaxed);
+            let mut resp = buf[..n].to_vec();
+            resp[2] = 0x81;
+            resp[3] = 0x80 | rcode;
+            if rcode == 0 {
+                resp[6..8].copy_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+                resp.extend_from_slice(&ttl.to_be_bytes());
+                resp.extend_from_slice(&[0, 4, 10, 0, 0, 1]);
+            } else {
+                resp[8..10].copy_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&[0xc0, 0x0c, 0, 6, 0, 1]);
+                resp.extend_from_slice(&ttl.to_be_bytes());
+                resp.extend_from_slice(&24u16.to_be_bytes());
+                resp.extend_from_slice(&[0xc0, 0x0c, 0xc0, 0x0c]);
+                resp.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4]);
+                resp.extend_from_slice(&ttl.to_be_bytes());
+            }
+            let _ = sock.send_to(&resp, peer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn split_dns_end_to_end_system_upstream_and_direct_with_cache_policy() {
+        use std::sync::atomic::AtomicUsize;
+
+        let default_up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let split_up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let sys_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let direct_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let split_hits = Arc::new(AtomicUsize::new(0));
+        let sys_hits = Arc::new(AtomicUsize::new(0));
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+
+        let t1 = tokio::spawn(counting_responder(
+            split_up.clone(),
+            0,
+            60,
+            split_hits.clone(),
+        ));
+        let t2 = tokio::spawn(counting_responder(
+            sys_sock.clone(),
+            3,
+            120,
+            sys_hits.clone(),
+        ));
+        let t3 = tokio::spawn(counting_responder(
+            direct_sock.clone(),
+            0,
+            45,
+            direct_hits.clone(),
+        ));
+
+        let up0 = Upstream {
+            name: "default".into(),
+            proto: Proto::Legacy,
+            host: default_up.local_addr().unwrap().ip().to_string(),
+            port: default_up.local_addr().unwrap().port(),
+            path: String::new(),
+            bootstrap_ip: Some(default_up.local_addr().unwrap().ip()),
+            timeout_ms: 500,
+            ip_stack: IpStack::Both,
+        };
+        let up1 = Upstream {
+            name: "corp".into(),
+            proto: Proto::Legacy,
+            host: split_up.local_addr().unwrap().ip().to_string(),
+            port: split_up.local_addr().unwrap().port(),
+            path: String::new(),
+            bootstrap_ip: Some(split_up.local_addr().unwrap().ip()),
+            timeout_ms: 500,
+            ip_stack: IpStack::Both,
+        };
+        let manager = Arc::new(
+            Manager::new(vec![up0, up1], &[], vec![sys_sock.local_addr().unwrap()]).unwrap(),
+        );
+        let cache = Arc::new(Cache::new(true, 16));
+        let rules: Arc<[SplitRule]> = Arc::from([
+            SplitRule {
+                suffix: "corp.example".into(),
+                target: SplitTarget::Upstream(1),
+            },
+            SplitRule {
+                suffix: "home.arpa".into(),
+                target: SplitTarget::System,
+            },
+            SplitRule {
+                suffix: "lan".into(),
+                target: SplitTarget::Direct(direct_sock.local_addr().unwrap()),
+            },
+        ]);
+
+        // 1) Upstream split rule uses shared cache.
+        let q_up = named_a_query(1, &[b"app", b"corp", b"example"]);
+        let r1 = resolve_query(&manager, &cache, &rules, &q_up, false).await;
+        let r2 = resolve_query(&manager, &cache, &rules, &q_up, false).await;
+        assert_eq!(r1[3] & 0x0f, 0);
+        assert_eq!(r2, r1);
+        assert_eq!(split_hits.load(Ordering::Relaxed), 1);
+
+        // 2) System split rule bypasses cache, preserves 120s negative TTL (no 5s rewrite),
+        //    still rejects multi-question with FORMERR, and returns SERVFAIL when fallback is empty.
+        let q_sys = named_a_query(2, &[b"nas", b"home", b"arpa"]);
+        let s1 = resolve_query(&manager, &cache, &rules, &q_sys, false).await;
+        let s2 = resolve_query(&manager, &cache, &rules, &q_sys, false).await;
+        assert_eq!(s1[3] & 0x0f, 3);
+        assert_eq!(s2, s1);
+        assert_eq!(sys_hits.load(Ordering::Relaxed), 2);
+        // SOA RR TTL at offset q_sys.len() + 6 must remain 120 (not rewritten to 5).
+        let ttl_off = q_sys.len() + 6;
+        assert_eq!(
+            u32::from_be_bytes(s1[ttl_off..ttl_off + 4].try_into().unwrap()),
+            120
+        );
+
+        let mut multi_sys = q_sys.clone();
+        multi_sys[4..6].copy_from_slice(&2u16.to_be_bytes());
+        multi_sys.extend_from_slice(&[1, b'x', 0, 0, 1, 0, 1]);
+        let formerr_resp = resolve_query(&manager, &cache, &rules, &multi_sys, false).await;
+        assert_eq!(formerr_resp.len(), 12);
+        assert_eq!(formerr_resp[3] & 0x0f, 1);
+        assert_eq!(sys_hits.load(Ordering::Relaxed), 2);
+
+        manager.set_system_fallback(Vec::new());
+        let sf = resolve_query(&manager, &cache, &rules, &q_sys, false).await;
+        assert_eq!(sf[3] & 0x0f, 2);
+
+        // 3) Direct split rule works over TCP and bypasses shared cache,
+        //    and preserves client EDNS UDP payload size on UDP.
+        let q_dir = named_a_query(3, &[b"printer", b"lan"]);
+        let d1 = resolve_query(&manager, &cache, &rules, &q_dir, true).await;
+        let d2 = resolve_query(&manager, &cache, &rules, &q_dir, true).await;
+        assert_eq!(d1[3] & 0x0f, 0);
+        assert_eq!(d2, d1);
+        assert_eq!(direct_hits.load(Ordering::Relaxed), 2);
+
+        let big_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let big_addr = big_sock.local_addr().unwrap();
+        let big_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = big_sock.recv_from(&mut buf).await.unwrap();
+                let mut resp = buf[..n].to_vec();
+                resp[2] = 0x81;
+                resp[3] = 0x80;
+                resp[6..8].copy_from_slice(&40u16.to_be_bytes());
+                resp[10..12].fill(0);
+                resp.truncate(q_dir.len());
+                for _ in 0..40 {
+                    resp.extend_from_slice(&[
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 1,
+                    ]);
+                }
+                big_sock.send_to(&resp, peer).await.unwrap();
+            }
+        });
+        let big_rules = [SplitRule {
+            suffix: "big.lan".into(),
+            target: SplitTarget::Direct(big_addr),
+        }];
+        let q_small_udp = named_a_query(4, &[b"srv", b"big", b"lan"]);
+        let trunc = resolve_query(&manager, &cache, &big_rules, &q_small_udp, false).await;
+        assert!(trunc.len() <= 512 && trunc[2] & 0x02 != 0);
+
+        let mut q_edns = named_a_query(5, &[b"srv", b"big", b"lan"]);
+        q_edns[11] = 1;
+        q_edns.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        let full = resolve_query(&manager, &cache, &big_rules, &q_edns, false).await;
+        assert!(full.len() > 512 && full[2] & 0x02 == 0);
+        big_task.await.unwrap();
+        assert!(default_up.try_recv_from(&mut [0u8; 512]).is_err());
+
+        for t in [t1, t2, t3] {
+            t.abort();
+        }
     }
 }

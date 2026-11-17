@@ -2,7 +2,7 @@ pub mod bootstrap;
 pub mod encrypted;
 pub mod legacy;
 
-use crate::config::{IpStack, Proto, Upstream};
+use crate::config::{IpStack, Proto, SplitTarget, Upstream};
 use bootstrap::Bootstrap;
 use hickory_net::proto::op::{Message, MessageType, OpCode};
 use std::borrow::Cow;
@@ -27,6 +27,7 @@ const HEDGE_DELAY: Duration = Duration::from_millis(300);
 /// Ordered-failover view over the configured upstreams.
 pub struct Manager {
     entries: Vec<Arc<Entry>>,
+    listeners: Arc<Vec<SocketAddr>>,
     attempts: Arc<Semaphore>,
     system_attempts: Semaphore,
     /// Runtime-refreshable: the watchdog swaps in the current network's DNS
@@ -77,6 +78,22 @@ impl<'a> Request<'a> {
             })
             .as_ref()
             .map_err(|&rcode| rcode)
+    }
+
+    fn encrypted_error(&self, entries: &[Arc<Entry>]) -> Option<Answer> {
+        let has_encrypted = entries
+            .iter()
+            .any(|entry| matches!(entry.backend, Backend::Encrypted(_)));
+        if !has_encrypted {
+            return None;
+        }
+        match self.message() {
+            Ok(_) => None,
+            Err(rcode) => Some(Answer {
+                bytes: crate::wire::error_response(&self.bytes, rcode),
+                cacheable: false,
+            }),
+        }
     }
 }
 
@@ -154,6 +171,7 @@ impl Manager {
         }
         Ok(Self {
             entries,
+            listeners: deny,
             attempts: Arc::new(Semaphore::new(MAX_ATTEMPTS)),
             system_attempts: Semaphore::new(MAX_SYSTEM_ATTEMPTS),
             system_fallback: std::sync::RwLock::new(system_fallback),
@@ -177,22 +195,14 @@ impl Manager {
             return None;
         }
         let request = Request::new(query);
-        if self
-            .entries
-            .iter()
-            .any(|entry| matches!(entry.backend, Backend::Encrypted(_)))
-            && let Err(rcode) = request.message()
-        {
-            return Some(Answer {
-                bytes: crate::wire::error_response(query, rcode),
-                cacheable: false,
-            });
+        if let Some(answer) = request.encrypted_error(&self.entries) {
+            return Some(answer);
         }
         let outcome = if let [entry] = self.entries.as_slice() {
             // No task, owned query copy, or JoinSet for the common single-upstream case.
             if let Ok(_permit) = self.attempts.try_acquire() {
                 let result = entry.run(&request, client_tcp, None).await;
-                match self.configured_answer(entry, query, result) {
+                match self.configured_answer(entry, query, result, true) {
                     Some(bytes) => ConfiguredOutcome::Answered(bytes),
                     None => ConfiguredOutcome::AllFailed,
                 }
@@ -210,15 +220,52 @@ impl Manager {
             }),
             // Overload on configured upstreams must fail closed, never via plaintext DNS.
             ConfiguredOutcome::BudgetExhausted => None,
-            ConfiguredOutcome::AllFailed => {
-                self.forward_to_system(query, client_tcp)
-                    .await
-                    .map(|bytes| Answer {
-                        bytes,
-                        cacheable: false,
-                    })
-            }
+            ConfiguredOutcome::AllFailed => self
+                .query_system_servers(query, client_tcp, true)
+                .await
+                .map(|bytes| Answer {
+                    bytes,
+                    cacheable: false,
+                }),
         }
+    }
+
+    /// Forward a split-DNS query to its matched target without failover or fallback.
+    pub async fn forward_split(
+        &self,
+        query: &[u8],
+        client_tcp: bool,
+        target: SplitTarget,
+    ) -> Option<Answer> {
+        if query.len() < 12 || query[2] & 0x80 != 0 {
+            return None;
+        }
+        let (bytes, cacheable) = match target {
+            SplitTarget::System => (
+                self.query_system_servers(query, client_tcp, false).await?,
+                false,
+            ),
+            SplitTarget::Upstream(index) => {
+                let entry = self.entries.get(index)?;
+                let request = Request::new(query);
+                if let Some(answer) = request.encrypted_error(std::slice::from_ref(entry)) {
+                    return Some(answer);
+                }
+                let _permit = self.attempts.try_acquire().ok()?;
+                let result = entry.run(&request, client_tcp, None).await;
+                (self.configured_answer(entry, query, result, false)?, true)
+            }
+            SplitTarget::Direct(addr) if !is_self_address(addr, &self.listeners) => {
+                let _permit = self.attempts.try_acquire().ok()?;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    legacy::query(addr, query, client_tcp),
+                );
+                (result.await.ok()?.ok()?, false)
+            }
+            SplitTarget::Direct(_) => return None,
+        };
+        Some(Answer { bytes, cacheable })
     }
 
     #[cfg(test)]
@@ -294,6 +341,7 @@ impl Manager {
                             &self.entries[index],
                             shared.bytes.as_ref(),
                             result,
+                            true,
                         ) {
                             if response[3] & 0x0f != 2 {
                                 return ConfiguredOutcome::Answered(response);
@@ -321,7 +369,8 @@ impl Manager {
                     continue;
                 }
             };
-            let Some(response) = self.configured_answer(&self.entries[index], query, result) else {
+            let Some(response) = self.configured_answer(&self.entries[index], query, result, true)
+            else {
                 continue;
             };
             if response[3] & 0x0f == 2 {
@@ -350,6 +399,7 @@ impl Manager {
         entry: &Entry,
         query: &[u8],
         result: Result<Vec<u8>, String>,
+        track_fallback: bool,
     ) -> Option<Vec<u8>> {
         let name = &entry.name;
         let mut response = match result {
@@ -362,7 +412,7 @@ impl Manager {
         };
         // Every backend validates before returning from Entry::attempt. Do not
         // parse the same question again here; this layer only selects answers.
-        if response[3] & 0x0f != 2 {
+        if track_fallback && response[3] & 0x0f != 2 {
             let fallback_was_active = self.fallback_active.swap(false, Ordering::Relaxed);
             let fallback_had_failed = self.fallback_failed.swap(false, Ordering::Relaxed);
             if fallback_was_active {
@@ -385,13 +435,18 @@ impl Manager {
         failures.join("; ")
     }
 
-    async fn forward_to_system(&self, query: &[u8], client_tcp: bool) -> Option<Vec<u8>> {
+    async fn query_system_servers(
+        &self,
+        query: &[u8],
+        client_tcp: bool,
+        track_fallback: bool,
+    ) -> Option<Vec<u8>> {
         let _permit = self.system_attempts.try_acquire().ok()?;
         // Snapshot and drop the guard before any await: the read guard is not
         // Send, and holding it would also block the watchdog's refresh.
         let system_fallback: Vec<SocketAddr> = self.system_fallback.read().unwrap().clone();
         if system_fallback.is_empty() {
-            if !self.fallback_failed.swap(true, Ordering::Relaxed) {
+            if track_fallback && !self.fallback_failed.swap(true, Ordering::Relaxed) {
                 log::warn!(
                     "all configured upstreams failed ({}) and no system DNS fallback is available; returning SERVFAIL",
                     self.failure_summary()
@@ -399,7 +454,7 @@ impl Manager {
             }
             return None;
         }
-        if !self.fallback_active.swap(true, Ordering::Relaxed) {
+        if track_fallback && !self.fallback_active.swap(true, Ordering::Relaxed) {
             log::warn!(
                 "all configured upstreams failed ({}); using pre-takeover system DNS directly",
                 self.failure_summary()
@@ -414,7 +469,7 @@ impl Manager {
                         log::debug!("system DNS fallback {server}: SERVFAIL");
                         continue;
                     }
-                    if self.fallback_failed.swap(false, Ordering::Relaxed) {
+                    if track_fallback && self.fallback_failed.swap(false, Ordering::Relaxed) {
                         log::info!("system DNS fallback recovered");
                     }
                     return Some(response);
@@ -423,7 +478,7 @@ impl Manager {
                 Err(_) => log::debug!("system DNS fallback {server}: timeout after 2000ms"),
             }
         }
-        if !self.fallback_failed.swap(true, Ordering::Relaxed) {
+        if track_fallback && !self.fallback_failed.swap(true, Ordering::Relaxed) {
             log::warn!("system DNS fallback also failed; returning SERVFAIL");
         }
         None
@@ -517,7 +572,7 @@ impl Entry {
 }
 
 /// One self-dial rule for literal, bootstrap-resolved, and encrypted targets.
-fn is_self_address(addr: SocketAddr, listeners: &[SocketAddr]) -> bool {
+pub(crate) fn is_self_address(addr: SocketAddr, listeners: &[SocketAddr]) -> bool {
     let ip = addr.ip().to_canonical();
     listeners.iter().any(|listener| {
         listener.port() == addr.port()
@@ -1315,5 +1370,66 @@ mod tests {
         responder.await.unwrap();
         let mut buf = [0u8; 512];
         assert!(blackhole.try_recv_from(&mut buf).is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_split_routes_system_upstream_and_direct_without_fallback_state() {
+        let primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (secondary_addr, secondary_task) = udp_responder(false).await;
+        let (system_addr, system_task) = udp_responder(false).await;
+        let (direct_addr, direct_task) = udp_responder(false).await;
+        let listener_addr: SocketAddr = "127.0.0.1:5354".parse().unwrap();
+
+        let manager = Manager::new(
+            vec![
+                test_upstream("primary", primary.local_addr().unwrap(), 100),
+                test_upstream("secondary", secondary_addr, 200),
+            ],
+            &[listener_addr],
+            vec![system_addr],
+        )
+        .unwrap();
+
+        let sys_ans = manager
+            .forward_split(&labeled_query(1), false, SplitTarget::System)
+            .await
+            .unwrap();
+        assert!(!sys_ans.cacheable);
+        assert!(!manager.fallback_active.load(Ordering::Relaxed));
+        assert!(!manager.fallback_failed.load(Ordering::Relaxed));
+        system_task.await.unwrap();
+
+        manager.set_system_fallback(Vec::new());
+        assert!(
+            manager
+                .forward_split(&labeled_query(2), false, SplitTarget::System)
+                .await
+                .is_none()
+        );
+        assert!(!manager.fallback_failed.load(Ordering::Relaxed));
+
+        manager.fallback_active.store(true, Ordering::Relaxed);
+        let up_ans = manager
+            .forward_split(&labeled_query(3), false, SplitTarget::Upstream(1))
+            .await
+            .unwrap();
+        assert!(up_ans.cacheable);
+        assert!(manager.fallback_active.load(Ordering::Relaxed));
+        secondary_task.await.unwrap();
+
+        let direct_ans = manager
+            .forward_split(&labeled_query(4), false, SplitTarget::Direct(direct_addr))
+            .await
+            .unwrap();
+        assert!(!direct_ans.cacheable);
+        direct_task.await.unwrap();
+
+        assert!(
+            manager
+                .forward_split(&labeled_query(5), false, SplitTarget::Direct(listener_addr))
+                .await
+                .is_none()
+        );
+        assert!(primary.try_recv_from(&mut [0u8; 512]).is_err());
     }
 }
