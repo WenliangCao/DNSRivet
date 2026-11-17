@@ -93,7 +93,7 @@ archive_root="$work_dir/dnsrivet-v${version}-macos-universal2"
 /bin/cp "$project_root/README.md" "$project_root/LICENSE" "$archive_root/"
 
 /bin/mkdir -p "$dist_dir"
-/usr/bin/find "$dist_dir" -mindepth 1 -maxdepth 1 -delete
+/usr/bin/find "$dist_dir" -mindepth 1 -delete
 archive="$dist_dir/dnsrivet-v${version}-macos-universal2.zip"
 (
     cd "$work_dir"

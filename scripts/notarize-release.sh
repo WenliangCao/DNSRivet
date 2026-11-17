@@ -61,8 +61,9 @@ fi
 
 # Stapling changes the PKG bytes, so release checksums must be generated only
 # after notarization is complete.
-checksum_dir=$(dirname -- "$package")
-if [ "$(dirname -- "$archive")" != "$checksum_dir" ]; then
+checksum_dir=$(CDPATH='' cd -- "$(dirname -- "$package")" && pwd -P)
+archive_dir=$(CDPATH='' cd -- "$(dirname -- "$archive")" && pwd -P)
+if [ "$archive_dir" != "$checksum_dir" ]; then
     echo "PKG and ZIP must be in the same release directory" >&2
     exit 1
 fi

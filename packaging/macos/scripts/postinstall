@@ -12,7 +12,7 @@ command_path="/usr/local/bin/dnsrivet"
 label="system/io.github.wenliangcao.dnsrivet"
 
 /bin/mkdir -p /usr/local/bin
-if [ ! -L "$command_path" ]; then
+if [ ! -e "$command_path" ] && [ ! -L "$command_path" ]; then
     /bin/ln -s "$binary" "$command_path"
 fi
 

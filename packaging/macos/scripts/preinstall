@@ -18,9 +18,16 @@ if [ -e "$homebrew_arm" ] || [ -L "$homebrew_arm" ]; then
 fi
 
 if [ -L "$command_path" ]; then
-    if [ "$(readlink "$command_path")" = "$managed_binary" ]; then
-        exit 0
-    fi
+    target=$(readlink "$command_path" || true)
+    case "$target" in
+        "$managed_binary")
+            exit 0
+            ;;
+        *Cellar/dnsrivet/*|*Cellar/dnsrivet)
+            echo "DNSRivet is already installed by Homebrew. Run 'brew uninstall dnsrivet' before installing the PKG." >&2
+            exit 1
+            ;;
+    esac
     echo "Refusing to replace existing command link: /usr/local/bin/dnsrivet" >&2
     exit 1
 fi

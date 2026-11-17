@@ -79,6 +79,7 @@ jobs:
           done
 
           work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT HUP INT TERM
           /usr/bin/unzip -q "$archive" -d "$work"
           binary=$(/usr/bin/find "$work" -type f -name dnsrivet -perm -111 -print -quit)
           if [ -z "$binary" ]; then
@@ -122,7 +123,7 @@ jobs:
           trap 'rm -rf "$keydir"' EXIT HUP INT TERM
           printf '%s\n' "$DEPLOY_KEY" > "$keydir/id_ed25519"
           chmod 600 "$keydir/id_ed25519"
-          export GIT_SSH_COMMAND="ssh -i $keydir/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          export GIT_SSH_COMMAND="ssh -i \"$keydir/id_ed25519\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
           git clone --depth 1 git@github.com:dnsrivet/homebrew-tap.git tap
           cp rendered/dnsrivet.rb tap/Formula/dnsrivet.rb
