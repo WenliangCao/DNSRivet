@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::upstream::Manager;
 use crate::wire;
 use cache::Cache;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -95,37 +96,48 @@ pub async fn serve(config: Config) -> Result<(), String> {
     Ok(())
 }
 
+fn current_route_source() -> Option<IpAddr> {
+    crate::upstream::encrypted::route_source(SocketAddr::from(([1, 1, 1, 1], 53))).or_else(|| {
+        crate::upstream::encrypted::route_source(SocketAddr::from((
+            [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111],
+            53,
+        )))
+    })
+}
+
 /// Route checks do not send packets; spawn ipconfig only after a source change.
-async fn fallback_refresh_loop(listeners: Vec<std::net::SocketAddr>, manager: Arc<Manager>) {
-    let mut previous = None;
+async fn fallback_refresh_loop(listeners: Vec<SocketAddr>, manager: Arc<Manager>) {
+    let mut previous = current_route_source();
+    let mut retries = 0u8;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let source = crate::upstream::encrypted::route_source("1.1.1.1:53".parse().unwrap())
-            .or_else(|| {
-                crate::upstream::encrypted::route_source(
-                    "[2606:4700:4700::1111]:53".parse().unwrap(),
-                )
-            });
-        if source == previous {
-            continue;
+        let source = current_route_source();
+        if let Some(current) = source
+            && source != previous
+        {
+            let listeners = listeners.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::osdns::dhcp_fallback(current, &listeners)
+            })
+            .await
+            {
+                Ok(Ok(servers)) => {
+                    log::info!("route changed; runtime system DNS fallback refreshed: {servers:?}");
+                    manager.set_system_fallback(servers);
+                }
+                Ok(Err(err)) if retries < 3 => {
+                    log::debug!("runtime DHCP DNS fallback not refreshed: {err}");
+                    retries += 1;
+                    continue;
+                }
+                Ok(Err(err)) => log::debug!("runtime DHCP DNS fallback not refreshed: {err}"),
+                Err(err) => log::warn!("runtime DHCP DNS refresh task failed: {err}"),
+            }
         }
         previous = source;
-        let Some(source) = source else {
-            continue;
-        };
-        let listeners = listeners.clone();
-        match tokio::task::spawn_blocking(move || crate::osdns::dhcp_fallback(source, &listeners))
-            .await
-        {
-            Ok(Ok(servers)) => {
-                log::info!("route changed; runtime system DNS fallback refreshed: {servers:?}");
-                manager.set_system_fallback(servers);
-            }
-            Ok(Err(err)) => log::debug!("runtime DHCP DNS fallback not refreshed: {err}"),
-            Err(err) => log::warn!("runtime DHCP DNS refresh task failed: {err}"),
-        }
+        retries = 0;
     }
 }
 
@@ -133,7 +145,7 @@ async fn fallback_refresh_loop(listeners: Vec<std::net::SocketAddr>, manager: Ar
 /// (a macOS update rewriting network preferences, another tool) removed it.
 /// The first tick fires immediately, so a daemon restarted while DNS is
 /// already drifted recovers in seconds rather than a full interval.
-async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
+async fn watchdog_loop(server: IpAddr, manager: Arc<Manager>) {
     if !nix::unistd::geteuid().is_root() {
         log::info!("takeover watchdog inactive: not running as root");
         return;
@@ -148,7 +160,10 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
         interval.tick().await;
         let stamp = crate::osdns::watchdog_stamp();
         if stamp.is_some() && stamp == last_stamp {
-            record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes);
+            if record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes, &mut slow_mode) {
+                set_watchdog_interval(&mut interval, WATCHDOG_INTERVAL);
+                log::info!("DNS settings stable again; watchdog back to normal cadence");
+            }
             continue;
         }
         // networksetup/scutil are blocking subprocess calls; keep them off
@@ -162,7 +177,7 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                 }
             };
         if outcome.is_ok() {
-            last_stamp = stamp;
+            last_stamp = crate::osdns::watchdog_stamp();
         }
         match outcome {
             Ok(crate::osdns::TickOutcome::NotActive) => {
@@ -178,16 +193,10 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                 } else if let Some(reason) = capture_error {
                     log::debug!("runtime system DNS fallback not refreshed: {reason}");
                 }
-                if slow_mode {
-                    slow_mode = false;
-                    flap_strikes = 0;
-                    ticks_since_reassert = None;
-                    interval = tokio::time::interval(WATCHDOG_INTERVAL);
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    interval.reset();
+                if record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes, &mut slow_mode)
+                {
+                    set_watchdog_interval(&mut interval, WATCHDOG_INTERVAL);
                     log::info!("DNS settings stable again; watchdog back to normal cadence");
-                } else {
-                    record_stable_tick(&mut ticks_since_reassert, &mut flap_strikes);
                 }
             }
             Ok(crate::osdns::TickOutcome::Reasserted {
@@ -217,9 +226,7 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
                 ticks_since_reassert = Some(0);
                 if flap_strikes >= FLAP_STRIKES && !slow_mode {
                     slow_mode = true;
-                    interval = tokio::time::interval(WATCHDOG_SLOW_INTERVAL);
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    interval.reset();
+                    set_watchdog_interval(&mut interval, WATCHDOG_SLOW_INTERVAL);
                     log::warn!(
                         "DNS settings keep being rewritten externally; another DNS manager may be active — checking every {}s from now on",
                         WATCHDOG_SLOW_INTERVAL.as_secs()
@@ -231,14 +238,29 @@ async fn watchdog_loop(server: std::net::IpAddr, manager: Arc<Manager>) {
     }
 }
 
-fn record_stable_tick(ticks_since_reassert: &mut Option<u32>, flap_strikes: &mut u32) {
+fn set_watchdog_interval(interval: &mut tokio::time::Interval, period: Duration) {
+    *interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.reset();
+}
+
+fn record_stable_tick(
+    ticks_since_reassert: &mut Option<u32>,
+    flap_strikes: &mut u32,
+    slow_mode: &mut bool,
+) -> bool {
     if let Some(ticks) = ticks_since_reassert {
         *ticks += 1;
         if *ticks >= FLAP_WINDOW_TICKS {
             *ticks_since_reassert = None;
             *flap_strikes = 0;
+            if *slow_mode {
+                *slow_mode = false;
+                return true;
+            }
         }
     }
+    false
 }
 
 async fn udp_loop(
@@ -1067,5 +1089,33 @@ mod tests {
         assert_eq!(resp[3], 0x82);
         assert_eq!(&resp[4..12], &[0, 1, 0, 0, 0, 0, 0, 0]);
         wire::validate_response(&query, &resp).unwrap();
+    }
+
+    #[test]
+    fn record_stable_tick_exits_slow_mode_after_flap_window() {
+        let mut ticks_since = Some(0);
+        let mut strikes = FLAP_STRIKES;
+        let mut slow_mode = true;
+
+        assert!(!record_stable_tick(
+            &mut ticks_since,
+            &mut strikes,
+            &mut slow_mode
+        ));
+        assert!(slow_mode);
+        assert!(!record_stable_tick(
+            &mut ticks_since,
+            &mut strikes,
+            &mut slow_mode
+        ));
+        assert!(slow_mode);
+        assert!(record_stable_tick(
+            &mut ticks_since,
+            &mut strikes,
+            &mut slow_mode
+        ));
+        assert!(!slow_mode);
+        assert_eq!(strikes, 0);
+        assert!(ticks_since.is_none());
     }
 }

@@ -612,8 +612,9 @@ fn parse_scutil_global_dns(text: &str) -> Result<Vec<SocketAddr>, String> {
             domain_scoped = true;
         } else if line.starts_with("nameserver[")
             && let Some((_, value)) = line.split_once(':')
+            && let Ok(addr) = parse_dns_socket(value.trim())
         {
-            pending.push(parse_dns_socket(value.trim())?);
+            pending.push(addr);
         }
     }
     commit(&mut pending, &mut domain_scoped, &mut servers);
@@ -721,21 +722,41 @@ pub fn dhcp_fallback(source: IpAddr, listeners: &[SocketAddr]) -> Result<Vec<Soc
             })
         })
         .ok_or_else(|| format!("no interface found for route source {source}"))?;
-    let output = run(
-        "/usr/sbin/ipconfig",
-        &["getoption", &interface.interface_name, "domain_name_server"],
-    )?;
-    let text = stdout(&output, "read DHCP DNS")?;
-    let servers = text
-        .split_whitespace()
-        .filter_map(|value| parse_dns_socket(value).ok())
-        .collect();
     let denied: Vec<_> = listeners.iter().map(SocketAddr::ip).collect();
-    let servers = filter_fallback_servers(servers, &denied);
+    let mut servers = run(
+        "/usr/sbin/ipconfig",
+        &["getsummary", &interface.interface_name],
+    )
+    .and_then(|output| stdout(&output, "read DHCP summary"))
+    .map(|text| filter_fallback_servers(parse_ipconfig_summary(&text), &denied))
+    .unwrap_or_default();
+    if servers.is_empty() {
+        let output = run(
+            "/usr/sbin/ipconfig",
+            &["getoption", &interface.interface_name, "domain_name_server"],
+        )?;
+        let candidates = stdout(&output, "read DHCP DNS")?
+            .split_whitespace()
+            .filter_map(|value| parse_dns_socket(value).ok())
+            .collect();
+        servers = filter_fallback_servers(candidates, &denied);
+    }
     if servers.is_empty() {
         return Err("DHCP reported no usable DNS server".into());
     }
     Ok(servers)
+}
+
+fn parse_ipconfig_summary(text: &str) -> Vec<SocketAddr> {
+    text.lines()
+        .filter_map(|line| line.trim().split_once(':'))
+        .filter(|(key, _)| {
+            key.trim().starts_with("domain_name_server")
+                || key.trim().starts_with("DNS_SERVERS (23)")
+        })
+        .flat_map(|(_, value)| value.trim_matches([' ', '{', '}']).split([',', ' ', '\t']))
+        .filter_map(|token| parse_dns_socket(token).ok())
+        .collect()
 }
 
 fn get_dns_servers(service: &str) -> Result<Vec<String>, String> {
@@ -1086,13 +1107,16 @@ resolver #1
 
     impl RestoreFixture {
         fn new(backup: &Backup, current: &[(&str, &[&str])]) -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
-                "dnsrivet-restore-test-{}-{}",
+                "dnsrivet-restore-test-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                seq
             ));
             std::fs::create_dir(&root).unwrap();
             let path = root.join("dns-backup.toml");
@@ -1532,5 +1556,59 @@ resolver #1
         assert!(error.contains("switch back to"));
         let decoded: Backup = toml::from_str(&toml::to_string(&backup).unwrap()).unwrap();
         assert_eq!(decoded.location.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn parse_ipconfig_summary_extracts_multi_server_ipv4_and_dhcpv6_dns() {
+        let summary = r#"
+<dictionary> {
+  IPv4 : <array> {
+    0 : <dictionary> {
+      DHCP : <dictionary> {
+        router (ip_mult): {192.168.1.1}
+        domain_name_server (ip_mult): {192.168.1.1, 8.8.8.8, 1.1.1.1}
+      }
+    }
+  }
+  IPv6 : <array> {
+    0 : <dictionary> {
+      DHCPv6 : <dictionary> {
+        Options[3] = {
+          SERVERID (2) Length 18: DUID UUID ABBB
+          DNS_SERVERS (23) Length 32: fdfd:3b1d:1c26::1, 2001:4860:4860::8888
+        }
+      }
+    }
+  }
+}
+"#;
+        assert_eq!(
+            parse_ipconfig_summary(summary),
+            [
+                "192.168.1.1:53".parse::<SocketAddr>().unwrap(),
+                "8.8.8.8:53".parse::<SocketAddr>().unwrap(),
+                "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+                "[fdfd:3b1d:1c26::1]:53".parse::<SocketAddr>().unwrap(),
+                "[2001:4860:4860::8888]:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn global_parser_skips_stale_unparseable_nameserver_entry() {
+        let text = r#"
+DNS configuration
+resolver #1
+  nameserver[0] : fe80::1%nonexistent_iface_99
+  nameserver[1] : 1.1.1.1
+  nameserver[2] : 8.8.8.8
+"#;
+        assert_eq!(
+            parse_scutil_global_dns(text).unwrap(),
+            [
+                "1.1.1.1:53".parse::<SocketAddr>().unwrap(),
+                "8.8.8.8:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
     }
 }
