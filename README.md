@@ -106,12 +106,12 @@ The Python load generator and OS scheduling can limit throughput; compare repeat
 runs on the same machine rather than treating these as maximum-capacity results.
 CPU time includes startup and shutdown, amortized over the query count.
 
-Focused in-process checks (prefix Cargo commands with `mbx` when using its cache):
+Focused in-process checks:
 
 ```bash
-mbx test --release benchmark_cache_hits -- --ignored --nocapture
-mbx test --release benchmark_wire_validation -- --ignored --nocapture
-mbx test --release benchmark_encrypted_dispatch -- --ignored --nocapture
+cargo test --release benchmark_cache_hits -- --ignored --nocapture
+cargo test --release benchmark_wire_validation -- --ignored --nocapture
+cargo test --release benchmark_encrypted_dispatch -- --ignored --nocapture
 ```
 
 The encrypted benchmark measures warm local dispatch, not TLS or network latency.
@@ -125,8 +125,8 @@ Requirements: macOS 11 or later and stable Rust.
 ```bash
 git clone https://github.com/WenliangCao/DNSRivet.git
 cd DNSRivet
-mbx test --all-targets --all-features
-mbx build --release
+cargo test --all-targets --all-features
+cargo build --release
 ./target/release/dnsrivet version
 ```
 
@@ -530,8 +530,8 @@ macOS 27.0 开发机，测试包含 200 次缓存查询和 40 次
 需要 macOS 11 或更高版本以及稳定版 Rust：
 
 ```bash
-mbx test --all-targets --all-features
-mbx build --release
+cargo test --all-targets --all-features
+cargo build --release
 cp example.config.toml dnsrivet.toml
 ./target/release/dnsrivet run --config dnsrivet.toml
 ```

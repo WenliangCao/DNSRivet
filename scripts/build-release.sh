@@ -6,7 +6,7 @@ dist_dir="$project_root/dist"
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/dnsrivet-release.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-mbx="${MBX:-$HOME/.cargo/bin/mbx}"
+cargo="${DNSRIVET_CARGO:-cargo}"
 if [ -n "${RUSTUP:-}" ]; then
     rustup=$RUSTUP
 elif [ -x "$HOME/.cargo/bin/rustup" ]; then
@@ -21,8 +21,8 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo "release packages can only be built on macOS" >&2
     exit 1
 fi
-if [ ! -x "$mbx" ]; then
-    echo "mbx not found: $mbx" >&2
+if ! command -v "$cargo" >/dev/null 2>&1; then
+    echo "cargo not found: $cargo" >&2
     exit 1
 fi
 if [ ! -x "$rustup" ]; then
@@ -58,10 +58,10 @@ fi
 "$rustup" target add --toolchain stable aarch64-apple-darwin x86_64-apple-darwin
 
 cd "$project_root"
-"$mbx" +stable test --all-targets --all-features --locked
+"$cargo" +stable test --all-targets --all-features --locked
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
-    "$mbx" +stable build --release --locked --target "$target"
-    # Work on copies: mbx may share the target artifact with other checkouts.
+    "$cargo" +stable build --release --locked --target "$target"
+    # Work on copies: the build directory may be shared with other checkouts.
     slice="$work_dir/dnsrivet-$target"
     /bin/cp "$project_root/target/$target/release/dnsrivet" "$slice"
     /usr/bin/strip "$slice"
