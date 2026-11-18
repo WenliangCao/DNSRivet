@@ -29,45 +29,43 @@ One binary. One runtime thread. No telemetry. No control plane.
 - Native `launchd` service management
 - One-line CLI configuration backed by the same TOML validation path
 
-## 0.4.2 changes
+## 0.4.3 changes
 
-- Renew encrypted connections when the route source changes; discard cooldown
-  and bootstrap failure state after network recovery. A query interrupted by
-  sleep or a route change gets one fresh-connection retry bounded to two seconds
-- Preserve configured SERVFAIL responses without plaintext fallback; reject
-  unsupported encrypted query shapes locally and discard QR=1 input
-- Keep responsive connections when an individual query times out or a request
-  hits backpressure or an HTTP error; allow 512 in-flight DoT requests, split
-  dialing time across candidate addresses, and bound connection-lock waits
-- Refresh system fallback from DHCP after a route-source change, randomize
-  legacy/bootstrap DNS IDs, retry lost legacy UDP queries once, and keep system
-  fallback answers out of the cache
-- Echo each client's cached question casing; cap cached responses at 4 KiB and
-  capacity at 16,384 entries; bypass queries with answer or authority records
-- Pipeline TCP queries, write complete frames, and return SERVFAIL for oversized
-  answers; cap client TCP connections at 64 and set the launchd file limit to 4096
-- Restore system DNS after managed-daemon startup failures; record network
-  locations in new backups and refuse to restore into a different location
-- Skip unchanged watchdog subprocess checks, keep repairing known services when
-  a new service has unknown takeover settings, and reduce repeated configuration reads
-- Restrict logs to mode 0640, move connection messages to debug, suppress dependency
-  warnings, and rate-limit listener warnings; document log rotation and recovery
-- Validate upstream hostnames and warn about exposed listeners; service commands
-  no longer import the current directory's config implicitly. Use `error` and
-  `both` instead of the removed `fatal` and `split` aliases
-- Explicitly strip and verify both release slices through the shared-cache build
-  workflow; a PKG restart failure now prints recovery instructions without failing
-  an otherwise completed installation
+- Add `[split_dns]` and `--split-dns SUFFIX=TARGET` to route matching domain
+  suffixes to `system`, one configured upstream, or a direct `IP[:PORT]`
+  resolver; `system` and direct answers bypass the shared cache
+- Redial encrypted upstreams whose idle connection was closed by the peer,
+  instead of failing every query on that channel until restart
+- When the attempt budget is exhausted, answer SERVFAIL instead of falling back
+  to plaintext system DNS; system fallback has its own 64-attempt budget, and
+  a stalled upstream keeps at most one losing hedge probe per connection
+- Give each legacy upstream address its own share of the timeout, and fail
+  over to the next bootstrap server on SERVFAIL, REFUSED, or a failed address
+  family
+- Cap each client TCP connection at 32 in-flight queries and close it after a
+  failed or timed-out write, so a partial frame is never followed by another
+- Do not cache empty referrals or non-zero EDNS extended RCODEs, and derive
+  positive cache TTLs from answer records only
+- Leave the watchdog's slow cadence once DNS settings are stable again; read
+  every DHCPv4 and DHCPv6 DNS server, and retry briefly while DHCP completes
+- Keep the takeover in place when the daemon fails during `restart`; open log
+  files with `O_NOFOLLOW`
+- Reject port 0, all-numeric final hostname labels, and IPv6 literals in DoH
+  or DoH3 URLs (they never worked; use a hostname with `bootstrap_ip`)
+- When an Intel Homebrew install already owns `/usr/local/bin/dnsrivet`, the
+  PKG installer says to run `brew uninstall dnsrivet` first
 
-After upgrading an existing service, run `sudo dnsrivet stop` followed by
-`sudo dnsrivet start` once to load the new launchd settings and backup metadata.
-Switch back to the original macOS network location before doing so. Existing
-backups remain supported. See the [complete release notes](https://github.com/WenliangCao/DNSRivet/releases/tag/v0.4.2)
+Run `dnsrivet config check` before upgrading; configurations rejected by the
+new validation must be fixed first. The PKG restarts a loaded service
+automatically; after a Homebrew upgrade, run `sudo dnsrivet restart`.
+Installations older than 0.4.2 still need the one-time `sudo dnsrivet stop`
+and `sudo dnsrivet start` described in the v0.4.2 release notes. See the
+[complete release notes](https://github.com/WenliangCao/DNSRivet/releases/tag/v0.4.3)
 for changes, verification, and compatibility details.
 
-0.4.1 added sleep recovery and refreshed trust roots and dependencies; 0.4.0
-moved encrypted transports to patched Hickory releases and hardened caching and
-service lifecycle handling.
+0.4.2 hardened failover, network-change recovery, caching, and service
+lifecycle handling; 0.4.1 added sleep recovery; 0.4.0 moved encrypted
+transports to patched Hickory releases.
 
 ## Runtime profile
 
@@ -481,37 +479,33 @@ DNSRivet 是一个以 Rust 编写的小型单进程 DNS 守护程序。它接收
 - 原生 `launchd` 服务管理
 - 一行终端参数配置，并与 TOML 共用同一套校验逻辑
 
-## 0.4.2 更新
+## 0.4.3 更新
 
-- 路由源地址变化时重建加密连接；网络恢复后清除冷却与 bootstrap 失败状态。
-  查询期间发生睡眠或换网时，额外给予一次最多两秒的重连重试
-- 配置上游的 SERVFAIL 不再触发明文回退；不支持的加密查询形态在本地拒绝，
-  QR=1 输入报文直接丢弃
-- 单个查询超时、发送背压或 HTTP 错误不再拆掉仍健康的连接；DoT 支持 512 个
-  在途请求，候选地址共享拨号预算，等待连接锁也受截止时间限制
-- 路由源地址变化后读取 DHCP DNS 刷新系统回退；随机化 legacy/bootstrap 的
-  DNS ID，legacy UDP 丢包后重发一次，系统回退答案不再缓存
-- 缓存命中还原当前客户端的问题段大小写；单条应答上限 4 KiB、容量上限
-  16384；带应答或授权记录的查询绕过缓存
-- TCP 查询支持流水线，完整帧一次写出，超大应答返回 SERVFAIL；客户端 TCP
-  连接上限改为 64，launchd 文件描述符软上限设为 4096
-- 受管理的守护进程启动失败时尝试恢复系统 DNS；新备份记录网络位置，拒绝
-  把原位置的设置恢复到别的位置
-- 网络偏好未变时跳过看门狗子进程检查；新服务的恢复状态未知时跳过该服务，
-  其他服务继续修复；减少重复读取
-- 日志权限收紧为 0640，连接成功降为 debug，过滤依赖库 warning，监听器告警
-  限流；补充日志轮转与 DNS 恢复说明
-- 校验上游主机名并警告非 loopback 监听；服务不再隐式导入当前目录配置。
-  删除 `fatal`、`split` 别名，分别使用 `error`、`both`
-- 发布构建使用共享缓存，显式剥离并检查两个架构的符号；PKG 重启失败时给出
-  恢复命令，不再把已完成的文件安装判为失败
+- 新增 `[split_dns]` 与 `--split-dns SUFFIX=TARGET`，按域名后缀把查询分流到
+  `system`、某个配置上游或直连 `IP[:PORT]`；`system` 与直连答案不进共享缓存
+- 对端关闭空闲连接后，加密上游会重新建连，不再让该通道的查询一直失败到重启
+- 尝试额度耗尽时直接返回 SERVFAIL，不再回退到明文系统 DNS；系统回退使用独立的
+  64 项额度，卡住的上游每条连接最多保留一个对冲探测
+- legacy 上游的每个候选地址各自分配超时；bootstrap 遇到 SERVFAIL、REFUSED 或
+  某个地址族查询失败时继续查询下一个服务器
+- 每条客户端 TCP 连接最多 32 个在途查询；写入失败或超时后关闭连接，避免半截
+  帧后再写入其他应答
+- 不缓存空 referral 和非零 EDNS 扩展 RCODE；正向缓存 TTL 只取应答记录
+- DNS 设置恢复稳定后，看门狗会退出慢节奏；读取全部 DHCPv4 与 DHCPv6 DNS 服务器，
+  DHCP 尚未完成时短暂重试
+- `restart` 期间守护进程启动失败时保留接管；日志文件以 `O_NOFOLLOW` 打开
+- 拒绝端口 0、最后一段全为数字的主机名，以及 DoH/DoH3 URL 中的 IPv6 字面量
+  （此前本就无法工作，请改用主机名加 `bootstrap_ip`）
+- Intel Homebrew 已占用 `/usr/local/bin/dnsrivet` 时，PKG 安装器会提示先执行
+  `brew uninstall dnsrivet`
 
-已有服务升级后，执行一次 `sudo dnsrivet stop` 再 `sudo dnsrivet start`，加载
-新的 launchd 设置和备份元数据；若切换过网络位置，先切回原位置。旧备份保持兼容。
-全部更改、验证与兼容说明见 [完整发布说明](https://github.com/WenliangCao/DNSRivet/releases/tag/v0.4.2)。
+升级前先执行 `dnsrivet config check`，新校验拒绝的配置需要先修改。PKG 会自动重启
+已加载的服务；Homebrew 升级后执行 `sudo dnsrivet restart`。从 0.4.2 之前版本升级时，
+仍需按 v0.4.2 发布说明执行一次 `sudo dnsrivet stop` 再 `sudo dnsrivet start`。全部更改、
+验证与兼容说明见 [完整发布说明](https://github.com/WenliangCao/DNSRivet/releases/tag/v0.4.3)。
 
-0.4.1 已加入睡眠恢复并更新信任根与依赖；0.4.0 已迁移到修复后的 Hickory，并加固
-缓存及服务生命周期处理。
+0.4.2 加固了故障转移、换网恢复、缓存与服务生命周期处理；0.4.1 加入睡眠恢复；
+0.4.0 迁移到修复后的 Hickory。
 
 ## 运行开销
 
